@@ -42,7 +42,7 @@ const nav = computed(() => {
     { name: "jobs", label: "任务", icon: ListTodo },
     { name: "files", label: "文件浏览", icon: FolderTree },
     { name: "tasks", label: "打包记录", icon: UploadCloud },
-    { name: "rules", label: "提取规则", icon: FileCog },
+    { name: "rules", label: "后处理工具", icon: FileCog },
   ];
   if (auth.me?.is_admin) {
     items.push({ name: "templates", label: "模板管理", icon: FileCode });

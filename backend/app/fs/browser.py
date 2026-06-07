@@ -135,10 +135,13 @@ def _do_mkdir(path: str) -> Dict:
 
 
 def _do_write_file(path: str, data: bytes) -> Dict:
-    """写入新文件（不覆盖已存在文件）。返回父目录 realpath 供二次校验。"""
+    """写入新文件（不覆盖已存在文件）。返回父目录 realpath 供二次校验。
+
+    父目录不存在时按降权身份自动创建（目录上传需保留层级）。
+    """
     parent = os.path.dirname(path)
-    if not os.path.isdir(parent):
-        raise FileNotFoundError(parent)
+    # 目录上传：中间目录可能尚不存在，按当前（已降权）身份创建，umask 077 → 0700
+    os.makedirs(parent, exist_ok=True)
     real_parent = os.path.realpath(parent)
     # O_EXCL：目标已存在则报错，避免静默覆盖
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -306,12 +309,18 @@ def rename_path(user: str, path: str, new_name: str, roots: List[str]) -> Dict:
 def write_file(
     user: str, parent: str, filename: str, data: bytes, roots: List[str]
 ) -> Dict:
-    """把上传的文件写入 parent 目录（取文件名 basename，不覆盖已有）。"""
-    safe = os.path.basename(filename or "").strip()
-    if not safe or safe in (".", ".."):
+    """把上传的文件写入 parent 目录，不覆盖已有。
+
+    filename 可含相对子路径（目录上传时保留层级，如 "sub/a.txt"）：逐段校验，
+    禁止空段 / "." / ".." / 绝对路径；中间目录按目标用户身份自动创建。
+    """
+    parts = [p.strip() for p in (filename or "").replace("\\", "/").split("/")]
+    parts = [p for p in parts if p]
+    if not parts or any(p in (".", "..") for p in parts):
         raise FsError("非法文件名", 400)
+    rel = os.path.join(*parts)
     parent_norm = normalize_under_roots(parent, roots)
-    target = os.path.join(parent_norm, safe)
+    target = os.path.join(parent_norm, rel)
     normalize_under_roots(target, roots)
     result = call_as_user(user, _do_write_file, target, data)
     if not _contains(roots, result["realpath_parent"]):

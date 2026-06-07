@@ -133,11 +133,13 @@ export const api = {
   async uploadFile(
     parent: string,
     file: File,
-    onProgress?: (loaded: number, total: number) => void
+    onProgress?: (loaded: number, total: number) => void,
+    relpath?: string
   ): Promise<{ path: string }> {
     const form = new FormData();
     form.append("parent", parent);
     form.append("file", file);
+    if (relpath) form.append("relpath", relpath); // 目录上传保留层级
     const { data } = await http.post<{ path: string }>("/fs/upload", form, {
       onUploadProgress: onProgress
         ? (e) => onProgress(e.loaded, e.total || file.size || 0)

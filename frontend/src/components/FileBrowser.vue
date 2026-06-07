@@ -18,6 +18,7 @@ import {
   RefreshCw,
   PackageIcon,
   FolderPlus,
+  FolderUp,
   Upload,
   Check,
   X,
@@ -99,12 +100,15 @@ const newDirName = ref("");
 const savingDir = ref(false);
 const uploading = ref(false);
 const fileInput = ref<HTMLInputElement | null>(null);
+const dirInput = ref<HTMLInputElement | null>(null);
 // 上传进度状态
 const uploadName = ref("");
 const uploadPercent = ref(0); // 0-100
 const uploadLoaded = ref(0); // 已传字节
 const uploadTotal = ref(0); // 总字节
 const uploadSpeed = ref(0); // 瞬时速率，字节/秒
+const uploadFileIdx = ref(0); // 目录上传：当前第几个文件
+const uploadFileCount = ref(0); // 目录上传：文件总数（>0 表示在传目录）
 
 function joinPath(name: string): string {
   const base = path.value.replace(/\/+$/, "");
@@ -492,6 +496,69 @@ async function onFilePicked(e: Event) {
   }
 }
 
+function pickDir() {
+  dirInput.value?.click();
+}
+// 上传整个目录：逐个文件上传并用 webkitRelativePath 保留层级，进度按总字节聚合
+async function onDirPicked(e: Event) {
+  const input = e.target as HTMLInputElement;
+  const files = Array.from(input.files ?? []);
+  input.value = "";
+  if (!files.length) return;
+  const totalBytes = files.reduce((s, f) => s + f.size, 0);
+  uploading.value = true;
+  error.value = "";
+  uploadFileCount.value = files.length;
+  uploadFileIdx.value = 0;
+  uploadTotal.value = totalBytes;
+  uploadLoaded.value = 0;
+  uploadPercent.value = 0;
+  uploadSpeed.value = 0;
+  let doneBytes = 0; // 已完成文件累计字节
+  let lastTime = performance.now();
+  let lastLoaded = 0;
+  try {
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      uploadFileIdx.value = i + 1;
+      const rel = f.webkitRelativePath || f.name; // "目录名/子目录/文件"
+      uploadName.value = rel;
+      await api.uploadFile(
+        path.value,
+        f,
+        (loaded) => {
+          const overall = doneBytes + loaded;
+          uploadLoaded.value = overall;
+          uploadPercent.value = totalBytes
+            ? Math.min(100, Math.round((overall / totalBytes) * 100))
+            : 0;
+          const now = performance.now();
+          const dt = (now - lastTime) / 1000;
+          if (dt >= 0.2) {
+            const inst = (overall - lastLoaded) / dt;
+            uploadSpeed.value = uploadSpeed.value
+              ? uploadSpeed.value * 0.6 + inst * 0.4
+              : inst;
+            lastTime = now;
+            lastLoaded = overall;
+          }
+        },
+        rel
+      );
+      doneBytes += f.size;
+    }
+    uploadPercent.value = 100;
+    await load();
+  } catch (err) {
+    error.value = errMsg(err);
+  } finally {
+    uploading.value = false;
+    uploadSpeed.value = 0;
+    uploadFileCount.value = 0;
+    uploadFileIdx.value = 0;
+  }
+}
+
 watch(
   () => props.initialPath,
   (p) => load(p)
@@ -608,6 +675,15 @@ defineExpose({ reload: () => load() });
           <Upload v-else :size="15" /> 上传文件
         </button>
         <button
+          class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-60"
+          :disabled="uploading"
+          title="上传整个目录（保留子目录层级）"
+          @click="pickDir"
+        >
+          <Loader2 v-if="uploading" :size="15" class="animate-spin" />
+          <FolderUp v-else :size="15" /> 上传目录
+        </button>
+        <button
           class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-slate-300 bg-white hover:bg-slate-50"
           @click="startCreateDir"
         >
@@ -662,6 +738,14 @@ defineExpose({ reload: () => load() });
           class="hidden"
           @change="onFilePicked"
         />
+        <input
+          ref="dirInput"
+          type="file"
+          class="hidden"
+          webkitdirectory
+          multiple
+          @change="onDirPicked"
+        />
       </div>
     </div>
 
@@ -685,7 +769,16 @@ defineExpose({ reload: () => load() });
       v-if="uploading"
       class="flex items-center gap-3 mb-3 p-2.5 rounded-lg bg-blue-50 border border-blue-200"
     >
-      <Upload :size="16" class="text-blue-600 shrink-0" />
+      <component
+        :is="uploadFileCount ? FolderUp : Upload"
+        :size="16"
+        class="text-blue-600 shrink-0"
+      />
+      <span
+        v-if="uploadFileCount"
+        class="text-xs font-medium text-blue-700 tabular-nums shrink-0"
+        >文件 {{ uploadFileIdx }}/{{ uploadFileCount }}</span
+      >
       <span
         class="text-sm text-slate-700 truncate max-w-[14rem]"
         :title="uploadName"

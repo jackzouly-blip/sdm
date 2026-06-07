@@ -64,7 +64,7 @@ function insertPlaceholder(ph: string) {
       <div class="flex items-center px-5 py-3 border-b border-slate-200">
         <FileCog :size="18" class="text-blue-600 mr-2" />
         <div class="font-medium text-slate-800">
-          {{ rule ? "编辑提取规则" : "新建提取规则" }}
+          {{ rule ? "编辑后处理工具" : "新建后处理工具" }}
         </div>
         <button
           class="ml-auto p-1.5 rounded hover:bg-slate-100 text-slate-500"

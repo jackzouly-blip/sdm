@@ -72,16 +72,16 @@ onMounted(load);
 <template>
   <div class="max-w-6xl mx-auto">
     <div class="flex items-center gap-3 mb-4">
-      <h1 class="text-lg font-semibold text-slate-800">数据提取规则</h1>
+      <h1 class="text-lg font-semibold text-slate-800">数据后处理工具</h1>
       <span class="text-sm text-slate-400">任务完成后自动在工作目录中运行</span>
-      <span v-if="!isAdmin" class="text-xs text-slate-400">（只读，规则由管理员维护）</span>
+      <span v-if="!isAdmin" class="text-xs text-slate-400">（只读，工具由管理员维护）</span>
       <div class="ml-auto flex items-center gap-2">
         <button
           v-if="isAdmin"
           class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md bg-blue-600 text-white hover:bg-blue-700"
           @click="openNew"
         >
-          <Plus :size="15" /> 新建规则
+          <Plus :size="15" /> 新建工具
         </button>
         <button
           class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-slate-300 bg-white hover:bg-slate-50"
@@ -182,7 +182,7 @@ onMounted(load);
         v-else-if="!rules.length"
         class="py-12 flex flex-col items-center justify-center text-slate-400 gap-2"
       >
-        <Inbox :size="28" /> {{ isAdmin ? "暂无规则，点击「新建规则」添加" : "暂无提取规则" }}
+        <Inbox :size="28" /> {{ isAdmin ? "暂无工具，点击「新建工具」添加" : "暂无后处理工具" }}
       </div>
     </div>
 

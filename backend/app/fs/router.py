@@ -166,10 +166,13 @@ def fs_find_files(
 async def fs_upload(
     parent: str = Form(..., description="目标目录绝对路径"),
     file: UploadFile = File(...),
+    relpath: str = Form("", description="相对子路径（目录上传保留层级，如 sub/a.txt）"),
     user: str = Depends(current_user),
 ) -> PathResponse:
     data = await file.read()
-    result = _handle(write_file, _fs_user(user), parent, file.filename, data, _roots())
+    # 目录上传时用 relpath 保留层级；否则退回单文件名
+    name = relpath or file.filename
+    result = _handle(write_file, _fs_user(user), parent, name, data, _roots())
     return PathResponse(path=result["path"])
 
 

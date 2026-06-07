@@ -81,8 +81,8 @@ async function runExtract() {
   try {
     const { dispatched } = await api.runExtract(job.value.jobid);
     runMsg.value = dispatched
-      ? `已派发 ${dispatched} 条提取任务，可在「打包记录」查看进度`
-      : "没有匹配的提取规则";
+      ? `已派发 ${dispatched} 条后处理任务，可在「打包记录」查看进度`
+      : "没有匹配的后处理工具";
     job.value = await api.getJob(props.jobid);
   } catch (e) {
     runMsg.value = errMsg(e);
@@ -209,7 +209,7 @@ function rows(j: JobDetail) {
       <!-- 数据提取：列出全部规则 + 手动触发 -->
       <div class="bg-white rounded-xl border border-slate-200 p-4 mb-5">
         <div class="flex items-center gap-3 flex-wrap mb-2">
-          <span class="text-sm font-medium text-slate-700">数据提取</span>
+          <span class="text-sm font-medium text-slate-700">数据后处理</span>
           <span class="text-xs text-slate-400">任务完成后自动在工作目录中运行</span>
           <span v-if="runMsg" class="text-xs text-slate-500">{{ runMsg }}</span>
           <button
@@ -220,7 +220,7 @@ function rows(j: JobDetail) {
           >
             <Loader2 v-if="running" :size="15" class="animate-spin" />
             <PlayCircle v-else :size="15" />
-            立即执行提取
+            立即执行后处理
           </button>
         </div>
         <ul v-if="rules.length" class="space-y-1.5">
@@ -239,7 +239,7 @@ function rows(j: JobDetail) {
             <code class="text-slate-500 break-all">{{ r.command }}</code>
           </li>
         </ul>
-        <div v-else class="text-xs text-slate-400">暂无提取规则</div>
+        <div v-else class="text-xs text-slate-400">暂无后处理工具</div>
       </div>
 
       <!-- 文件清理：删除 disk* / mes* / scr* 临时文件 -->
