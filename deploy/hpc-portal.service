@@ -1,0 +1,22 @@
+# HPC 门户后端 systemd 服务
+# 安装： cp deploy/hpc-portal.service /etc/systemd/system/
+#        systemctl daemon-reload && systemctl enable --now hpc-portal
+# 注意：必须以 root 运行 —— act-as-user 靠 setuid 降权到各登录用户，PAM 登录校验亦需 root。
+[Unit]
+Description=HPC Portal backend (FastAPI/uvicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/hpc-portal/backend
+EnvironmentFile=/opt/hpc-portal/deploy/hpc-portal.env
+# 用 conda base 环境(含 lasso)的 python
+ExecStart=/opt/miniconda3/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=3
+# 让子进程能找到 qstat/qdel(Torque)、tar、soffice 等。务必含 Torque bin 路径！
+Environment=PATH=/opt/miniconda3/bin:/usr/local/torque-6.1.2/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+[Install]
+WantedBy=multi-user.target

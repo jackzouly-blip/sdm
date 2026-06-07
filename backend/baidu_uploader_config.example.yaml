@@ -1,0 +1,36 @@
+# 复制为 config.yaml 后填写（config.yaml 已被 .gitignore 忽略，不会进版本库）
+
+# 百度开放平台应用凭据
+app:
+  app_id: "123555822"
+  app_key: "YOUR_APP_KEY"
+  secret_key: "YOUR_SECRET_KEY"
+  sign_key: "YOUR_SIGN_KEY"
+
+# OAuth2 授权
+auth:
+  # oob: 浏览器手动复制授权码（独立工具最简单）
+  # local_server: 本地起回调服务器自动接收（需 redirect_uri 指向 http://localhost:端口）
+  mode: "oob"
+  redirect_uri: "oob"
+  scope: "basic,netdisk"
+  # token 持久化路径（已被 .gitignore 忽略）
+  token_file: "baidu.token.json"
+
+# 上传配置
+upload:
+  # 本地待上传目录
+  local_dir: "/path/to/local/data"
+  # 网盘目标根目录（必须以 /apps/你的应用名 开头，普通权限只能写应用目录）
+  remote_dir: "/apps/your-app-name/backup"
+  # 分片大小（普通用户 4MB，会员可更大）
+  chunk_size: 4194304
+  # 分片并发数
+  concurrency: 3
+
+# 状态与日志
+state:
+  db_path: "state/uploader.db"
+log:
+  level: "INFO"
+  file: "uploader.log"

@@ -1,0 +1,319 @@
+"""文件浏览核心：路径白名单校验 + 以登录用户身份执行文件操作。
+
+安全分两层：
+  1. 白名单 + 防穿越（lexical）：请求路径先做词法归一（消解 .. 与多余斜杠），
+     再校验落在 fs_roots（如 /data）之内，挡掉 ../../etc/passwd 这类穿越。
+  2. OS 权限兜底：真正的列目录/读文件都通过 call_as_user 降权到登录用户执行，
+     用户能不能看、能不能读完全由操作系统决定。
+  另对最终真实路径（realpath，已解析符号链接）再做一次根包含校验，防止
+  /data 内的符号链接指向白名单外。
+
+在子进程（降权后）执行的函数必须是顶层函数且返回值可 pickle。
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import stat
+from typing import Dict, List, Optional
+
+from ..privilege.actas import call_as_user
+
+
+class FsError(Exception):
+    """文件操作错误，message 适合直接回给前端。"""
+
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+
+def normalize_under_roots(path: str, roots: List[str]) -> str:
+    """词法归一并校验路径在某个根之下，返回归一化绝对路径。"""
+    if not path or not path.startswith("/"):
+        raise FsError("路径必须是绝对路径", 400)
+    # 词法归一：消解 . / .. / 重复斜杠，不触碰文件系统
+    norm = os.path.normpath(path)
+    for root in roots:
+        if norm == root or norm.startswith(root + "/"):
+            return norm
+    raise FsError(f"路径超出允许范围: {norm}", 403)
+
+
+def _contains(roots: List[str], real: str) -> bool:
+    """real（已 realpath）是否落在某个根内。根本身也做 realpath，
+    以容忍根路径上游存在符号链接（如 /var -> /private/var）。"""
+    for r in roots:
+        rr = os.path.realpath(r)
+        if real == rr or real.startswith(rr + "/"):
+            return True
+    return False
+
+
+# --- 在降权子进程中执行的纯函数（顶层，可 pickle）-------------------
+
+def _do_listdir(path: str) -> Dict:
+    """列目录。返回 {entries: [...], realpath: str}。"""
+    real = os.path.realpath(path)
+    entries = []
+    for name in sorted(os.listdir(path)):
+        full = os.path.join(path, name)
+        try:
+            st = os.lstat(full)
+        except OSError:
+            continue
+        is_link = stat.S_ISLNK(st.st_mode)
+        # 符号链接解析到目标：大小/时间/类型用目标的（lstat 给的是链接自身，
+        # 其 size 是目标路径字符串长度，会误导）。断链则回退到链接自身。
+        target_st = st
+        if is_link:
+            try:
+                target_st = os.stat(full)
+            except OSError:
+                target_st = st
+        is_dir = stat.S_ISDIR(target_st.st_mode)
+        entries.append(
+            {
+                "name": name,
+                "is_dir": is_dir,
+                "is_link": is_link,
+                "size": int(target_st.st_size),
+                "mtime": float(target_st.st_mtime),
+                "mode": stat.filemode(st.st_mode),
+            }
+        )
+    return {"entries": entries, "realpath": real}
+
+
+def _do_read_text(path: str, max_bytes: int) -> Dict:
+    """读取文本预览。返回 {realpath, size, truncated, content}。"""
+    real = os.path.realpath(path)
+    st = os.stat(path)
+    if stat.S_ISDIR(st.st_mode):
+        raise IsADirectoryError(path)
+    size = int(st.st_size)
+    with open(path, "rb") as f:
+        data = f.read(max_bytes + 1)
+    truncated = len(data) > max_bytes
+    data = data[:max_bytes]
+    # 二进制判定：含空字节，或采样中不可打印字节比例过高
+    binary = b"\x00" in data
+    if not binary and data:
+        sample = data[:4096]
+        nonprint = sum(1 for b in sample if b < 9 or (13 < b < 32))
+        binary = nonprint / len(sample) > 0.15
+    content = "" if binary else data.decode("utf-8", errors="replace")
+    return {
+        "realpath": real,
+        "size": size,
+        "truncated": truncated,
+        "binary": binary,
+        "content": content,
+    }
+
+
+def _do_stat(path: str) -> Dict:
+    real = os.path.realpath(path)
+    st = os.stat(path)
+    return {
+        "realpath": real,
+        "is_dir": stat.S_ISDIR(st.st_mode),
+        "size": int(st.st_size),
+        "mtime": float(st.st_mtime),
+    }
+
+
+def _do_mkdir(path: str) -> Dict:
+    """新建目录。父目录须已存在；返回父目录的 realpath 供二次校验。"""
+    parent = os.path.dirname(path)
+    if not os.path.isdir(parent):
+        raise FileNotFoundError(parent)
+    real_parent = os.path.realpath(parent)
+    os.mkdir(path)  # 受降权子进程 umask(077) 约束，权限为 0700
+    return {"realpath_parent": real_parent}
+
+
+def _do_write_file(path: str, data: bytes) -> Dict:
+    """写入新文件（不覆盖已存在文件）。返回父目录 realpath 供二次校验。"""
+    parent = os.path.dirname(path)
+    if not os.path.isdir(parent):
+        raise FileNotFoundError(parent)
+    real_parent = os.path.realpath(parent)
+    # O_EXCL：目标已存在则报错，避免静默覆盖
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        mv = memoryview(data)
+        while mv:
+            n = os.write(fd, mv)
+            mv = mv[n:]
+    finally:
+        os.close(fd)
+    return {"realpath_parent": real_parent}
+
+
+# --- 对外 API（在 root 主进程调用，内部降权）------------------------
+
+def list_dir(user: str, path: str, roots: List[str]) -> Dict:
+    norm = normalize_under_roots(path, roots)
+    result = call_as_user(user, _do_listdir, norm)
+    # 二次校验：realpath 解析符号链接后仍须在根内
+    if not _contains(roots, result["realpath"]):
+        raise FsError("目标经符号链接解析后超出允许范围", 403)
+    result["path"] = norm
+    return result
+
+
+def read_text(user: str, path: str, roots: List[str], max_bytes: int) -> Dict:
+    norm = normalize_under_roots(path, roots)
+    result = call_as_user(user, _do_read_text, norm, max_bytes)
+    if not _contains(roots, result["realpath"]):
+        raise FsError("目标经符号链接解析后超出允许范围", 403)
+    result["path"] = norm
+    return result
+
+
+def stat_path(user: str, path: str, roots: List[str]) -> Dict:
+    norm = normalize_under_roots(path, roots)
+    result = call_as_user(user, _do_stat, norm)
+    if not _contains(roots, result["realpath"]):
+        raise FsError("目标经符号链接解析后超出允许范围", 403)
+    result["path"] = norm
+    return result
+
+
+def _do_size(path: str) -> Dict:
+    """计算路径占用大小：文件取自身大小，目录递归累加（忽略符号链接）。"""
+    real = os.path.realpath(path)
+    total = 0
+    if os.path.isdir(path) and not os.path.islink(path):
+        for root, _dirs, files in os.walk(path):
+            for fn in files:
+                fp = os.path.join(root, fn)
+                try:
+                    if not os.path.islink(fp):
+                        total += os.path.getsize(fp)
+                except OSError:
+                    continue
+    else:
+        try:
+            total = int(os.path.getsize(path))
+        except OSError:
+            total = 0
+    return {"realpath": real, "size": int(total)}
+
+
+def path_size(user: str, path: str, roots: List[str]) -> int:
+    """以登录用户身份计算路径大小（目录递归）。"""
+    norm = normalize_under_roots(path, roots)
+    result = call_as_user(user, _do_size, norm)
+    if not _contains(roots, result["realpath"]):
+        raise FsError("目标经符号链接解析后超出允许范围", 403)
+    return int(result["size"])
+
+
+def make_dir(user: str, parent: str, name: str, roots: List[str]) -> Dict:
+    """在 parent 下新建名为 name 的目录。"""
+    safe = name.strip()
+    if not safe or "/" in safe or safe in (".", ".."):
+        raise FsError("非法目录名", 400)
+    parent_norm = normalize_under_roots(parent, roots)
+    target = os.path.join(parent_norm, safe)
+    # 目标本身仍须落在根内（normpath 兜底）
+    normalize_under_roots(target, roots)
+    result = call_as_user(user, _do_mkdir, target)
+    if not _contains(roots, result["realpath_parent"]):
+        raise FsError("目标经符号链接解析后超出允许范围", 403)
+    return {"path": target}
+
+
+def _do_delete(path: str) -> Dict:
+    """删除文件/目录(目录递归);软链只删链接本身。"""
+    if os.path.islink(path):
+        os.unlink(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
+    elif os.path.exists(path):
+        os.remove(path)
+    else:
+        raise FileNotFoundError(path)
+    return {"ok": True}
+
+
+def delete_path(user: str, path: str, roots: List[str]) -> Dict:
+    """删除 path（文件或目录，目录递归）。禁止删除白名单根本身。"""
+    norm = normalize_under_roots(path, roots)
+    real = os.path.realpath(norm)
+    for r in roots:
+        if real == os.path.realpath(r):
+            raise FsError("不能删除根目录", 400)
+    if not _contains(roots, real):
+        raise FsError("目标经符号链接解析后超出允许范围", 403)
+    call_as_user(user, _do_delete, norm)
+    return {"ok": True}
+
+
+def _do_find_files(root: str, exts: tuple, limit: int, max_depth: int) -> List[str]:
+    """在 root 下递归查找扩展名匹配的文件，返回相对 root 的路径列表（限深、限量）。"""
+    out: List[str] = []
+    base = root.rstrip("/")
+    base_depth = base.count(os.sep)
+    for dirpath, dirs, files in os.walk(base):
+        if dirpath.count(os.sep) - base_depth >= max_depth:
+            dirs[:] = []  # 达到深度上限不再下钻
+        for fn in sorted(files):
+            if fn.lower().endswith(exts):
+                out.append(os.path.relpath(os.path.join(dirpath, fn), base))
+                if len(out) >= limit:
+                    return out
+    return out
+
+
+def find_files(
+    user: str, dir_path: str, exts: tuple, roots: List[str],
+    limit: int = 500, max_depth: int = 8,
+) -> List[str]:
+    """以用户身份在目录下递归查找指定扩展名文件，返回相对路径。"""
+    norm = normalize_under_roots(dir_path, roots)
+    return call_as_user(user, _do_find_files, norm, exts, limit, max_depth)
+
+
+def _do_rename(src: str, dst: str) -> Dict:
+    """同目录改名。源须存在、目标不得已存在（不覆盖）。返回父目录 realpath 供二次校验。"""
+    if not os.path.lexists(src):
+        raise FileNotFoundError(src)
+    if os.path.lexists(dst):
+        raise FileExistsError(dst)
+    real_parent = os.path.realpath(os.path.dirname(dst))
+    os.rename(src, dst)
+    return {"realpath_parent": real_parent}
+
+
+def rename_path(user: str, path: str, new_name: str, roots: List[str]) -> Dict:
+    """把 path 在其所在目录内改名为 new_name（单段，不跨目录、不覆盖）。"""
+    safe = (new_name or "").strip()
+    if not safe or "/" in safe or safe in (".", ".."):
+        raise FsError("非法名称", 400)
+    src = normalize_under_roots(path, roots)
+    dst = os.path.join(os.path.dirname(src), safe)
+    normalize_under_roots(dst, roots)
+    result = call_as_user(user, _do_rename, src, dst)
+    if not _contains(roots, result["realpath_parent"]):
+        raise FsError("目标经符号链接解析后超出允许范围", 403)
+    return {"path": dst}
+
+
+def write_file(
+    user: str, parent: str, filename: str, data: bytes, roots: List[str]
+) -> Dict:
+    """把上传的文件写入 parent 目录（取文件名 basename，不覆盖已有）。"""
+    safe = os.path.basename(filename or "").strip()
+    if not safe or safe in (".", ".."):
+        raise FsError("非法文件名", 400)
+    parent_norm = normalize_under_roots(parent, roots)
+    target = os.path.join(parent_norm, safe)
+    normalize_under_roots(target, roots)
+    result = call_as_user(user, _do_write_file, target, data)
+    if not _contains(roots, result["realpath_parent"]):
+        raise FsError("目标经符号链接解析后超出允许范围", 403)
+    return {"path": target}

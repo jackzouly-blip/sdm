@@ -1,0 +1,17 @@
+# Web 框架
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-multipart>=0.0.12
+# 认证
+python-pam>=2.0
+six>=1.16  # python-pam 运行期依赖但未声明
+pyjwt>=2.9
+# 配置与数据
+pydantic>=2.6
+pydantic-settings>=2.5
+pyyaml>=6.0
+# 网盘上传引擎（baidu_uploader）依赖
+httpx>=0.27
+# d3plot 仿真结果解析（碰撞 3D 查看）。会带入 numpy/h5py/scipy 等。
+# 需 Python 3.8+；后端自身解释器即作为 d3plot 解析器(HPC_D3PLOT_PYTHON 可留空)。
+lasso-python>=2.0

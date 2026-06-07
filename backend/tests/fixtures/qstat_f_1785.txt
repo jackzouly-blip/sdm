@@ -1,0 +1,55 @@
+Job Id: 1785.hpcmaster
+    Job_Name = JACD32poleDRPA2
+    Job_Owner = user07@hpcmaster
+    resources_used.cput = 1141:05:03
+    resources_used.energy_used = 0
+    resources_used.mem = 68315880kb
+    resources_used.vmem = 980108472kb
+    resources_used.walltime = 17:57:47
+    job_state = R
+    queue = batch
+    server = hpcmaster
+    Checkpoint = u
+    ctime = Mon Jun  1 19:48:57 2026
+    Error_Path = hpcmaster:/data/project/user07/ZXY/JAC_D_side/32_pole/DR_PA/c
+        ase2/JACD32poleDRPA2.e1785
+    exec_host = hpcnode5.upcloud.local/0-63
+    Hold_Types = n
+    Join_Path = n
+    Keep_Files = n
+    Mail_Points = a
+    mtime = Mon Jun  1 19:55:20 2026
+    Output_Path = hpcmaster:/data/project/user07/ZXY/JAC_D_side/32_pole/DR_PA/
+        case2/JACD32poleDRPA2.o1785
+    Priority = 0
+    qtime = Mon Jun  1 19:48:57 2026
+    Rerunable = True
+    Resource_List.walltime = 99:00:00
+    Resource_List.nodes = 1:ppn=64
+    Resource_List.nodect = 1
+    session_id = 78926
+    Variable_List = PBS_O_QUEUE=batch,PBS_O_HOME=/root,PBS_O_LOGNAME=root,
+        PBS_O_PATH=/usr/local/torque-6.1.2/bin:/usr/local/torque-6.1.2/sbin:/
+        usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/usr/local/torque-6.1
+        .2/bin:/usr/local/torque-6.1.2/sbin:/usr/local/maui-3.3.1/bin:/script/
+        :/root/bin,PBS_O_MAIL=/var/spool/mail/root,PBS_O_SHELL=/bin/bash,
+        PBS_O_LANG=en_US.UTF-8,
+        PBS_O_INITDIR=/caedata/project/user07/ZXY/JAC_D_side/32_pole/DR_PA/ca
+        se2,
+        PBS_O_WORKDIR=/data/project/user07/ZXY/JAC_D_side/32_pole/DR_PA/case2
+        ,PBS_O_HOST=hpcmaster,PBS_O_SERVER=hpcmaster.upcloud.local
+    euser = user07
+    egroup = domain users
+    queue_type = E
+    etime = Mon Jun  1 19:48:57 2026
+    submit_args = -P user07 -N JACD32poleDRPA2 -q batch -l nodes=1:ppn=64 -d /
+        caedata/project/user07/ZXY/JAC_D_side/32_pole/DR_PA/case2
+    start_time = Mon Jun  1 19:55:20 2026
+    Walltime.Remaining = 291664
+    start_count = 1
+    fault_tolerant = False
+    job_radix = 0
+    proxy_user = user07
+    submit_host = hpcmaster
+    init_work_dir = /data/project/user07/ZXY/JAC_D_side/32_pole/DR_PA/case2
+    request_version = 1
