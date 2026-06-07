@@ -127,6 +127,7 @@ async function load(p?: string) {
       if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
       return a.name.localeCompare(b.name);
     });
+    lastIndex.value = null; // 切目录后重置 shift 区间锚点
   } catch (e) {
     error.value = errMsg(e);
   } finally {
@@ -175,11 +176,20 @@ function selectByPredicate(pred: (e: FsEntry) => boolean, label: string) {
   paths.forEach((p) => (allSel ? next.delete(p) : next.add(p)));
   selected.value = next;
 }
+// mes* ：以 mes 开头的文件（mes0000、mes0001 …）
+const MES_RE = /^mes/i;
 function selectH3d() {
   selectByPredicate((e) => H3D_RE.test(e.name), "h3d");
 }
 function selectD3plot() {
   selectByPredicate((e) => D3PLOT_RE.test(e.name), "d3plot");
+}
+function selectMes() {
+  selectByPredicate((e) => MES_RE.test(e.name), "mes");
+}
+function clearSelection() {
+  selected.value = new Set();
+  lastIndex.value = null;
 }
 
 function toggle(entry: FsEntry) {
@@ -188,6 +198,25 @@ function toggle(entry: FsEntry) {
   if (next.has(full)) next.delete(full);
   else next.add(full);
   selected.value = next;
+}
+
+// 行勾选：支持 shift 选中区间（上次点击行 ↔ 本次行 之间全部选中）
+const lastIndex = ref<number | null>(null);
+const rowShift = ref(false); // 点击时是否按住 Shift（@click 先于 @change 触发时捕获）
+function onRowChange(entry: FsEntry, index: number) {
+  if (rowShift.value && lastIndex.value !== null) {
+    const a = Math.min(lastIndex.value, index);
+    const b = Math.max(lastIndex.value, index);
+    const next = new Set(selected.value);
+    for (let i = a; i <= b; i++) {
+      const e = entries.value[i];
+      if (e) next.add(joinPath(e.name));
+    }
+    selected.value = next;
+  } else {
+    toggle(entry);
+  }
+  lastIndex.value = index;
 }
 
 function isSelected(entry: FsEntry): boolean {
@@ -667,6 +696,21 @@ defineExpose({ reload: () => load() });
           <Check :size="15" /> 选择d3plot
         </button>
         <button
+          class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-slate-300 bg-white hover:bg-slate-50"
+          title="勾选当前目录所有 mes* 文件(再点取消)"
+          @click="selectMes"
+        >
+          <Check :size="15" /> 选择mes
+        </button>
+        <button
+          v-if="selected.size"
+          class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-slate-300 bg-white text-slate-600 hover:bg-slate-50"
+          title="清除所有已勾选项"
+          @click="clearSelection"
+        >
+          <X :size="15" /> 清除选择 ({{ selected.size }})
+        </button>
+        <button
           class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-60"
           :disabled="uploading"
           @click="pickFile"
@@ -846,7 +890,7 @@ defineExpose({ reload: () => load() });
         </thead>
         <tbody>
           <tr
-            v-for="entry in entries"
+            v-for="(entry, index) in entries"
             :key="entry.name"
             class="border-t border-slate-100 hover:bg-slate-50"
           >
@@ -854,7 +898,9 @@ defineExpose({ reload: () => load() });
               <input
                 type="checkbox"
                 :checked="isSelected(entry)"
-                @change="toggle(entry)"
+                title="按住 Shift 点击可选中区间"
+                @click="rowShift = $event.shiftKey"
+                @change="onRowChange(entry, index)"
               />
             </td>
             <td class="px-3 py-2">
