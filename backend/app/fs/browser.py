@@ -53,6 +53,27 @@ def _contains(roots: List[str], real: str) -> bool:
 
 # --- 在降权子进程中执行的纯函数（顶层，可 pickle）-------------------
 
+def _safe_str(s: str) -> str:
+    """把可能含 surrogate 的字符串（非 UTF-8 文件名，os.listdir 以 surrogateescape
+    保留原始字节）净化为可 JSON 序列化的合法字符串，避免整个列目录序列化失败（500）。
+
+    很多文件名其实是 GBK 中文（Windows/中文系统所建），故先按 UTF-8，失败再尝试
+    GBK/GB18030 还原中文，都不行才用 � 替换，尽量保住可读的真实名字。"""
+    if not isinstance(s, str):
+        return s
+    try:
+        s.encode("utf-8")
+        return s  # 本就是合法 UTF-8
+    except UnicodeEncodeError:
+        raw = s.encode("utf-8", "surrogateescape")  # 还原原始字节
+        for enc in ("utf-8", "gb18030", "gbk"):
+            try:
+                return raw.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("utf-8", "replace")
+
+
 def _do_listdir(path: str) -> Dict:
     """列目录。返回 {entries: [...], realpath: str}。"""
     real = os.path.realpath(path)
@@ -75,7 +96,7 @@ def _do_listdir(path: str) -> Dict:
         is_dir = stat.S_ISDIR(target_st.st_mode)
         entries.append(
             {
-                "name": name,
+                "name": _safe_str(name),
                 "is_dir": is_dir,
                 "is_link": is_link,
                 "size": int(target_st.st_size),
@@ -83,7 +104,7 @@ def _do_listdir(path: str) -> Dict:
                 "mode": stat.filemode(st.st_mode),
             }
         )
-    return {"entries": entries, "realpath": real}
+    return {"entries": entries, "realpath": _safe_str(real)}
 
 
 def _do_read_text(path: str, max_bytes: int) -> Dict:

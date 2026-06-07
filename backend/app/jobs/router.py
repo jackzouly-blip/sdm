@@ -14,9 +14,11 @@ from pydantic import BaseModel
 from ..auth.session import current_user
 from ..config import get_settings
 from ..db.jobs_db import JobsDB
+from ..logger import get_logger
 from ..privilege.actas import call_as_user, run_as_user
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+log = get_logger(__name__)
 
 
 class JobSummary(BaseModel):
@@ -185,5 +187,27 @@ def cancel_job(
     proc = run_as_user(row["owner"], [qdel, jobid], timeout=30)
     if proc.returncode != 0:
         msg = (proc.stderr or b"").decode("utf-8", "replace").strip()
-        raise HTTPException(status_code=500, detail=f"终止失败: {msg[:300]}")
+        low = msg.lower()
+        # 常见竞态：本地 DB 还显示活跃，但 Torque 里任务已结束/出队，
+        # qdel 报 Unknown Job Id / Request invalid for state of job。
+        # 这不是错误，任务本就已停止——返回友好提示而非 500。
+        if (
+            not msg
+            or "unknown job" in low
+            or "invalid for state" in low
+            or "job has finished" in low
+            or "qhist" in low
+        ):
+            log.info("终止任务 %s：任务已结束（qdel: %s）", jobid, msg or "无输出")
+            return {
+                "jobid": jobid,
+                "cancelled": False,
+                "message": "任务可能已结束，无需终止",
+            }
+        # 其它失败：记日志，返回 409 友好错误（不再抛 500）
+        log.warning("终止任务 %s 失败（rc=%s）：%s", jobid, proc.returncode, msg)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=f"终止失败: {msg[:300]}"
+        )
+    log.info("已终止任务 %s（属主 %s，操作人 %s）", jobid, row["owner"], user)
     return {"jobid": jobid, "cancelled": True}
