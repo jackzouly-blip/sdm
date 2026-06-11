@@ -70,7 +70,7 @@ onMounted(load);
 </script>
 
 <template>
-  <div class="max-w-6xl mx-auto">
+  <div class="w-full">
     <div class="flex items-center gap-3 mb-4">
       <h1 class="text-lg font-semibold text-slate-800">数据后处理工具</h1>
       <span class="text-sm text-slate-400">任务完成后自动在工作目录中运行</span>

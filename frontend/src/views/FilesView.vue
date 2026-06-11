@@ -27,7 +27,7 @@ function switchRoot(r: string) {
 </script>
 
 <template>
-  <div class="max-w-6xl mx-auto">
+  <div class="w-full">
     <div class="flex items-center gap-3 mb-4">
       <h1 class="text-lg font-semibold text-slate-800">文件浏览</h1>
       <div v-if="roots.length > 1" class="flex gap-1">

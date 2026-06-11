@@ -31,7 +31,7 @@ async function cancel(job: JobSummary) {
     cancelling.value = null;
   }
 }
-const filter = ref<"" | "active" | "done">("");
+const filter = ref<"" | "active" | "done">("active");
 
 // d3plot 文件数：默认关(开启才逐个扫目录，避免列表加载变慢)
 const showD3plot = ref(false);
@@ -99,7 +99,7 @@ function nodeNames(execHost: string | null): string {
 </script>
 
 <template>
-  <div class="max-w-6xl mx-auto">
+  <div class="w-full">
     <div class="flex items-center gap-3 mb-4">
       <h1 class="text-lg font-semibold text-slate-800">我的任务</h1>
       <div class="flex gap-1 ml-2">

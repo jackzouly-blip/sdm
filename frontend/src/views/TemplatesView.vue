@@ -92,7 +92,7 @@ async function remove() {
 </script>
 
 <template>
-  <div class="max-w-6xl mx-auto">
+  <div class="w-full">
     <div class="flex items-center gap-3 mb-4">
       <h1 class="text-lg font-semibold text-slate-800">模板管理</h1>
       <span class="text-xs text-slate-400">作业提交脚本模板（管理员维护）</span>

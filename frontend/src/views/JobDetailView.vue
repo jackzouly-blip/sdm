@@ -228,7 +228,7 @@ function rows(j: JobDetail) {
 </script>
 
 <template>
-  <div class="max-w-6xl mx-auto">
+  <div class="w-full">
     <button
       class="flex items-center gap-1 text-sm text-slate-500 hover:text-slate-700 mb-4"
       @click="router.push({ name: 'jobs' })"
