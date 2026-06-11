@@ -80,6 +80,16 @@ def job_extract(handle: TaskHandle, params: dict) -> Dict:
             f"提取命令退出码 {proc.returncode}：{stderr[:800] or stdout[:800]}"
         )
 
+    # 后处理完成（h3d 等结果已生成）：若属主在白名单内，自动触发网盘上传分享。
+    # 任何异常都不得影响提取任务本身的成功结果，故整体兜底。
+    try:
+        from ..netdisk.autoshare import maybe_auto_share
+
+        if maybe_auto_share(params.get("jobid")):
+            log.info("提取完成后已自动触发网盘分享: job=%s", params.get("jobid"))
+    except Exception:  # noqa: BLE001
+        log.exception("自动网盘分享触发失败（不影响提取结果）: job=%s", params.get("jobid"))
+
     handle.update(phase="完成", progress=100)
     return {
         "jobid": params.get("jobid"),

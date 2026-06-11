@@ -1,0 +1,32 @@
+# HPC Agent —— 供 3dix-portal 调用的并行 HPC 后端实例（蓝绿/并存部署）
+#
+# 与现有生产实例 hpc-portal.service 完全隔离、互不影响：
+#   - 独立代码目录：/opt/hpc-portal-agent      （新代码，含 agent token 支持）
+#   - 独立端口：    8001                        （生产为 8000，勿冲突）
+#   - 独立状态/缓存：/var/lib/hpc-portal-agent  （独立 state.db / scratch / 缓存）
+#   - 独立环境文件：/opt/hpc-portal-agent/deploy/hpc-agent.env（含 HPC_AGENT_API_TOKEN）
+#
+# 安装：
+#   cp deploy/hpc-agent.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now hpc-agent
+#
+# 注意：必须以 root 运行 —— act-as-user 靠 setuid 降权到各登录用户。
+#       仅监听 127.0.0.1，由同机的 3dix-portal 内部调用，不对外暴露。
+[Unit]
+Description=HPC Agent backend for 3dix-portal (FastAPI/uvicorn, parallel instance)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/hpc-portal-agent/backend
+EnvironmentFile=/opt/hpc-portal-agent/deploy/hpc-agent.env
+# 复用与生产相同的 conda base 环境（含 lasso）；如需隔离可改用专用 env 的 python。
+ExecStart=/opt/miniconda3/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
+Restart=on-failure
+RestartSec=3
+# 让子进程能找到 qstat/qdel(Torque)、tar、soffice 等。务必含 Torque bin 路径！
+Environment=PATH=/opt/miniconda3/bin:/usr/local/torque-6.1.2/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+[Install]
+WantedBy=multi-user.target

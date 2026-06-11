@@ -111,6 +111,22 @@ def d3plot_prepare(
     return {"ready": False, "key": key, "task_id": task_id}
 
 
+@router.get("/task/{task_id}")
+def d3plot_task(
+    task_id: str,
+    request: Request,
+    user: str = Depends(current_user),
+) -> dict:
+    """查询解析任务进度（仅任务属主可见）。供前端轮询显示解析进度。"""
+    tm = request.app.state.task_manager
+    snap = tm.snapshot(task_id)
+    if snap is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if snap["owner"] != user:
+        raise HTTPException(status_code=403, detail="无权查看该任务")
+    return {k: snap.get(k) for k in ("status", "phase", "progress", "error")}
+
+
 @router.get("/asset/{key}/{name}")
 def d3plot_asset(
     key: str,

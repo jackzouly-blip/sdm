@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { ref, onMounted, onUnmounted } from "vue";
 import { useRouter } from "vue-router";
 import { api, errMsg } from "@/api";
-import type { JobDetail, ExtractRule } from "@/api/types";
+import type { JobDetail, ExtractRule, NetdiskState, NetdiskPreview } from "@/api/types";
 import { fmtTime, jobBadge, pbsStateLabel, fmtBytes } from "@/lib/format";
 import FileBrowser from "@/components/FileBrowser.vue";
-import { ArrowLeft, Loader2, PlayCircle, Box, Trash2, Ban } from "lucide-vue-next";
+import { ArrowLeft, Loader2, PlayCircle, Box, Trash2, Ban, CloudUpload, Copy } from "lucide-vue-next";
 
 const props = defineProps<{ jobid: string }>();
 const router = useRouter();
@@ -62,6 +62,16 @@ onMounted(async () => {
     } catch {
       /* 无权限或暂无规则，忽略 */
     }
+    // 预览将要上传的结果文件（数量 + 总大小）
+    loadNetdiskPreview();
+    // 若网盘上传进行中（含运行中流式上传），启动轮询刷新状态
+    if (
+      job.value.netdisk_state === "pending" ||
+      job.value.netdisk_state === "uploading" ||
+      job.value.netdisk_state === "partial"
+    ) {
+      pollTimer = window.setTimeout(pollNetdisk, 3000);
+    }
   } catch (e) {
     error.value = errMsg(e);
   } finally {
@@ -114,6 +124,85 @@ async function cleanFiles() {
     cleaning.value = false;
   }
 }
+
+// --- 结果网盘分享 ---
+const sharing = ref(false);
+const shareMsg = ref("");
+const netdiskPlan = ref<NetdiskPreview | null>(null); // 预计上传的文件数与总大小
+let pollTimer: number | null = null;
+
+// 拉取将要上传的结果文件预览（数量 + 总大小），失败静默
+async function loadNetdiskPreview() {
+  if (!job.value || job.value.derived_state !== "done" || !job.value.workdir) return;
+  try {
+    netdiskPlan.value = await api.netdiskPreview(job.value.jobid);
+  } catch {
+    /* 无权限/无目录，忽略 */
+  }
+}
+
+function netdiskBadge(s: NetdiskState) {
+  const m: Record<NetdiskState, { text: string; cls: string }> = {
+    none: { text: "未上传", cls: "bg-slate-100 text-slate-500" },
+    pending: { text: "排队中", cls: "bg-amber-100 text-amber-700" },
+    uploading: { text: "上传中", cls: "bg-blue-100 text-blue-700" },
+    partial: { text: "计算中·已传部分", cls: "bg-sky-100 text-sky-700" },
+    done: { text: "已分享", cls: "bg-emerald-100 text-emerald-700" },
+    failed: { text: "失败", cls: "bg-rose-100 text-rose-700" },
+    skipped: { text: "无文件", cls: "bg-slate-100 text-slate-400" },
+  };
+  return m[s] || m.none;
+}
+
+function fmtExpire(ts: number | null): string {
+  if (!ts) return "永久有效";
+  return new Date(ts * 1000).toLocaleDateString() + " 到期";
+}
+
+// 上传进行中时轮询任务详情，刷新网盘分享状态
+async function pollNetdisk() {
+  try {
+    job.value = await api.getJob(props.jobid);
+  } catch {
+    /* 忽略瞬时错误，继续轮询 */
+  }
+  const st = job.value?.netdisk_state;
+  if (st === "pending" || st === "uploading" || st === "partial") {
+    pollTimer = window.setTimeout(pollNetdisk, 3000);
+  } else {
+    pollTimer = null;
+  }
+}
+
+async function triggerShare() {
+  if (!job.value) return;
+  sharing.value = true;
+  shareMsg.value = "";
+  try {
+    await api.netdiskShare(job.value.jobid);
+    job.value = await api.getJob(props.jobid);
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = window.setTimeout(pollNetdisk, 2000);
+  } catch (e) {
+    shareMsg.value = errMsg(e);
+  } finally {
+    sharing.value = false;
+  }
+}
+
+async function copyText(t: string) {
+  try {
+    await navigator.clipboard.writeText(t);
+    shareMsg.value = "已复制到剪贴板";
+    setTimeout(() => (shareMsg.value = ""), 1500);
+  } catch {
+    shareMsg.value = "复制失败，请手动选择";
+  }
+}
+
+onUnmounted(() => {
+  if (pollTimer) clearTimeout(pollTimer);
+});
 
 // 详情字段表（标签 + 取值）。
 function rows(j: JobDetail) {
@@ -240,6 +329,88 @@ function rows(j: JobDetail) {
           </li>
         </ul>
         <div v-else class="text-xs text-slate-400">暂无后处理工具</div>
+      </div>
+
+      <!-- 结果网盘分享：上传 h3d/d3plot/binout/d3hsp 到百度网盘并生成分享链接 -->
+      <div class="bg-white rounded-xl border border-slate-200 p-4 mb-5">
+        <div class="flex items-center gap-3 flex-wrap mb-1">
+          <span class="text-sm font-medium text-slate-700">结果网盘分享</span>
+          <span class="text-xs text-slate-400">
+            上传 h3d / d3plot / binout / d3hsp 到百度网盘，生成分享链接供下载（绕开本地下载）
+          </span>
+          <span class="px-2 py-0.5 rounded-full text-xs" :class="netdiskBadge(job.netdisk_state).cls">
+            {{ netdiskBadge(job.netdisk_state).text }}
+          </span>
+          <button
+            v-if="['none', 'failed', 'skipped', 'done'].includes(job.netdisk_state)"
+            class="ml-auto flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-60"
+            :disabled="sharing || !job.workdir || job.derived_state !== 'done'"
+            :title="job.derived_state !== 'done' ? '任务完成后才能上传' : (job.workdir ? '' : '该任务无工作目录')"
+            @click="triggerShare"
+          >
+            <Loader2 v-if="sharing" :size="15" class="animate-spin" />
+            <CloudUpload v-else :size="15" />
+            {{ job.netdisk_state === "done" ? "重新上传分享" : "上传到网盘并分享" }}
+          </button>
+          <span v-else class="ml-auto text-xs text-blue-600 flex items-center gap-1">
+            <Loader2 :size="13" class="animate-spin" /> 上传中…
+          </span>
+        </div>
+
+        <!-- 预计上传：文件数 + 总大小 -->
+        <div v-if="netdiskPlan && netdiskPlan.count > 0" class="text-xs text-slate-500 mt-1">
+          预计上传 <span class="font-medium text-slate-700">{{ netdiskPlan.count }}</span> 个文件，共
+          <span class="font-medium text-slate-700">{{ fmtBytes(netdiskPlan.total_bytes) }}</span>
+        </div>
+        <div v-else-if="netdiskPlan && netdiskPlan.count === 0 && job.netdisk_state === 'none'"
+             class="text-xs text-slate-400 mt-1">
+          工作目录下暂无可上传的结果文件（h3d / d3plot / binout / d3hsp）
+        </div>
+
+        <!-- 运行中流式上传提示：任务未完成，链接已早建，其余文件待结束后续传 -->
+        <div v-if="job.netdisk_state === 'partial'"
+             class="text-xs text-sky-700 bg-sky-50 border border-sky-100 rounded-md px-2.5 py-1.5 mt-2">
+          ⚠ 任务尚未完成。已上传部分已写完的 d3plot 并生成分享链接，
+          其余文件（h3d / binout / d3hsp 及最后的 d3plot）将在任务结束后自动续传。
+        </div>
+
+        <!-- 链接 + 提取码 + 文件清单：只要已生成链接就展示（partial 也提前展示） -->
+        <div v-if="job.netdisk_share_url" class="text-sm space-y-1.5 mt-2">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="text-xs text-slate-500 shrink-0">链接</span>
+            <a :href="job.netdisk_share_url" target="_blank" rel="noopener"
+               class="text-blue-600 break-all hover:underline">{{ job.netdisk_share_url }}</a>
+            <button class="text-slate-400 hover:text-blue-600 shrink-0" title="复制链接"
+                    @click="copyText(job.netdisk_share_url || '')"><Copy :size="14" /></button>
+          </div>
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="text-xs text-slate-500 shrink-0">提取码</span>
+            <code class="px-1.5 py-0.5 bg-slate-100 rounded">{{ job.netdisk_share_pwd }}</code>
+            <button class="text-slate-400 hover:text-blue-600 shrink-0" title="复制提取码"
+                    @click="copyText(job.netdisk_share_pwd || '')"><Copy :size="14" /></button>
+            <span class="text-xs text-slate-400">{{ fmtExpire(job.netdisk_expire_at) }}</span>
+          </div>
+          <div v-if="job.netdisk_files?.length" class="text-xs text-slate-500">
+            已上传 {{ job.netdisk_files.length }}<template v-if="netdiskPlan?.count && job.netdisk_state !== 'partial'"> / {{ netdiskPlan.count }}</template>
+            个文件<template v-if="job.netdisk_state === 'partial'">（任务进行中，陆续增加）</template>：{{ job.netdisk_files.join("、") }}
+          </div>
+        </div>
+
+        <div v-if="job.netdisk_state === 'failed'" class="text-xs text-rose-600 mt-1">
+          上传失败：{{ job.netdisk_msg || "未知错误" }}
+        </div>
+        <div v-else-if="job.netdisk_state === 'skipped'" class="text-xs text-slate-400 mt-1">
+          {{ job.netdisk_msg || "未找到可上传的结果文件" }}
+        </div>
+        <div v-else-if="['pending', 'uploading'].includes(job.netdisk_state)" class="text-xs text-slate-500 mt-1">
+          正在上传到百度网盘，完成后这里会显示分享链接（大文件可能需要较久）。已完成
+          {{ job.netdisk_files?.length || 0 }}<template v-if="netdiskPlan?.count"> / {{ netdiskPlan.count }}</template>
+          个文件。
+        </div>
+        <div v-else-if="job.netdisk_state === 'partial' && !job.netdisk_share_url" class="text-xs text-slate-500 mt-1">
+          正在上传首批已写完的 d3plot…
+        </div>
+        <div v-if="shareMsg" class="text-xs text-slate-500 mt-1">{{ shareMsg }}</div>
       </div>
 
       <!-- 文件清理：删除 disk* / mes* / scr* 临时文件 -->

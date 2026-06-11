@@ -18,6 +18,7 @@ from .extract.rules_db import RulesDB
 from .fs.favorites_db import FavoritesDB
 from .fs.router import router as fs_router
 from .jobs.poller import JobPoller
+from .netdisk.streamer import NetdiskStreamer, set_streamer
 from .jobs.router import router as jobs_router
 from .logger import get_logger, setup_logging
 from .packaging.router import router as packaging_router
@@ -43,9 +44,16 @@ async def lifespan(app: FastAPI):
     favorites_db = FavoritesDB(str(BACKEND_DIR / "state" / "favorites.db"))
     dispatcher = Dispatcher(db, rules_db, task_manager)
     set_dispatcher(dispatcher)
+    streamer = NetdiskStreamer(
+        db,
+        interval=settings.netdisk_stream_interval,
+        stable_seconds=settings.netdisk_stream_stable_seconds,
+    )
+    set_streamer(streamer)
     app.state.jobs_db = db
     app.state.poller = poller
     app.state.task_manager = task_manager
+    app.state.netdisk_streamer = streamer
     app.state.rules_db = rules_db
     app.state.templates_db = templates_db
     app.state.favorites_db = favorites_db
@@ -60,10 +68,12 @@ async def lifespan(app: FastAPI):
     except Exception:  # noqa: BLE001
         log.exception("提取补派发失败")
     poller.start()
+    streamer.start()
     try:
         yield
     finally:
         poller.stop()
+        streamer.stop()
         task_manager.close()
         rules_db.close()
         templates_db.close()

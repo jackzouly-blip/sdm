@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 import httpx
 
@@ -30,6 +31,16 @@ class BaiduApiError(RuntimeError):
         self.where = where
         self.errno = errno
         self.payload = payload
+
+
+class BaiduHttpError(RuntimeError):
+    """HTTP 非 2xx：携带百度返回体，避免真实 errno 被状态码吞掉。"""
+
+    def __init__(self, status: int, url: str, body: object):
+        super().__init__(f"HTTP {status} {url} 返回: {body}")
+        self.status = status
+        self.url = url
+        self.body = body
 
 
 class BaiduPanClient:
@@ -102,7 +113,12 @@ class BaiduPanClient:
         uploadid: str,
         rtype: int = 3,
     ) -> dict:
-        """合并分片，完成上传。"""
+        """合并分片，完成上传。
+
+        百度 superfile2 的分片是异步提交的，紧接着调用 create 合并时，
+        大文件可能因部分分片在服务端尚未就绪而返回空体 HTTP 5xx。
+        这是该接口的已知最终一致性行为，故对 5xx 做指数退避重试。
+        """
         data = {
             "path": remote_path,
             "size": str(size),
@@ -111,15 +127,30 @@ class BaiduPanClient:
             "uploadid": uploadid,
             "block_list": json.dumps(block_list),
         }
-        resp = self._client.post(
-            FILE_API,
-            params={"method": "create", "access_token": self._get_token()},
-            data=data,
-        )
-        payload = self._json(resp)
-        if payload.get("errno", 0) != 0:
-            raise BaiduApiError("create", payload.get("errno", -1), payload)
-        return payload
+        attempts = 5  # 首次 + 4 次重试，退避 2/4/8/16s
+        last_err: BaiduHttpError | None = None
+        for attempt in range(attempts):
+            resp = self._client.post(
+                FILE_API,
+                params={"method": "create", "access_token": self._get_token()},
+                data=data,
+            )
+            if resp.status_code < 500:
+                payload = self._json(resp)  # 4xx 会带响应体抛出；2xx 正常解析
+                if payload.get("errno", 0) != 0:
+                    raise BaiduApiError("create", payload.get("errno", -1), payload)
+                return payload
+            # 5xx：分片合并未就绪，退避后重试
+            body = (resp.text or "")[:300]
+            last_err = BaiduHttpError(resp.status_code, FILE_API, body or "<空响应体>")
+            if attempt < attempts - 1:
+                wait = 2 ** (attempt + 1)
+                log.warning(
+                    "create 返回 HTTP %s（分片可能未就绪），%ss 后重试 (%d/%d): %s",
+                    resp.status_code, wait, attempt + 1, attempts - 1, remote_path,
+                )
+                time.sleep(wait)
+        raise last_err  # type: ignore[misc]
 
     # --- 列目录 / 解析 fs_id -------------------------------------------
 
@@ -176,5 +207,13 @@ class BaiduPanClient:
 
     @staticmethod
     def _json(resp: httpx.Response) -> dict:
-        resp.raise_for_status()
+        # 不直接 raise_for_status：百度即便返回 4xx/5xx，响应体里通常仍带
+        # errno 与提示，直接抛 HTTP 状态会把真实原因吞掉，难以定位。
+        if resp.status_code >= 400:
+            body: object
+            try:
+                body = resp.json()
+            except Exception:  # noqa: BLE001
+                body = (resp.text or "")[:800]
+            raise BaiduHttpError(resp.status_code, str(resp.url).split("?")[0], body)
         return resp.json()

@@ -150,6 +150,7 @@ function nodeNames(execHost: string | null): string {
             <th class="px-4 py-2.5 font-medium">队列</th>
             <th class="px-4 py-2.5 font-medium">计算节点</th>
             <th class="px-4 py-2.5 font-medium">提交时间</th>
+            <th class="px-4 py-2.5 font-medium">结束时间</th>
             <th class="px-4 py-2.5 font-medium">用时</th>
             <th v-if="showD3plot" class="px-4 py-2.5 font-medium">d3plot</th>
             <th class="px-4 py-2.5 font-medium">操作</th>
@@ -179,6 +180,9 @@ function nodeNames(execHost: string | null): string {
             <td class="px-4 py-2.5 text-slate-600 font-mono text-xs">{{ nodeNames(job.exec_host) }}</td>
             <td class="px-4 py-2.5 text-slate-600">
               {{ fmtTime(job.submit_ts) }}
+            </td>
+            <td class="px-4 py-2.5 text-slate-600">
+              {{ job.end_ts ? fmtTime(job.end_ts) : "—" }}
             </td>
             <td class="px-4 py-2.5 text-slate-600">
               {{ job.walltime_used || "—" }}

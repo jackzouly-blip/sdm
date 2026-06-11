@@ -13,6 +13,7 @@ import type {
   ListResponse,
   LoginResponse,
   MeResponse,
+  NetdiskPreview,
   PackageRequest,
   PreviewResponse,
   TaskSnapshot,
@@ -49,6 +50,20 @@ export const api = {
   async cancelJob(jobid: string): Promise<{ jobid: string; cancelled: boolean }> {
     const { data } = await http.post<{ jobid: string; cancelled: boolean }>(
       `/jobs/${encodeURIComponent(jobid)}/cancel`
+    );
+    return data;
+  },
+  // 预览将要上传到网盘的结果文件清单与总大小（不触发上传）
+  async netdiskPreview(jobid: string): Promise<NetdiskPreview> {
+    const { data } = await http.get<NetdiskPreview>(
+      `/jobs/${encodeURIComponent(jobid)}/netdisk-preview`
+    );
+    return data;
+  },
+  // 将任务结果（h3d/d3plot/binout/d3hsp）上传百度网盘并生成分享链接
+  async netdiskShare(jobid: string): Promise<{ task_id: string; jobid: string }> {
+    const { data } = await http.post<{ task_id: string; jobid: string }>(
+      `/jobs/${encodeURIComponent(jobid)}/netdisk-share`
     );
     return data;
   },

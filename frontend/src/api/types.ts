@@ -50,7 +50,35 @@ export interface JobDetail extends JobSummary {
   exit_status: number | null;
   extract_state: ExtractState;
   raw: Record<string, unknown>;
+  // 结果网盘自动分享
+  netdisk_state: NetdiskState;
+  netdisk_share_url: string | null;
+  netdisk_share_pwd: string | null;
+  netdisk_expire_at: number | null;
+  netdisk_files: string[] | null;
+  netdisk_msg: string | null;
+  netdisk_updated: number | null;
 }
+
+export interface NetdiskPreviewItem {
+  name: string;
+  size: number;
+}
+
+export interface NetdiskPreview {
+  count: number;
+  total_bytes: number;
+  files: NetdiskPreviewItem[];
+}
+
+export type NetdiskState =
+  | "none"
+  | "pending"
+  | "uploading"
+  | "partial" // 运行中流式上传：已传部分 d3plot 并生成链接，余下待任务结束后续传
+  | "done"
+  | "failed"
+  | "skipped";
 
 export type ExtractState =
   | "none"

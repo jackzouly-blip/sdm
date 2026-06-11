@@ -19,7 +19,7 @@ from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from ..auth.session import current_user
+from ..auth.session import current_user, is_admin_request
 from ..config import get_settings
 from ..logger import get_logger
 from ..pbs.parser import parse_qstat_f
@@ -60,9 +60,10 @@ def cpu_hours(
     start: str = Query(..., description="开始日期 YYYY-MM-DD（本地时间，含当天）"),
     end: str = Query(..., description="结束日期 YYYY-MM-DD（本地时间，含当天）"),
     user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
 ):
     """按用户统计 [start, end] 区间内的 CPU 机时。仅管理员可用。"""
-    if not get_settings().is_admin(user):
+    if not is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权查看统计")
     try:
         d0 = datetime.strptime(start, "%Y-%m-%d")
@@ -164,12 +165,13 @@ def jobs_list(
     end: str = Query(..., description="结束日期 YYYY-MM-DD"),
     only_user: str | None = Query(None, alias="user_filter", description="仅统计该用户，留空为全部"),
     user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
 ):
     """导出任务清单：区间内每个作业的明细（含开始/结束时间、核数、机时）。仅管理员。
 
     user_filter 非空时只返回该用户的作业。
     """
-    if not get_settings().is_admin(user):
+    if not is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权查看统计")
     try:
         d0 = datetime.strptime(start, "%Y-%m-%d")

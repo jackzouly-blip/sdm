@@ -16,7 +16,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from ..auth.session import current_user
+from ..auth.session import current_user, is_admin_request
 from ..config import get_settings
 from ..fs.browser import FsError, stat_path, write_file
 from ..privilege.actas import run_as_user
@@ -33,8 +33,8 @@ def _roots():
     return get_settings().fs_root_list
 
 
-def _require_admin(user: str) -> None:
-    if not get_settings().is_admin(user):
+def _require_admin(is_admin: bool) -> None:
+    if not is_admin:
         raise HTTPException(status_code=403, detail="需要管理员权限")
 
 
@@ -50,14 +50,14 @@ def list_templates(request: Request, user: str = Depends(current_user)):
 
 
 @router.post("/templates")
-def create_template(body: TemplateIn, request: Request, user: str = Depends(current_user)):
-    _require_admin(user)
+def create_template(body: TemplateIn, request: Request, user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request)):
+    _require_admin(is_admin)
     return row_to_dict(_db(request).create(body.name, body.content))
 
 
 @router.put("/templates/{tid}")
-def update_template(tid: int, body: TemplateIn, request: Request, user: str = Depends(current_user)):
-    _require_admin(user)
+def update_template(tid: int, body: TemplateIn, request: Request, user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request)):
+    _require_admin(is_admin)
     r = _db(request).update(tid, {"name": body.name, "content": body.content})
     if not r:
         raise HTTPException(status_code=404, detail="模板不存在")
@@ -65,8 +65,8 @@ def update_template(tid: int, body: TemplateIn, request: Request, user: str = De
 
 
 @router.delete("/templates/{tid}")
-def delete_template(tid: int, request: Request, user: str = Depends(current_user)):
-    _require_admin(user)
+def delete_template(tid: int, request: Request, user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request)):
+    _require_admin(is_admin)
     if not _db(request).delete(tid):
         raise HTTPException(status_code=404, detail="模板不存在")
     return {"ok": True}
@@ -113,9 +113,8 @@ class SubmitIn(BaseModel):
 
 
 @router.post("/jobs/submit")
-def submit_job(body: SubmitIn, request: Request, user: str = Depends(current_user)):
+def submit_job(body: SubmitIn, request: Request, user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request)):
     s = get_settings()
-    is_admin = s.is_admin(user)
     eff = "root" if is_admin else user  # 校验/读取身份
 
     # 1) 校验初始目录
