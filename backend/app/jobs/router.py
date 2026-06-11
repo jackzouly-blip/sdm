@@ -11,7 +11,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
-from ..auth.session import current_user
+from ..auth.session import current_user, is_admin_request
 from ..config import get_settings
 from ..db.jobs_db import JobsDB
 from ..logger import get_logger
@@ -19,6 +19,15 @@ from ..privilege.actas import call_as_user, run_as_user
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 log = get_logger(__name__)
+
+# 容错导入网盘自动分享任务（触发 netdisk_autoshare 注册）。
+# 网盘为可选子系统，缺失/异常时仅禁用该功能，绝不拖垮门户启动。
+try:
+    from ..netdisk import autoshare  # noqa: F401
+    _NETDISK_AVAILABLE = True
+except Exception as _e:  # noqa: BLE001
+    _NETDISK_AVAILABLE = False
+    log.warning("网盘自动分享模块不可用，相关功能已禁用: %s", _e)
 
 
 class JobSummary(BaseModel):
@@ -44,10 +53,42 @@ class JobDetail(JobSummary):
     exit_status: Optional[int]
     extract_state: str
     raw: dict
+    # 结果网盘自动分享
+    netdisk_state: str = "none"
+    netdisk_share_url: Optional[str] = None
+    netdisk_share_pwd: Optional[str] = None
+    netdisk_expire_at: Optional[float] = None
+    netdisk_files: Optional[List[str]] = None
+    netdisk_msg: Optional[str] = None
+    netdisk_updated: Optional[float] = None
 
 
 def _db(request: Request) -> JobsDB:
     return request.app.state.jobs_db
+
+
+def _netdisk_fields(r: sqlite3.Row) -> dict:
+    """从任务行安全提取网盘分享字段（兼容历史库缺列）。"""
+    keys = r.keys()
+
+    def g(k):
+        return r[k] if k in keys else None
+
+    files = None
+    if "netdisk_files" in keys and r["netdisk_files"]:
+        try:
+            files = json.loads(r["netdisk_files"])
+        except Exception:  # noqa: BLE001
+            files = None
+    return {
+        "netdisk_state": (g("netdisk_state") or "none"),
+        "netdisk_share_url": g("netdisk_share_url"),
+        "netdisk_share_pwd": g("netdisk_share_pwd"),
+        "netdisk_expire_at": g("netdisk_expire_at"),
+        "netdisk_files": files,
+        "netdisk_msg": g("netdisk_msg"),
+        "netdisk_updated": g("netdisk_updated"),
+    }
 
 
 def _row_to_summary(r: sqlite3.Row) -> JobSummary:
@@ -73,12 +114,40 @@ def _row_to_summary(r: sqlite3.Row) -> JobSummary:
 def list_jobs(
     request: Request,
     user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
     state: Optional[str] = Query(None, description="active / done，留空为全部"),
 ) -> List[JobSummary]:
     # 管理员查看所有用户的任务；普通用户只看自己的
-    owner = None if get_settings().is_admin(user) else user
+    owner = None if is_admin else user
     rows = _db(request).list_by_owner(owner, state=state)
     return [_row_to_summary(r) for r in rows]
+
+
+@router.get("/netdisk/queue")
+def netdisk_queue(
+    request: Request,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+    jobid: Optional[str] = Query(None, description="按任务过滤"),
+    status_filter: Optional[str] = Query(None, alias="status",
+                                         description="queued/uploading/done/failed"),
+) -> dict:
+    """网盘流式上传队列总览：各状态计数 + 队列项明细。供观测"文件是否已入队"。"""
+    db = _db(request)
+    counts = db.nq_counts()
+    items = db.nq_list(jobid=jobid, status=status_filter)
+    # 普通用户只看自己的队列项
+    out = []
+    for r in items:
+        if not is_admin and r["owner"] != user:
+            continue
+        out.append({
+            "id": r["id"], "jobid": r["jobid"], "owner": r["owner"],
+            "fname": r["fname"], "status": r["status"],
+            "enqueued_at": r["enqueued_at"], "updated_at": r["updated_at"],
+            "msg": r["msg"],
+        })
+    return {"counts": counts, "items": out}
 
 
 @router.get("/{jobid}", response_model=JobDetail)
@@ -86,12 +155,13 @@ def get_job(
     jobid: str,
     request: Request,
     user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
 ) -> JobDetail:
     row = _db(request).get(jobid)
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
     # 权限隔离：只能看自己的任务；管理员可访问所有任务
-    if row["owner"] != user and not get_settings().is_admin(user):
+    if row["owner"] != user and not is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该任务")
     summary = _row_to_summary(row)
     return JobDetail(
@@ -100,6 +170,7 @@ def get_job(
         exit_status=row["exit_status"],
         extract_state=row["extract_state"] if "extract_state" in row.keys() else "none",
         raw=json.loads(row["raw"]) if row["raw"] else {},
+        **_netdisk_fields(row),
     )
 
 
@@ -142,13 +213,14 @@ def cleanup_job_files(
     jobid: str,
     request: Request,
     user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
 ) -> dict:
     """清理任务工作目录下的 disk* / mes* / scr* 临时文件（以任务属主身份执行）。"""
     row = _db(request).get(jobid)
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
     # 权限隔离：仅任务属主或管理员可清理
-    if row["owner"] != user and not get_settings().is_admin(user):
+    if row["owner"] != user and not is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权操作该任务")
     workdir = row["workdir"] or ""
     if not workdir or not os.path.isdir(workdir):
@@ -167,13 +239,14 @@ def cancel_job(
     jobid: str,
     request: Request,
     user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
 ) -> dict:
     """终止运行/排队中的任务（qdel，以任务属主身份执行）。"""
     row = _db(request).get(jobid)
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
     # 权限隔离：仅任务属主或管理员可终止
-    if row["owner"] != user and not get_settings().is_admin(user):
+    if row["owner"] != user and not is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权操作该任务")
     # 只有活跃（运行/排队）任务才能终止
     if row["derived_state"] != "active":
@@ -211,3 +284,69 @@ def cancel_job(
         )
     log.info("已终止任务 %s（属主 %s，操作人 %s）", jobid, row["owner"], user)
     return {"jobid": jobid, "cancelled": True}
+
+
+@router.get("/{jobid}/netdisk-preview")
+def netdisk_preview(
+    jobid: str,
+    request: Request,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> dict:
+    """预览将要上传到网盘的结果文件清单与总大小（不触发上传）。"""
+    row = _db(request).get(jobid)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
+    if row["owner"] != user and not is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该任务")
+    workdir = get_settings().map_path(row["workdir"]) or ""
+    if not _NETDISK_AVAILABLE or not workdir or not os.path.isdir(workdir):
+        return {"count": 0, "total_bytes": 0, "files": []}
+    entries = autoshare.scan_result_entries(workdir)
+    files = [{"name": os.path.basename(p), "size": s} for p, s in entries]
+    return {
+        "count": len(files),
+        "total_bytes": sum(f["size"] for f in files),
+        "files": files,
+    }
+
+
+@router.post("/{jobid}/netdisk-share")
+def netdisk_share_job(
+    jobid: str,
+    request: Request,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> dict:
+    """将任务结果（h3d / d3plot / binout）上传到百度网盘并生成分享链接。"""
+    if not _NETDISK_AVAILABLE:
+        raise HTTPException(status_code=503, detail="网盘分享功能未启用")
+    row = _db(request).get(jobid)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
+    if row["owner"] != user and not get_settings().is_admin(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权操作该任务")
+    if row["derived_state"] != "done":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="任务尚未完成，暂不能上传分享"
+        )
+    cur = row["netdisk_state"] if "netdisk_state" in row.keys() else "none"
+    if cur in ("pending", "uploading"):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="已在上传中，请稍候")
+    tm = request.app.state.task_manager
+    task_id = tm.submit(
+        "netdisk_autoshare",
+        owner=row["owner"],
+        params={
+            "jobid": jobid,
+            # 后端可读的工作目录（/data→/caedata 映射）
+            "workdir": get_settings().map_path(row["workdir"]),
+            "owner": row["owner"],
+            "task_name": row["name"] or row["short_id"],
+            "short_id": row["short_id"],
+            "period": get_settings().netdisk_share_period,
+        },
+    )
+    _db(request).set_netdisk(jobid, netdisk_state="pending", netdisk_msg=None)
+    log.info("已提交网盘分享任务 %s（job=%s, 属主=%s, 操作人=%s）", task_id, jobid, row["owner"], user)
+    return {"task_id": task_id, "jobid": jobid}
