@@ -45,6 +45,9 @@ class JobSummary(BaseModel):
     walltime_used: Optional[str]
     nodes: Optional[str]
     exec_host: Optional[str]
+    # 本地排队中的提交请求(尚未/未能进入 PBS)才会有值；真实 PBS 任务恒为 None。
+    queue_id: Optional[int] = None
+    msg: Optional[str] = None
 
 
 class JobDetail(JobSummary):
@@ -110,6 +113,29 @@ def _row_to_summary(r: sqlite3.Row) -> JobSummary:
     )
 
 
+def _sq_row_to_summary(r: sqlite3.Row) -> JobSummary:
+    """把一条本地排队记录(尚未/未能进入 PBS)转成 JobSummary 形态，混入任务列表。"""
+    is_failed = r["status"] == "failed"
+    return JobSummary(
+        jobid=f"local:{r['id']}",
+        short_id=f"Q{r['id']}",
+        name=r["jobname"] or "",
+        owner=r["owner"],
+        pbs_state="F" if is_failed else "L",
+        derived_state="queue_failed" if is_failed else "queued_local",
+        queue=r["queue_name"],
+        workdir=get_settings().map_path(r["workdir"]),
+        submit_ts=r["queued_at"],
+        start_ts=None,
+        end_ts=None,
+        walltime_used=None,
+        nodes=None,
+        exec_host=None,
+        queue_id=r["id"],
+        msg=r["msg"],
+    )
+
+
 @router.get("", response_model=List[JobSummary])
 def list_jobs(
     request: Request,
@@ -120,7 +146,14 @@ def list_jobs(
     # 管理员查看所有用户的任务；普通用户只看自己的
     owner = None if is_admin else user
     rows = _db(request).list_by_owner(owner, state=state)
-    return [_row_to_summary(r) for r in rows]
+    out = [_row_to_summary(r) for r in rows]
+    if state in (None, "active"):
+        # 本地排队中/提交失败的记录也算"活跃"的一部分，一并展示；
+        # submitted/cancelled 不重复展示(submitted 很快会被轮询采集为真实任务行)。
+        for r in _db(request).sq_list(owner=owner):
+            if r["status"] in ("queued", "submitting", "failed"):
+                out.append(_sq_row_to_summary(r))
+    return out
 
 
 @router.get("/netdisk/queue")
@@ -284,6 +317,28 @@ def cancel_job(
         )
     log.info("已终止任务 %s（属主 %s，操作人 %s）", jobid, row["owner"], user)
     return {"jobid": jobid, "cancelled": True}
+
+
+@router.post("/queue/{item_id}/cancel")
+def cancel_queued_submission(
+    item_id: int,
+    request: Request,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> dict:
+    """撤回一个尚未提交到 PBS 的本地排队项（未占用任何 PBS 资源，无需 qdel）。"""
+    db = _db(request)
+    row = db.sq_get(item_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="排队项不存在")
+    if row["owner"] != user and not is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权操作该排队项")
+    if not db.sq_cancel(item_id, owner=None if is_admin else user):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="已提交或已撤回，无法取消"
+        )
+    log.info("已撤回本地排队项 %s（属主 %s，操作人 %s）", item_id, row["owner"], user)
+    return {"id": item_id, "cancelled": True}
 
 
 @router.get("/{jobid}/netdisk-preview")

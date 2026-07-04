@@ -30,6 +30,12 @@ export function jobBadge(
   if (derived === "done") {
     return { text: "已完成", cls: "bg-slate-100 text-slate-600" };
   }
+  if (derived === "queued_local") {
+    return { text: "本地排队中", cls: "bg-amber-50 text-amber-600" };
+  }
+  if (derived === "queue_failed") {
+    return { text: "提交失败", cls: "bg-rose-100 text-rose-700" };
+  }
   switch (pbsState) {
     case "R":
       return { text: "运行中", cls: "bg-blue-100 text-blue-700" };

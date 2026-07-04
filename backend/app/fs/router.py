@@ -340,10 +340,14 @@ def fs_download(
     # 自动设置 Content-Length 并支持 HTTP Range（断点续传 / 下载器多线程）。
     # 自定义流式生成器逐块 yield 在高延迟/丢包网络上会被 chunk 间隙拖低吞吐，故弃用。
     # 权限：路径已由 stat_path(以目标用户身份) 校验在用户可见根内；服务以 root 读取文件。
+    # 禁用浏览器缓存：服务器上的文件被替换后，重新下载须拿到新内容而非旧缓存。
+    # FileResponse 自带基于 mtime/size 的 ETag/Last-Modified，no-cache 会强制每次
+    # 带条件请求校验，文件变了即返回新内容，未变则 304，兼顾正确与效率。
     return FileResponse(
         norm,
         media_type="application/octet-stream",
         filename=filename,
+        headers={"Cache-Control": "no-cache"},
     )
 
 

@@ -22,6 +22,7 @@ const loading = ref(true);
 const submitting = ref(false);
 const error = ref("");
 const okJobid = ref("");
+const queuedInfo = ref<{ id: number; total: number } | null>(null); // 本地排队中(未进入PBS)
 
 onMounted(async () => {
   try {
@@ -66,8 +67,13 @@ async function submit() {
       input_file: inputFile.value.trim(),
       template_id: templateId.value,
     });
-    okJobid.value = r.jobid;
-    emit("submitted", r.jobid);
+    if (r.status === "queued") {
+      queuedInfo.value = { id: r.queue_id!, total: r.queued_total ?? 1 };
+      emit("submitted", `local:${r.queue_id}`);
+    } else {
+      okJobid.value = r.jobid!;
+      emit("submitted", r.jobid!);
+    }
   } catch (e) {
     error.value = errMsg(e);
   } finally {
@@ -91,12 +97,23 @@ async function submit() {
           <Loader2 :size="18" class="animate-spin" /> 加载中…
         </div>
 
-        <!-- 提交成功 -->
+        <!-- 提交成功：已直接进入 PBS -->
         <div v-else-if="okJobid" class="py-8 flex flex-col items-center gap-3 text-center">
           <CheckCircle2 :size="40" class="text-emerald-500" />
           <div class="text-slate-700">已提交，作业号</div>
           <div class="font-mono text-lg text-slate-800">{{ okJobid }}</div>
           <div class="text-xs text-slate-400">可在「任务」列表查看（轮询稍后收录）</div>
+          <button class="mt-2 px-4 py-1.5 text-sm rounded-md bg-blue-600 text-white hover:bg-blue-700" @click="emit('close')">完成</button>
+        </div>
+
+        <!-- 本地排队中：受并发配额或核数余量限制，暂未进入 PBS -->
+        <div v-else-if="queuedInfo" class="py-8 flex flex-col items-center gap-3 text-center">
+          <Loader2 :size="40" class="text-amber-500" />
+          <div class="text-slate-700">已加入本地排队</div>
+          <div class="text-xs text-slate-400">
+            当前并发已达配额上限或集群核数暂不充裕，有空位会自动提交，无需重新操作
+          </div>
+          <div class="text-xs text-slate-400">可在「任务」列表查看排队状态，也可随时取消</div>
           <button class="mt-2 px-4 py-1.5 text-sm rounded-md bg-blue-600 text-white hover:bg-blue-700" @click="emit('close')">完成</button>
         </div>
 

@@ -26,6 +26,7 @@ from .shell.router import router as shell_router
 from .stats.router import router as stats_router
 from .submit.db import TemplatesDB
 from .submit.router import router as submit_router
+from .submit.scheduler import SubmissionScheduler, set_scheduler
 from .tasks.manager import TaskManager
 
 settings = get_settings()
@@ -50,6 +51,8 @@ async def lifespan(app: FastAPI):
         stable_seconds=settings.netdisk_stream_stable_seconds,
     )
     set_streamer(streamer)
+    scheduler = SubmissionScheduler(db, interval=settings.submit_scheduler_interval)
+    set_scheduler(scheduler)
     app.state.jobs_db = db
     app.state.poller = poller
     app.state.task_manager = task_manager
@@ -58,6 +61,7 @@ async def lifespan(app: FastAPI):
     app.state.templates_db = templates_db
     app.state.favorites_db = favorites_db
     app.state.dispatcher = dispatcher
+    app.state.scheduler = scheduler
     if os.geteuid() != 0:
         log.warning("当前非 root 运行：act-as-user 降权将不可用，仅适合本地接口联调")
     else:
@@ -69,11 +73,13 @@ async def lifespan(app: FastAPI):
         log.exception("提取补派发失败")
     poller.start()
     streamer.start()
+    scheduler.start()
     try:
         yield
     finally:
         poller.stop()
         streamer.stop()
+        scheduler.stop()
         task_manager.close()
         rules_db.close()
         templates_db.close()
@@ -113,3 +119,42 @@ def health() -> dict:
         "poller_last_ok": getattr(poller, "last_ok_ts", None),
         "poller_last_error": getattr(poller, "last_error", None),
     }
+
+
+def _current_ipv6() -> Optional[str]:
+    """读取本机当前全局 IPv6 地址（排除链路本地/回环/ULA），优先后缀 ::100。
+
+    解析 /proc/net/if_inet6（无外部依赖）。供前端展示"IPv6 入口"，
+    ISP 前缀变化由 ipv6-autoheal 跟进，本接口总是返回当下真实地址。"""
+    import ipaddress
+
+    gua = ipaddress.ip_network("2000::/3")  # 全局单播地址段
+    cands: list[str] = []
+    try:
+        with open("/proc/net/if_inet6") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 6:
+                    continue
+                raw, _idx, _plen, scope, _flags, _ifname = parts[:6]
+                if scope != "00":  # 00 = global scope（排除 fe80 链路本地等）
+                    continue
+                addr = ":".join(raw[i:i + 4] for i in range(0, 32, 4))
+                try:
+                    ip = ipaddress.IPv6Address(addr)
+                except ValueError:
+                    continue
+                if ip in gua:  # 仅取全局单播，排除 ULA(fc00::/7)/回环等
+                    cands.append(str(ip))
+    except OSError:
+        return None
+    for a in cands:
+        if a.endswith("::100"):
+            return a
+    return cands[0] if cands else None
+
+
+@app.get("/system/ipv6")
+def system_ipv6() -> dict:
+    """当前服务器全局 IPv6 地址（无需登录，供登录前/顶栏展示 IPv6 入口）。"""
+    return {"ipv6": _current_ipv6()}

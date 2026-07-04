@@ -1,0 +1,10 @@
+[Unit]
+Description=IPv6 prefix auto-heal (keep <current-prefix>::100 on em1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# 网卡与后缀按需修改：SUFFIX 是希望对外稳定的主机部分
+Environment=IFACE=em1 SUFFIX=::100 PROBE=240c::6666
+ExecStart=/opt/hpc-portal/deploy/ipv6-autoheal.sh

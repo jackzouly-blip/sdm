@@ -9,6 +9,7 @@ import type {
   JobDetail,
   JobSummary,
   JobTemplate,
+  UserPolicy,
   SubmitResult,
   ListResponse,
   LoginResponse,
@@ -33,6 +34,12 @@ export const api = {
     return data;
   },
 
+  // 服务器当前全局 IPv6 地址（ISP 前缀变化时随之更新）；无则返回 null
+  async systemIpv6(): Promise<string | null> {
+    const { data } = await http.get<{ ipv6: string | null }>("/system/ipv6");
+    return data.ipv6;
+  },
+
   // --- 任务（PBS）---
   async listJobs(state?: "active" | "done"): Promise<JobSummary[]> {
     const { data } = await http.get<JobSummary[]>("/jobs", {
@@ -50,6 +57,13 @@ export const api = {
   async cancelJob(jobid: string): Promise<{ jobid: string; cancelled: boolean }> {
     const { data } = await http.post<{ jobid: string; cancelled: boolean }>(
       `/jobs/${encodeURIComponent(jobid)}/cancel`
+    );
+    return data;
+  },
+  // 撤回一个尚未提交到 PBS 的本地排队项（未占用 PBS 资源，无需 qdel）
+  async cancelQueuedSubmission(queueId: number): Promise<{ id: number; cancelled: boolean }> {
+    const { data } = await http.post<{ id: number; cancelled: boolean }>(
+      `/jobs/queue/${queueId}/cancel`
     );
     return data;
   },
@@ -408,6 +422,26 @@ export const api = {
   async deleteTemplate(id: number): Promise<void> {
     await http.delete(`/templates/${id}`);
   },
+
+  // --- 用户提交策略（管理员）---
+  async listUserPolicies(): Promise<UserPolicy[]> {
+    const { data } = await http.get<UserPolicy[]>("/admin/user-policies");
+    return data;
+  },
+  async upsertUserPolicy(
+    user: string,
+    payload: { max_concurrent: number | null; priority: number }
+  ): Promise<UserPolicy> {
+    const { data } = await http.put<UserPolicy>(
+      `/admin/user-policies/${encodeURIComponent(user)}`,
+      payload
+    );
+    return data;
+  },
+  async deleteUserPolicy(user: string): Promise<void> {
+    await http.delete(`/admin/user-policies/${encodeURIComponent(user)}`);
+  },
+
   async submitJob(payload: {
     name: string;
     cores: number;

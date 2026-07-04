@@ -54,6 +54,16 @@ class JobPoller:
                     d.dispatch_many(finished)
                 except Exception:  # noqa: BLE001
                     log.exception("提取派发失败")
+        # 任务结束会释放核数/用户配额名额，立刻触发一次准入调度补位，
+        # 不必等调度器自己的兜底轮询间隔。
+        from ..submit.scheduler import get_scheduler
+
+        sched = get_scheduler()
+        if sched is not None:
+            try:
+                sched.tick()
+            except Exception:  # noqa: BLE001
+                log.exception("准入调度触发失败")
         self.last_ok_ts = time.time()
         self.last_error = None
         return len(jobs)

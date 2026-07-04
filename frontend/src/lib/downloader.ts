@@ -98,7 +98,12 @@ export function startDownload(opts: DownloadOptions): DownloadControls {
     const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
     if (startOffset > 0) headers["Range"] = `bytes=${startOffset}-`;
 
-    const resp = await fetch(url, { headers, signal: controller.signal });
+    // no-store：绕过浏览器 HTTP 缓存，确保服务器文件被替换后拿到的是新内容
+    const resp = await fetch(url, {
+      headers,
+      signal: controller.signal,
+      cache: "no-store",
+    });
     if (!resp.ok && resp.status !== 206) {
       throw new Error(`下载失败：HTTP ${resp.status}`);
     }

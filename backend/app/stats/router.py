@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from ..auth.session import current_user, is_admin_request
 from ..config import get_settings
 from ..logger import get_logger
+from ..pbs.cores import cores_from_nodes as _cores_from_nodes
 from ..pbs.parser import parse_qstat_f
 from ..pbs.qstat import _qstat_bin
 
@@ -37,22 +38,10 @@ TORQUE_TIME_FMT = "%a %b %d %H:%M:%S %Y"
 # accounting E 记录的 key=value 串解析：值可能含空格（如 group=domain users），
 # 故按“下一个 key= 边界”切分，key 仅由字母/数字/点/下划线组成。
 _KV_RE = re.compile(r"([\w.]+)=(.*?)(?=\s+[\w.]+=|\s*$)")
-_PPN_RE = re.compile(r"ppn=(\d+)")
 
 
 def _parse_acct_fields(rest: str) -> Dict[str, str]:
     return {m.group(1): m.group(2) for m in _KV_RE.finditer(rest)}
-
-
-def _cores_from_nodes(nodes: str | None, nodect: str | None) -> int:
-    """从 Resource_List.nodes(如 '1:ppn=64:first') + nodect 估算核数。"""
-    m = _PPN_RE.search(nodes or "")
-    ppn = int(m.group(1)) if m else 1
-    try:
-        n = int(nodect) if nodect else 1
-    except ValueError:
-        n = 1
-    return max(1, n) * max(1, ppn)
 
 
 @router.get("/cpu-hours")

@@ -1,15 +1,16 @@
-"""作业提交：模板 CRUD（管理员）+ 提交作业（qsub）。
+"""作业提交：模板 CRUD（管理员）+ 提交作业（本地排队 → 准入调度器 qsub）。
 
 提交流程：取模板内容 → 替换 ###init_dir_path###/###input_file_path### → 把 #PBS -l
 nodes 行注入 ppn=<核数>(保留原有节点特性) → 以"初始目录属主"身份把脚本写入初始目录
-并 qsub 到默认队列 → 返回作业号(轮询自动收录到作业管理)。
+→ 写入本地排队队列(submission_queue) → 同步触发一次准入调度：无策略限制且核数
+充裕时会在本次请求内直接 qsub 完成(与旧行为一致)，否则留在队列里等待
+SubmissionScheduler 后续补位（见 app/submit/scheduler.py）。
 """
 from __future__ import annotations
 
 import os
 import pwd
 import re
-import shutil
 import uuid
 from typing import Optional
 
@@ -18,11 +19,16 @@ from pydantic import BaseModel
 
 from ..auth.session import current_user, is_admin_request
 from ..config import get_settings
+from ..db.jobs_db import SQ_FAILED, SQ_QUEUED, SQ_SUBMITTED
 from ..fs.browser import FsError, stat_path, write_file
+from ..logger import get_logger
+from ..pbs.cores import cores_from_nodes
 from ..privilege.actas import run_as_user
 from .db import row_to_dict
+from .scheduler import get_scheduler
 
 router = APIRouter(tags=["submit"])
+log = get_logger(__name__)
 
 
 def _db(request: Request):
@@ -69,6 +75,51 @@ def delete_template(tid: int, request: Request, user: str = Depends(current_user
     _require_admin(is_admin)
     if not _db(request).delete(tid):
         raise HTTPException(status_code=404, detail="模板不存在")
+    return {"ok": True}
+
+
+# ===== 用户提交策略（管理员）=====
+# 未配置的用户 = 不限并发、优先级0（与不开启本功能时行为一致）。
+class UserPolicyIn(BaseModel):
+    max_concurrent: Optional[int] = None  # 留空=不限并发（仍受全局核数约束）
+    priority: int = 0                     # 越大越优先抢占空出来的核数/名额
+
+
+def _policy_to_dict(row) -> dict:
+    return {
+        "user": row["user"],
+        "max_concurrent": row["max_concurrent"],
+        "priority": row["priority"],
+        "updated_at": row["updated_at"],
+    }
+
+
+@router.get("/admin/user-policies")
+def list_user_policies(request: Request, user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request)):
+    _require_admin(is_admin)
+    return [_policy_to_dict(r) for r in request.app.state.jobs_db.policy_list()]
+
+
+@router.put("/admin/user-policies/{target_user}")
+def upsert_user_policy(
+    target_user: str, body: UserPolicyIn, request: Request,
+    user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request),
+):
+    _require_admin(is_admin)
+    if body.max_concurrent is not None and body.max_concurrent < 1:
+        raise HTTPException(status_code=400, detail="max_concurrent 需为正整数或留空(不限)")
+    row = request.app.state.jobs_db.policy_upsert(target_user, body.max_concurrent, body.priority)
+    return _policy_to_dict(row)
+
+
+@router.delete("/admin/user-policies/{target_user}")
+def delete_user_policy(
+    target_user: str, request: Request,
+    user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request),
+):
+    _require_admin(is_admin)
+    if not request.app.state.jobs_db.policy_delete(target_user):
+        raise HTTPException(status_code=404, detail="策略不存在")
     return {"ok": True}
 
 
@@ -175,16 +226,47 @@ def submit_job(body: SubmitIn, request: Request, user: str = Depends(current_use
         raise HTTPException(status_code=e.status, detail="写入提交脚本失败: " + e.message)
     script_path = os.path.join(init_dir, fname)
 
-    # 7) qsub（用绝对路径，因降权后 PATH 不含 Torque bin）
-    qsub = shutil.which("qsub") or "/usr/local/torque-6.1.2/bin/qsub"
-    queue = (body.queue or "").strip() or s.submit_default_queue or "batch"
-    argv = [qsub, "-N", jobname, "-q", queue]
-    if extra_l:
-        argv += ["-l", extra_l]
-    argv.append(script_path)
-    proc = run_as_user(exec_user, argv, cwd=init_dir, timeout=60)
-    if proc.returncode != 0:
-        err = proc.stderr.decode("utf-8", "replace").strip()[:500]
-        raise HTTPException(status_code=500, detail=f"qsub 失败: {err or '未知错误'}")
-    jobid = proc.stdout.decode("utf-8", "replace").strip()
-    return {"jobid": jobid, "exec_user": exec_user, "name": jobname, "script": script_path}
+    # 7) 写入本地排队队列，交给准入调度器判定何时真正 qsub。
+    #    核数记账：优先用请求核数(会被注入脚本)，否则从脚本自带的 nodes 行解析，
+    #    都拿不到则保守按 1 核算。
+    if cores > 0:
+        est_cores = cores
+    else:
+        m = _NODES_RE.search(script)
+        est_cores = cores_from_nodes(m.group(2)) if m else 1
+    queue_name = (body.queue or "").strip() or s.submit_default_queue or "batch"
+    jobs_db = request.app.state.jobs_db
+    qid = jobs_db.sq_enqueue(
+        exec_user, jobname, queue_name, script_path, init_dir, est_cores, extra_l
+    )
+
+    # 同步触发一次准入调度：无策略限制且核数充裕时会在本次请求内直接提交完成，
+    # 对没配置策略的默认用户而言与"直接 qsub"体验一致，不会有排队感。
+    sched = get_scheduler()
+    if sched is not None:
+        try:
+            sched.tick()
+        except Exception:  # noqa: BLE001
+            log.exception("提交后触发准入调度失败")
+
+    row = jobs_db.sq_get(qid)
+    if row["status"] == SQ_SUBMITTED:
+        return {
+            "status": "submitted",
+            "jobid": row["jobid"],
+            "exec_user": exec_user,
+            "name": jobname,
+            "script": script_path,
+        }
+    if row["status"] == SQ_FAILED:
+        raise HTTPException(status_code=500, detail=f"qsub 失败: {row['msg'] or '未知错误'}")
+    # 仍在本地排队：受用户并发配额或全局核数余量限制，等待调度器后续补位
+    queued_total = len(jobs_db.sq_list(status=SQ_QUEUED))
+    return {
+        "status": "queued",
+        "queue_id": qid,
+        "queued_total": queued_total,
+        "exec_user": exec_user,
+        "name": jobname,
+        "script": script_path,
+    }

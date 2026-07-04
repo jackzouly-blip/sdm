@@ -57,6 +57,11 @@ const router = createRouter({
           component: () => import("@/views/TemplatesView.vue"),
         },
         {
+          path: "user-policies",
+          name: "user-policies",
+          component: () => import("@/views/UserPoliciesView.vue"),
+        },
+        {
           path: "stats",
           name: "stats",
           component: () => import("@/views/StatsView.vue"),

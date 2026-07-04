@@ -673,6 +673,14 @@ defineExpose({ reload: () => load() });
         </button>
       </div>
       <button
+        class="p-1 rounded hover:bg-blue-50 text-slate-500 hover:text-blue-600 disabled:opacity-50"
+        title="刷新当前目录"
+        :disabled="loading"
+        @click="load()"
+      >
+        <RefreshCw :size="16" :class="{ 'animate-spin': loading }" />
+      </button>
+      <button
         v-if="!rootLock"
         class="p-1 rounded hover:bg-amber-50"
         :title="isFav ? '取消收藏当前目录' : '收藏当前目录'"
@@ -768,13 +776,6 @@ defineExpose({ reload: () => load() });
           @click="showSubmit = true"
         >
           <Rocket :size="15" /> 提交作业
-        </button>
-        <button
-          class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-slate-300 bg-white hover:bg-slate-50"
-          :disabled="loading"
-          @click="load()"
-        >
-          <RefreshCw :size="15" :class="{ 'animate-spin': loading }" /> 刷新
         </button>
         <input
           ref="fileInput"

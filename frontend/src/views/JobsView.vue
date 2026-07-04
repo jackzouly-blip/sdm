@@ -31,6 +31,21 @@ async function cancel(job: JobSummary) {
     cancelling.value = null;
   }
 }
+
+// 撤回一个尚未进入 PBS 的本地排队项（未占用 PBS 资源，无需确认弹窗那么谨慎）
+async function cancelQueued(job: JobSummary) {
+  if (job.queue_id == null) return;
+  cancelling.value = job.jobid;
+  error.value = "";
+  try {
+    await api.cancelQueuedSubmission(job.queue_id);
+    await load();
+  } catch (e) {
+    error.value = errMsg(e);
+  } finally {
+    cancelling.value = null;
+  }
+}
 const filter = ref<"" | "active" | "done">("active");
 
 // d3plot 文件数：默认关(开启才逐个扫目录，避免列表加载变慢)
@@ -74,6 +89,8 @@ async function load() {
 }
 
 function open(job: JobSummary) {
+  // 本地排队中/提交失败的记录不是真实 PBS 任务，没有详情页可看
+  if (job.queue_id != null) return;
   router.push({ name: "job-detail", params: { jobid: job.jobid } });
 }
 
@@ -160,7 +177,8 @@ function nodeNames(execHost: string | null): string {
           <tr
             v-for="job in jobs"
             :key="job.jobid"
-            class="border-t border-slate-100 hover:bg-blue-50/40 cursor-pointer"
+            class="border-t border-slate-100 hover:bg-blue-50/40"
+            :class="job.queue_id != null ? '' : 'cursor-pointer'"
             @click="open(job)"
           >
             <td class="px-4 py-2.5 font-mono text-slate-700">
@@ -172,6 +190,7 @@ function nodeNames(execHost: string | null): string {
               <span
                 class="px-2 py-0.5 rounded-full text-xs"
                 :class="jobBadge(job.pbs_state, job.derived_state).cls"
+                :title="job.msg || ''"
               >
                 {{ jobBadge(job.pbs_state, job.derived_state).text }}
               </span>
@@ -203,6 +222,17 @@ function nodeNames(execHost: string | null): string {
                 <Loader2 v-if="cancelling === job.jobid" :size="13" class="animate-spin" />
                 <Ban v-else :size="13" />
                 终止
+              </button>
+              <button
+                v-else-if="job.derived_state === 'queued_local'"
+                class="inline-flex items-center gap-1 px-2 py-1 text-xs rounded-md border border-amber-200 text-amber-700 hover:bg-amber-50 disabled:opacity-60"
+                :disabled="cancelling === job.jobid"
+                title="尚未进入 PBS，撤回不占用任何计算资源"
+                @click.stop="cancelQueued(job)"
+              >
+                <Loader2 v-if="cancelling === job.jobid" :size="13" class="animate-spin" />
+                <Ban v-else :size="13" />
+                取消排队
               </button>
               <span v-else class="text-slate-300">—</span>
             </td>

@@ -10,9 +10,10 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from ..logger import get_logger
+from ..pbs.cores import cores_from_nodes
 from ..pbs.parser import Job
 
 log = get_logger(__name__)
@@ -72,7 +73,44 @@ CREATE TABLE IF NOT EXISTS netdisk_queue (
 );
 CREATE INDEX IF NOT EXISTS idx_ndq_status ON netdisk_queue(status);
 CREATE INDEX IF NOT EXISTS idx_ndq_job ON netdisk_queue(jobid);
+
+-- 本地提交排队：作业提交请求先落地于此，由 SubmissionScheduler 按用户配额与
+-- 全局核数余量决定何时真正 qsub。默认(无策略/无核数上限)配置下该表几乎立即
+-- 流转到 submitted，行为与"直接 qsub"一致。
+CREATE TABLE IF NOT EXISTS submission_queue (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner         TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'queued',  -- queued/submitting/submitted/cancelled/failed
+    jobname       TEXT NOT NULL,
+    queue_name    TEXT NOT NULL,
+    script_path   TEXT NOT NULL,
+    workdir       TEXT NOT NULL,
+    cores         INTEGER NOT NULL,
+    extra_l       TEXT,
+    jobid         TEXT,
+    msg           TEXT,
+    queued_at     REAL NOT NULL,
+    submitted_at  REAL,
+    updated_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_subq_status ON submission_queue(status);
+CREATE INDEX IF NOT EXISTS idx_subq_owner ON submission_queue(owner);
+
+-- 用户提交策略：未配置的用户=不限并发、优先级0（与现状一致）。
+CREATE TABLE IF NOT EXISTS user_policies (
+    user           TEXT PRIMARY KEY,
+    max_concurrent INTEGER,
+    priority       INTEGER NOT NULL DEFAULT 0,
+    updated_at     REAL NOT NULL
+);
 """
+
+# submission_queue 状态
+SQ_QUEUED = "queued"
+SQ_SUBMITTING = "submitting"
+SQ_SUBMITTED = "submitted"
+SQ_CANCELLED = "cancelled"
+SQ_FAILED = "failed"
 
 
 class JobsDB:
@@ -87,6 +125,7 @@ class JobsDB:
             self.conn.executescript(_SCHEMA)
             self._migrate()
             self._reconcile_stale_netdisk()
+            self._reconcile_stale_submissions()
             self.conn.commit()
 
     def _migrate(self) -> None:
@@ -146,6 +185,25 @@ class JobsDB:
             )
             if q.rowcount:
                 log.warning("启动自愈：%d 个中断的上传队列项退回 queued", q.rowcount)
+
+    def _reconcile_stale_submissions(self) -> None:
+        """启动自愈：'submitting' 是"正在调用 qsub"的瞬时状态，进程若在此时
+        崩溃，重启后无法确认 qsub 是否已经成功——为避免重复提交，一律置 failed，
+        由用户/管理员确认后手动重新提交。"""
+        if "submission_queue" not in {
+            r["name"]
+            for r in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }:
+            return
+        cur = self.conn.execute(
+            "UPDATE submission_queue SET status=?, msg=?, updated_at=? "
+            "WHERE status=?",
+            (SQ_FAILED, "服务重启导致提交中断，请确认是否已提交后重试", time.time(), SQ_SUBMITTING),
+        )
+        if cur.rowcount:
+            log.warning("启动自愈：重置 %d 个中断的本地排队提交为 failed", cur.rowcount)
 
     def close(self) -> None:
         self.conn.close()
@@ -424,3 +482,160 @@ class JobsDB:
         params.append(limit)
         with self._lock:
             return self.conn.execute(sql, params).fetchall()
+
+    # --- 本地提交排队（准入调度）-----------------------------------------
+
+    def sq_enqueue(
+        self,
+        owner: str,
+        jobname: str,
+        queue_name: str,
+        script_path: str,
+        workdir: str,
+        cores: int,
+        extra_l: Optional[str] = None,
+    ) -> int:
+        """把一次提交请求写入本地排队队列（真正 qsub 前的落地），返回队列项 id。"""
+        now = time.time()
+        with self._lock:
+            cur = self.conn.execute(
+                """INSERT INTO submission_queue
+                    (owner, status, jobname, queue_name, script_path, workdir,
+                     cores, extra_l, queued_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (owner, SQ_QUEUED, jobname, queue_name, script_path, workdir,
+                 cores, extra_l, now, now),
+            )
+            self.conn.commit()
+            return cur.lastrowid
+
+    def sq_get(self, item_id: int) -> Optional[sqlite3.Row]:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM submission_queue WHERE id=?", (item_id,)
+            ).fetchone()
+
+    def sq_list(
+        self, owner: Optional[str] = None, status: Optional[str] = None, limit: int = 500
+    ) -> List[sqlite3.Row]:
+        """列出本地排队项（可按属主/状态过滤），供列表页展示与调度器扫描使用。"""
+        sql = "SELECT * FROM submission_queue WHERE 1=1"
+        params: list = []
+        if owner is not None:
+            sql += " AND owner=?"
+            params.append(owner)
+        if status is not None:
+            sql += " AND status=?"
+            params.append(status)
+        sql += " ORDER BY queued_at LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            return self.conn.execute(sql, params).fetchall()
+
+    def sq_claim_for_submit(self, item_id: int) -> bool:
+        """原子地把队列项从 queued 置为 submitting(准备调用 qsub)，成功返回 True。
+
+        供调度器认领——避免同一项被并发的两次 tick(定时线程 + 提交请求内联触发
+        + 轮询完成回调)重复提交。"""
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE submission_queue SET status=?, updated_at=? "
+                "WHERE id=? AND status=?",
+                (SQ_SUBMITTING, time.time(), item_id, SQ_QUEUED),
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def sq_mark_submitted(self, item_id: int, jobid: str) -> None:
+        now = time.time()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE submission_queue SET status=?, jobid=?, "
+                "submitted_at=?, updated_at=? WHERE id=?",
+                (SQ_SUBMITTED, jobid, now, now, item_id),
+            )
+            self.conn.commit()
+
+    def sq_mark_failed(self, item_id: int, msg: str) -> None:
+        """qsub 调用失败：置为终态 failed，不自动重试（脚本/环境问题需人工确认）。"""
+        with self._lock:
+            self.conn.execute(
+                "UPDATE submission_queue SET status=?, msg=?, updated_at=? WHERE id=?",
+                (SQ_FAILED, msg, time.time(), item_id),
+            )
+            self.conn.commit()
+
+    def sq_cancel(self, item_id: int, owner: Optional[str] = None) -> bool:
+        """撤回一个尚未提交到 PBS 的排队项（仅 queued 状态可撤回）。
+
+        owner 非空时要求属主匹配，供非管理员用户的越权校验。"""
+        sql = "UPDATE submission_queue SET status=?, updated_at=? WHERE id=? AND status=?"
+        params: list = [SQ_CANCELLED, time.time(), item_id, SQ_QUEUED]
+        if owner is not None:
+            sql += " AND owner=?"
+            params.append(owner)
+        with self._lock:
+            cur = self.conn.execute(sql, params)
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    # --- 准入调度所需的用量统计 -------------------------------------------
+
+    def active_counts_by_owner(self) -> Dict[str, int]:
+        """各用户当前活跃（Q+R，即 derived_state=active）任务数。
+
+        覆盖门户之外直接 qsub 的任务，用作 per-user 并发配额判定的分母。"""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT owner, COUNT(*) n FROM jobs WHERE derived_state=? GROUP BY owner",
+                (ACTIVE,),
+            ).fetchall()
+        return {r["owner"]: r["n"] for r in rows}
+
+    def running_cores_total(self) -> int:
+        """当前集群已用核数 = 所有 pbs_state='R' 活跃任务的核数之和。"""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT nodes FROM jobs WHERE derived_state=? AND pbs_state='R'",
+                (ACTIVE,),
+            ).fetchall()
+        return sum(cores_from_nodes(r["nodes"]) for r in rows)
+
+    # --- 用户提交策略 -------------------------------------------------------
+
+    def policy_get(self, user: str) -> Optional[sqlite3.Row]:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM user_policies WHERE user=?", (user,)
+            ).fetchone()
+
+    def policy_list(self) -> List[sqlite3.Row]:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM user_policies ORDER BY user"
+            ).fetchall()
+
+    def policy_upsert(
+        self, user: str, max_concurrent: Optional[int], priority: int = 0
+    ) -> sqlite3.Row:
+        now = time.time()
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO user_policies (user, max_concurrent, priority, updated_at)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT(user) DO UPDATE SET
+                       max_concurrent=excluded.max_concurrent,
+                       priority=excluded.priority,
+                       updated_at=excluded.updated_at""",
+                (user, max_concurrent, priority, now),
+            )
+            self.conn.commit()
+            return self.conn.execute(
+                "SELECT * FROM user_policies WHERE user=?", (user,)
+            ).fetchone()
+
+    def policy_delete(self, user: str) -> bool:
+        with self._lock:
+            cur = self.conn.execute("DELETE FROM user_policies WHERE user=?", (user,))
+            self.conn.commit()
+            return cur.rowcount > 0

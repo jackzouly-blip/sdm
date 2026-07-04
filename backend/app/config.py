@@ -79,6 +79,13 @@ class Settings(BaseSettings):
     # 作业提交默认队列（Torque 未设 default_queue 时必须 qsub -q 指定）
     submit_default_queue: str = "batch"
 
+    # 提交准入调度：集群总核数上限，用于全局核数网关。0=不限（不做全局核数判断，
+    # 仅按 per-user 配额本地排队——这是功能的默认/休眠状态，不影响现状）。
+    cluster_total_cores: int = 0
+    # 准入调度器兜底轮询间隔（秒）；正常情况下由"新提交"和"轮询发现任务结束"
+    # 两个事件触发即时调度，这个间隔只是兜底防漏。
+    submit_scheduler_interval: int = 10
+
     # 数据提取：任务完成后在 workdir 运行第三方提取命令的超时（秒）
     extract_timeout: int = 1800
     # 可管理提取规则的运维白名单（冒号分隔）。留空表示不限制（适合本地联调）。

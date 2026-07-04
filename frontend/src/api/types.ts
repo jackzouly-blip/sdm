@@ -8,8 +8,21 @@ export interface JobTemplate {
   updated_at: number;
 }
 
+// 用户提交策略：未配置的用户 = 不限并发、优先级0（与不开启限流时行为一致）。
+export interface UserPolicy {
+  user: string;
+  max_concurrent: number | null; // null=不限并发（仍受全局核数约束）
+  priority: number; // 越大越优先抢占空出来的核数/名额
+  updated_at: number;
+}
+
 export interface SubmitResult {
-  jobid: string;
+  // submitted: 已直接进入 PBS，jobid 有值；
+  // queued: 受用户并发配额或全局核数余量限制，先在门户本地排队，queue_id 有值。
+  status: "submitted" | "queued";
+  jobid?: string;
+  queue_id?: number;
+  queued_total?: number;
   exec_user: string;
   name: string;
   script: string;
@@ -42,6 +55,10 @@ export interface JobSummary {
   walltime_used: string | null;
   nodes: string | null;
   exec_host: string | null;
+  // 本地排队中/提交失败的记录才会有值(derived_state=queued_local/queue_failed)；
+  // 真实 PBS 任务恒为 null。
+  queue_id: number | null;
+  msg: string | null;
 }
 
 export interface JobDetail extends JobSummary {

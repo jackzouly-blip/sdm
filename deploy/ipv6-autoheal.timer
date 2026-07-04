@@ -1,0 +1,12 @@
+[Unit]
+Description=Run IPv6 prefix auto-heal periodically
+
+[Timer]
+# 开机 30s 后跑一次，之后每 3 分钟检测一次（前缀变化通常几分钟内自愈）
+OnBootSec=30s
+OnUnitActiveSec=3min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
