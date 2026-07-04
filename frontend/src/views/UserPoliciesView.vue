@@ -11,11 +11,17 @@ const error = ref("");
 const saving = ref<string | null>(null); // 正在保存的用户名
 const removing = ref<string | null>(null);
 
-// 新增表单缓冲
+// 新增表单缓冲。注意：<input type="number"> 的 v-model 在 Vue 中会把值强制转成
+// number（空则为空串），故这些缓冲实际可能是 number | string，比较/校验前统一归一。
 const adding = ref(false);
 const draftUser = ref("");
-const draftMax = ref<string>(""); // 空串=不限并发
-const draftPriority = ref<string>("0");
+const draftMax = ref<string | number>(""); // 空=不限并发
+const draftPriority = ref<string | number>(0);
+
+// 把 number 输入的 v-model 值归一成去空白字符串（空/undefined→""）
+function normStr(v: unknown): string {
+  return v === "" || v == null ? "" : String(v).trim();
+}
 
 async function load() {
   loading.value = true;
@@ -32,17 +38,17 @@ onMounted(load);
 
 // 校验并归一化：max_concurrent 空=不限(null)，否则须为正整数；priority 为整数(默认0)
 function parseForm(
-  maxRaw: string,
-  prioRaw: string
+  maxRaw: unknown,
+  prioRaw: unknown
 ): { max_concurrent: number | null; priority: number } | string {
   let max: number | null = null;
-  const mt = maxRaw.trim();
+  const mt = normStr(maxRaw);
   if (mt !== "") {
     const m = Number(mt);
     if (!Number.isInteger(m) || m < 1) return "并发上限需为正整数，或留空表示不限";
     max = m;
   }
-  const pt = prioRaw.trim();
+  const pt = normStr(prioRaw);
   const p = pt === "" ? 0 : Number(pt);
   if (!Number.isInteger(p)) return "优先级需为整数";
   return { max_concurrent: max, priority: p };
@@ -52,7 +58,7 @@ function startAdd() {
   adding.value = true;
   draftUser.value = "";
   draftMax.value = "";
-  draftPriority.value = "0";
+  draftPriority.value = 0;
   error.value = "";
 }
 
@@ -80,8 +86,9 @@ async function saveNew() {
   }
 }
 
-// 表格内直接编辑：把某行的输入回写。用本地字符串缓冲承接 input。
-const editBuf = ref<Record<string, { max: string; prio: string }>>({});
+// 表格内直接编辑：把某行的输入回写。number 输入的 v-model 可能写入 number，
+// 故缓冲值类型放宽为 string | number，比较/校验统一经 normStr 归一。
+const editBuf = ref<Record<string, { max: string | number; prio: string | number }>>({});
 
 function bufFor(p: UserPolicy) {
   if (!editBuf.value[p.user]) {
@@ -132,7 +139,7 @@ function dirty(p: UserPolicy): boolean {
   const buf = editBuf.value[p.user];
   if (!buf) return false;
   const savedMax = p.max_concurrent == null ? "" : String(p.max_concurrent);
-  return buf.max.trim() !== savedMax || buf.prio.trim() !== String(p.priority);
+  return normStr(buf.max) !== savedMax || normStr(buf.prio) !== String(p.priority);
 }
 </script>
 
