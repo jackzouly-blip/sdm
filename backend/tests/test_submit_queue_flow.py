@@ -167,6 +167,41 @@ def test_admin_policy_crud():
     # job_dir 未在这个用例里实际用到提交，仅复用 fixture 建好 fs_roots
 
 
+def test_delete_failed_submission():
+    """提交失败的本地排队项可经 DELETE /jobs/queue/{id} 清除；非 failed 项拒删。"""
+    _setup_workdir()
+    get_settings().admin_users = "zzz_admin_placeholder"
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        db = _swap_db(app)
+        me = getpass.getuser()
+        h = {"Authorization": f"Bearer {issue_token(me)}"}
+
+        # 一条失败项 + 一条排队中项
+        failed_id = db.sq_enqueue(me, "boom", "batch", "/tmp/x.pbs", "/tmp", cores=1)
+        db.sq_mark_failed(failed_id, "qsub 找不到脚本")
+        queued_id = db.sq_enqueue(me, "waiting", "batch", "/tmp/y.pbs", "/tmp", cores=1)
+
+        # 删除失败项 -> 成功且从库中消失
+        r = client.delete(f"/jobs/queue/{failed_id}", headers=h)
+        assert r.status_code == 200, r.text
+        assert r.json()["deleted"] is True
+        assert db.sq_get(failed_id) is None
+
+        # 删除“排队中”的项 -> 409（仅允许删 failed）
+        r = client.delete(f"/jobs/queue/{queued_id}", headers=h)
+        assert r.status_code == 409, r.text
+        assert db.sq_get(queued_id) is not None
+
+        # 删除不存在的项 -> 404
+        r = client.delete("/jobs/queue/999999", headers=h)
+        assert r.status_code == 404
+        db.close()
+    get_settings().admin_users = ""
+
+
 if __name__ == "__main__":
     import sys
 

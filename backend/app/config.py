@@ -79,6 +79,10 @@ class Settings(BaseSettings):
     # 作业提交默认队列（Torque 未设 default_queue 时必须 qsub -q 指定）
     submit_default_queue: str = "batch"
 
+    # 试算：在管理节点直接跑命令（不进 PBS）的全局并发上限；收割线程轮询间隔。
+    trial_max_concurrent: int = 4
+    trial_reap_interval: int = 3
+
     # 提交准入调度：集群总核数上限，用于全局核数网关。0=不限（不做全局核数判断，
     # 仅按 per-user 配额本地排队——这是功能的默认/休眠状态，不影响现状）。
     cluster_total_cores: int = 0

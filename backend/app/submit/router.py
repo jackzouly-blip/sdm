@@ -48,6 +48,11 @@ def _require_admin(is_admin: bool) -> None:
 class TemplateIn(BaseModel):
     name: str
     content: str
+    kind: str = "pbs"  # pbs=作业脚本(现状) / trial=试算命令行
+
+
+def _norm_kind(kind: str) -> str:
+    return "trial" if (kind or "").strip().lower() == "trial" else "pbs"
 
 
 @router.get("/templates")
@@ -58,13 +63,13 @@ def list_templates(request: Request, user: str = Depends(current_user)):
 @router.post("/templates")
 def create_template(body: TemplateIn, request: Request, user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request)):
     _require_admin(is_admin)
-    return row_to_dict(_db(request).create(body.name, body.content))
+    return row_to_dict(_db(request).create(body.name, body.content, _norm_kind(body.kind)))
 
 
 @router.put("/templates/{tid}")
 def update_template(tid: int, body: TemplateIn, request: Request, user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request)):
     _require_admin(is_admin)
-    r = _db(request).update(tid, {"name": body.name, "content": body.content})
+    r = _db(request).update(tid, {"name": body.name, "content": body.content, "kind": _norm_kind(body.kind)})
     if not r:
         raise HTTPException(status_code=404, detail="模板不存在")
     return row_to_dict(r)

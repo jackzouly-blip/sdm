@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from "vue";
 import { api, errMsg } from "@/api";
-import type { JobTemplate } from "@/api/types";
+import type { JobTemplate, TemplateKind } from "@/api/types";
 import { Loader2, Plus, Pencil, Trash2, Save, X } from "lucide-vue-next";
 
 const list = ref<JobTemplate[]>([]);
@@ -13,6 +13,11 @@ const saving = ref(false);
 // 编辑/新建缓冲
 const draftName = ref("");
 const draftContent = ref("");
+const draftKind = ref<TemplateKind>("pbs");
+
+function kindLabel(k: TemplateKind): string {
+  return k === "trial" ? "试算" : "作业";
+}
 
 const selected = computed(() => list.value.find((t) => t.id === selectedId.value) || null);
 
@@ -40,6 +45,7 @@ function startNew() {
   selectedId.value = null;
   draftName.value = "";
   draftContent.value = "#!/bin/bash\n";
+  draftKind.value = "pbs";
 }
 
 function startEdit() {
@@ -47,6 +53,7 @@ function startEdit() {
   editing.value = true;
   draftName.value = selected.value.name;
   draftContent.value = selected.value.content;
+  draftKind.value = selected.value.kind || "pbs";
 }
 
 function cancel() {
@@ -63,11 +70,20 @@ async function save() {
   error.value = "";
   try {
     if (selectedId.value === null) {
-      const t = await api.createTemplate(draftName.value.trim(), draftContent.value);
+      const t = await api.createTemplate(
+        draftName.value.trim(),
+        draftContent.value,
+        draftKind.value
+      );
       await load();
       selectedId.value = t.id;
     } else {
-      await api.updateTemplate(selectedId.value, draftName.value.trim(), draftContent.value);
+      await api.updateTemplate(
+        selectedId.value,
+        draftName.value.trim(),
+        draftContent.value,
+        draftKind.value
+      );
       await load();
     }
     editing.value = false;
@@ -122,7 +138,12 @@ async function remove() {
             @click="select(t)"
           >
             <span class="w-1.5 h-1.5 rounded-full" :class="selectedId === t.id ? 'bg-blue-500' : 'bg-slate-300'"></span>
-            {{ t.name }}
+            <span class="truncate">{{ t.name }}</span>
+            <span
+              v-if="t.kind === 'trial'"
+              class="ml-auto shrink-0 px-1.5 py-0.5 rounded text-[10px] bg-indigo-100 text-indigo-700"
+              >试算</span
+            >
           </li>
           <li v-if="!list.length" class="px-3 py-3 text-xs text-slate-400">暂无模板</li>
         </ul>
@@ -135,8 +156,16 @@ async function remove() {
             <input
               v-model="draftName"
               placeholder="模板名称"
-              class="px-2 py-1 text-sm border border-slate-300 rounded-md w-64"
+              class="px-2 py-1 text-sm border border-slate-300 rounded-md w-48"
             />
+            <select
+              v-model="draftKind"
+              class="px-2 py-1 text-sm border border-slate-300 rounded-md"
+              title="作业=提交到 PBS 队列；试算=在管理节点直接跑命令行"
+            >
+              <option value="pbs">作业模板</option>
+              <option value="trial">试算模板</option>
+            </select>
             <button
               class="ml-auto flex items-center gap-1 px-2.5 py-1 text-sm rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60"
               :disabled="saving"
@@ -150,6 +179,11 @@ async function remove() {
           </template>
           <template v-else-if="selected">
             <span class="text-sm font-medium text-slate-700">{{ selected.name }}</span>
+            <span
+              class="px-1.5 py-0.5 rounded text-[11px]"
+              :class="selected.kind === 'trial' ? 'bg-indigo-100 text-indigo-700' : 'bg-slate-100 text-slate-500'"
+              >{{ kindLabel(selected.kind) }}模板</span
+            >
             <button class="ml-auto flex items-center gap-1 px-2.5 py-1 text-sm rounded-md border border-slate-300 hover:bg-slate-50 text-slate-600" @click="startEdit">
               <Pencil :size="14" /> 编辑
             </button>

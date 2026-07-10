@@ -136,6 +136,41 @@ def _sq_row_to_summary(r: sqlite3.Row) -> JobSummary:
     )
 
 
+# 试算状态 → 混入任务列表时的派生状态（前端据此显示徽标/操作）
+_TRIAL_DERIVED = {
+    "running": "trial_running",
+    "finished": "trial_done",
+    "failed": "trial_failed",
+    "killed": "trial_killed",
+    "interrupted": "trial_interrupted",
+}
+
+
+def _trial_row_to_summary(r: sqlite3.Row) -> JobSummary:
+    """把一条试算记录转成 JobSummary 形态，混入任务列表。
+
+    jobid 以 trial: 前缀标识，前端据此走"试算输出"面板而非 PBS 详情页；
+    workdir 用真实 head 路径（试算就在管理节点该路径下执行，不做计算节点映射）。"""
+    return JobSummary(
+        jobid=f"trial:{r['id']}",
+        short_id=f"T{r['id']}",
+        name=r["name"] or "",
+        owner=r["owner"],
+        pbs_state="",
+        derived_state=_TRIAL_DERIVED.get(r["status"], "trial_done"),
+        queue="试算",
+        workdir=r["workdir"],
+        submit_ts=r["created_at"],
+        start_ts=r["started_at"],
+        end_ts=r["ended_at"],
+        walltime_used=None,
+        nodes=None,
+        exec_host="管理节点",
+        queue_id=None,
+        msg=r["msg"],
+    )
+
+
 @router.get("", response_model=List[JobSummary])
 def list_jobs(
     request: Request,
@@ -153,6 +188,14 @@ def list_jobs(
         for r in _db(request).sq_list(owner=owner):
             if r["status"] in ("queued", "submitting", "failed"):
                 out.append(_sq_row_to_summary(r))
+    # 试算任务（非 PBS，管理节点直跑）：running 计入 active，终态计入 done。
+    for r in _db(request).trial_list(owner=owner):
+        running = r["status"] == "running"
+        if state == "active" and not running:
+            continue
+        if state == "done" and running:
+            continue
+        out.append(_trial_row_to_summary(r))
     return out
 
 
@@ -339,6 +382,28 @@ def cancel_queued_submission(
         )
     log.info("已撤回本地排队项 %s（属主 %s，操作人 %s）", item_id, row["owner"], user)
     return {"id": item_id, "cancelled": True}
+
+
+@router.delete("/queue/{item_id}")
+def delete_failed_submission(
+    item_id: int,
+    request: Request,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> dict:
+    """删除一条提交失败的本地排队记录（仅 failed 状态；未占任何 PBS 资源）。"""
+    db = _db(request)
+    row = db.sq_get(item_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="排队项不存在")
+    if row["owner"] != user and not is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权操作该排队项")
+    if not db.sq_delete_failed(item_id, owner=None if is_admin else user):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="仅可删除“提交失败”的记录"
+        )
+    log.info("已删除失败本地排队项 %s（属主 %s，操作人 %s）", item_id, row["owner"], user)
+    return {"id": item_id, "deleted": True}
 
 
 @router.get("/{jobid}/netdisk-preview")

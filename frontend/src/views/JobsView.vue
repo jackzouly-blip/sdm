@@ -4,13 +4,24 @@ import { useRouter } from "vue-router";
 import { api, errMsg } from "@/api";
 import type { JobSummary } from "@/api/types";
 import { fmtTime, jobBadge } from "@/lib/format";
-import { RefreshCw, Loader2, Inbox, Ban } from "lucide-vue-next";
+import { RefreshCw, Loader2, Inbox, Ban, Terminal, Trash2 } from "lucide-vue-next";
+import TrialOutputModal from "@/components/TrialOutputModal.vue";
 
 const router = useRouter();
 const jobs = ref<JobSummary[]>([]);
 const loading = ref(false);
 const error = ref("");
 const cancelling = ref<string | null>(null);
+
+// 试算输出弹窗（jobid 形如 "trial:<id>"）
+const trialModal = ref<{ id: number; name: string } | null>(null);
+function isTrial(job: JobSummary): boolean {
+  return job.jobid.startsWith("trial:");
+}
+function openTrial(job: JobSummary) {
+  const id = Number(job.jobid.slice("trial:".length));
+  trialModal.value = { id, name: job.name || job.short_id };
+}
 
 // 终止运行/排队中的任务（qdel）
 async function cancel(job: JobSummary) {
@@ -39,6 +50,22 @@ async function cancelQueued(job: JobSummary) {
   error.value = "";
   try {
     await api.cancelQueuedSubmission(job.queue_id);
+    await load();
+  } catch (e) {
+    error.value = errMsg(e);
+  } finally {
+    cancelling.value = null;
+  }
+}
+// 删除一条“提交失败”的本地排队记录（仅清门户记录，未占任何 PBS 资源）
+async function deleteFailed(job: JobSummary) {
+  if (job.queue_id == null) return;
+  if (!window.confirm(`删除失败记录「${job.name || job.short_id}」？该记录未占用计算资源，仅从列表清除。`))
+    return;
+  cancelling.value = job.jobid;
+  error.value = "";
+  try {
+    await api.deleteFailedSubmission(job.queue_id);
     await load();
   } catch (e) {
     error.value = errMsg(e);
@@ -89,6 +116,11 @@ async function load() {
 }
 
 function open(job: JobSummary) {
+  // 试算行：打开输出面板（非 PBS 任务，无 qstat 详情）
+  if (isTrial(job)) {
+    openTrial(job);
+    return;
+  }
   // 本地排队中/提交失败的记录不是真实 PBS 任务，没有详情页可看
   if (job.queue_id != null) return;
   router.push({ name: "job-detail", params: { jobid: job.jobid } });
@@ -214,7 +246,15 @@ function nodeNames(execHost: string | null): string {
             </td>
             <td class="px-4 py-2.5">
               <button
-                v-if="job.derived_state === 'active'"
+                v-if="isTrial(job)"
+                class="inline-flex items-center gap-1 px-2 py-1 text-xs rounded-md border border-indigo-200 text-indigo-700 hover:bg-indigo-50"
+                @click.stop="openTrial(job)"
+              >
+                <Terminal :size="13" />
+                {{ job.derived_state === 'trial_running' ? '查看/中断' : '查看输出' }}
+              </button>
+              <button
+                v-else-if="job.derived_state === 'active'"
                 class="inline-flex items-center gap-1 px-2 py-1 text-xs rounded-md border border-rose-200 text-rose-600 hover:bg-rose-50 disabled:opacity-60"
                 :disabled="cancelling === job.jobid"
                 @click.stop="cancel(job)"
@@ -233,6 +273,17 @@ function nodeNames(execHost: string | null): string {
                 <Loader2 v-if="cancelling === job.jobid" :size="13" class="animate-spin" />
                 <Ban v-else :size="13" />
                 取消排队
+              </button>
+              <button
+                v-else-if="job.derived_state === 'queue_failed'"
+                class="inline-flex items-center gap-1 px-2 py-1 text-xs rounded-md border border-slate-200 text-slate-500 hover:bg-slate-50 disabled:opacity-60"
+                :disabled="cancelling === job.jobid"
+                title="仅清除门户里的这条失败记录，不占用任何计算资源"
+                @click.stop="deleteFailed(job)"
+              >
+                <Loader2 v-if="cancelling === job.jobid" :size="13" class="animate-spin" />
+                <Trash2 v-else :size="13" />
+                删除记录
               </button>
               <span v-else class="text-slate-300">—</span>
             </td>
@@ -253,5 +304,13 @@ function nodeNames(execHost: string | null): string {
         <Inbox :size="28" /> 暂无任务
       </div>
     </div>
+
+    <TrialOutputModal
+      v-if="trialModal"
+      :trial-id="trialModal.id"
+      :name="trialModal.name"
+      @close="trialModal = null"
+      @changed="load"
+    />
   </div>
 </template>

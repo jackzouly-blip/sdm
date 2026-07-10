@@ -132,6 +132,54 @@ def run_as_user(
     )
 
 
+def popen_as_user(
+    username: str,
+    argv: list[str],
+    *,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    stdout=None,
+    stderr=None,
+    start_new_session: bool = False,
+) -> subprocess.Popen:
+    """以目标用户身份启动一个**非阻塞**子进程（run_as_user 的 Popen 版）。
+
+    与 run_as_user 的区别：不等待、不捕获输出，直接返回 Popen 句柄，供调用方
+    自行保存 pid、轮询存活、随时中断——用于试算这类"在管理节点直接跑、要拿
+    pid、要能中断/看输出"的长命令。
+
+    start_new_session=True：子进程自成会话/进程组（pid==pgid），便于用
+    os.killpg 连同其派生子进程整组中断，也让它不受服务端控制终端影响。
+    降权顺序与 run_as_user 一致：先 setgid+附加组，再 setuid（在 preexec 内）。
+    """
+    user = resolve_user(username)
+    if not isinstance(argv, (list, tuple)) or not argv:
+        raise PrivilegeError("argv 必须是非空列表，禁止 shell 拼接")
+    preexec = None if _is_self(user) else _demote(user)
+    if preexec is not None:
+        _require_root()
+
+    run_env = {
+        "HOME": user.home,
+        "USER": user.name,
+        "LOGNAME": user.name,
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+    }
+    if env:
+        run_env.update(env)
+
+    log.info("以用户 %s 启动进程: %s", username, " ".join(argv))
+    return subprocess.Popen(
+        list(argv),
+        cwd=cwd,
+        env=run_env,
+        stdout=stdout,
+        stderr=stderr,
+        preexec_fn=preexec,
+        start_new_session=start_new_session,
+    )
+
+
 def fork_pty_as_user(
     username: str,
     *,

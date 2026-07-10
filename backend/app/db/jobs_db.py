@@ -103,7 +103,38 @@ CREATE TABLE IF NOT EXISTS user_policies (
     priority       INTEGER NOT NULL DEFAULT 0,
     updated_at     REAL NOT NULL
 );
+
+-- 试算任务：不进 PBS，直接在管理节点以属主身份跑一条命令。门户自己持有
+-- pid/pgid 以便随时整组中断，输出重定向到 log_path 供随时增量拉取，退出码
+-- 经 status_path 落盘（进程若被 init 收养也能恢复真实退出码）。
+CREATE TABLE IF NOT EXISTS trial_tasks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner       TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    workdir     TEXT NOT NULL,
+    command     TEXT NOT NULL,
+    pid         INTEGER,
+    pgid        INTEGER,
+    status      TEXT NOT NULL DEFAULT 'running',  -- running/finished/failed/killed/interrupted
+    exit_code   INTEGER,
+    log_path    TEXT NOT NULL,
+    status_path TEXT NOT NULL,
+    msg         TEXT,
+    created_at  REAL NOT NULL,
+    started_at  REAL,
+    ended_at    REAL
+);
+CREATE INDEX IF NOT EXISTS idx_trial_status ON trial_tasks(status);
+CREATE INDEX IF NOT EXISTS idx_trial_owner ON trial_tasks(owner);
 """
+
+# trial_tasks 状态
+TRIAL_RUNNING = "running"
+TRIAL_FINISHED = "finished"
+TRIAL_FAILED = "failed"
+TRIAL_KILLED = "killed"
+TRIAL_INTERRUPTED = "interrupted"
+TRIAL_TERMINAL = (TRIAL_FINISHED, TRIAL_FAILED, TRIAL_KILLED, TRIAL_INTERRUPTED)
 
 # submission_queue 状态
 SQ_QUEUED = "queued"
@@ -579,6 +610,20 @@ class JobsDB:
             self.conn.commit()
             return cur.rowcount > 0
 
+    def sq_delete_failed(self, item_id: int, owner: Optional[str] = None) -> bool:
+        """删除一个提交失败的本地排队记录（仅 failed 状态可删；未占任何 PBS 资源）。
+
+        owner 非空时要求属主匹配，供非管理员用户的越权校验。"""
+        sql = "DELETE FROM submission_queue WHERE id=? AND status=?"
+        params: list = [item_id, SQ_FAILED]
+        if owner is not None:
+            sql += " AND owner=?"
+            params.append(owner)
+        with self._lock:
+            cur = self.conn.execute(sql, params)
+            self.conn.commit()
+            return cur.rowcount > 0
+
     # --- 准入调度所需的用量统计 -------------------------------------------
 
     def active_counts_by_owner(self) -> Dict[str, int]:
@@ -639,3 +684,76 @@ class JobsDB:
             cur = self.conn.execute("DELETE FROM user_policies WHERE user=?", (user,))
             self.conn.commit()
             return cur.rowcount > 0
+
+    # --- 试算任务 ---------------------------------------------------------
+
+    def trial_create(
+        self, owner: str, name: str, workdir: str, command: str,
+        log_path: str, status_path: str,
+    ) -> int:
+        """登记一条试算任务（pid 稍后由 trial_set_started 回填），返回 id。"""
+        now = time.time()
+        with self._lock:
+            cur = self.conn.execute(
+                """INSERT INTO trial_tasks
+                    (owner, name, workdir, command, status, log_path, status_path,
+                     created_at, started_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (owner, name, workdir, command, TRIAL_RUNNING, log_path,
+                 status_path, now, now),
+            )
+            self.conn.commit()
+            return cur.lastrowid
+
+    def trial_set_started(self, trial_id: int, pid: int, pgid: int) -> None:
+        with self._lock:
+            self.conn.execute(
+                "UPDATE trial_tasks SET pid=?, pgid=? WHERE id=?",
+                (pid, pgid, trial_id),
+            )
+            self.conn.commit()
+
+    def trial_finish(
+        self, trial_id: int, status: str,
+        exit_code: Optional[int] = None, msg: Optional[str] = None,
+    ) -> None:
+        """置为终态并记结束时间/退出码。"""
+        with self._lock:
+            self.conn.execute(
+                "UPDATE trial_tasks SET status=?, exit_code=?, msg=?, ended_at=? "
+                "WHERE id=?",
+                (status, exit_code, msg, time.time(), trial_id),
+            )
+            self.conn.commit()
+
+    def trial_get(self, trial_id: int) -> Optional[sqlite3.Row]:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM trial_tasks WHERE id=?", (trial_id,)
+            ).fetchone()
+
+    def trial_list(
+        self, owner: Optional[str] = None, limit: int = 500
+    ) -> List[sqlite3.Row]:
+        """列出试算任务（owner=None 不限属主，供管理员查看全部）。"""
+        if owner is None:
+            sql, params = "SELECT * FROM trial_tasks WHERE 1=1", []
+        else:
+            sql, params = "SELECT * FROM trial_tasks WHERE owner=?", [owner]
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            return self.conn.execute(sql, params).fetchall()
+
+    def trial_list_running(self) -> List[sqlite3.Row]:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM trial_tasks WHERE status=?", (TRIAL_RUNNING,)
+            ).fetchall()
+
+    def trial_count_running(self) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) n FROM trial_tasks WHERE status=?", (TRIAL_RUNNING,)
+            ).fetchone()
+        return row["n"] if row else 0

@@ -28,6 +28,8 @@ from .submit.db import TemplatesDB
 from .submit.router import router as submit_router
 from .submit.scheduler import SubmissionScheduler, set_scheduler
 from .tasks.manager import TaskManager
+from .trial.manager import TrialManager, set_trial_manager
+from .trial.router import router as trial_router
 
 settings = get_settings()
 setup_logging(settings.log_level)
@@ -53,6 +55,12 @@ async def lifespan(app: FastAPI):
     set_streamer(streamer)
     scheduler = SubmissionScheduler(db, interval=settings.submit_scheduler_interval)
     set_scheduler(scheduler)
+    trial_manager = TrialManager(
+        db,
+        max_concurrent=settings.trial_max_concurrent,
+        interval=settings.trial_reap_interval,
+    )
+    set_trial_manager(trial_manager)
     app.state.jobs_db = db
     app.state.poller = poller
     app.state.task_manager = task_manager
@@ -62,6 +70,7 @@ async def lifespan(app: FastAPI):
     app.state.favorites_db = favorites_db
     app.state.dispatcher = dispatcher
     app.state.scheduler = scheduler
+    app.state.trial_manager = trial_manager
     if os.geteuid() != 0:
         log.warning("当前非 root 运行：act-as-user 降权将不可用，仅适合本地接口联调")
     else:
@@ -74,12 +83,14 @@ async def lifespan(app: FastAPI):
     poller.start()
     streamer.start()
     scheduler.start()
+    trial_manager.start()
     try:
         yield
     finally:
         poller.stop()
         streamer.stop()
         scheduler.stop()
+        trial_manager.stop()
         task_manager.close()
         rules_db.close()
         templates_db.close()
@@ -107,6 +118,7 @@ app.include_router(shell_router)
 app.include_router(d3plot_router)
 app.include_router(submit_router)
 app.include_router(stats_router)
+app.include_router(trial_router)
 
 
 @app.get("/health")

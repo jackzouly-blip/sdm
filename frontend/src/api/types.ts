@@ -1,11 +1,41 @@
 // 与后端 Pydantic 模型一一对应的前端类型定义。
 
+// 模板用途：pbs=提交到 PBS 的作业脚本；trial=在管理节点直跑的试算命令行。
+export type TemplateKind = "pbs" | "trial";
+
 export interface JobTemplate {
   id: number;
   name: string;
   content: string;
+  kind: TemplateKind;
   created_at: number;
   updated_at: number;
+}
+
+// 试算提交结果
+export interface TrialSubmitResult {
+  id: number;
+  jobid: string; // "trial:<id>"
+  exec_user: string;
+  name: string;
+}
+
+// 试算命令输出增量拉取结果
+export type TrialStatus =
+  | "running"
+  | "finished"
+  | "failed"
+  | "killed"
+  | "interrupted";
+
+export interface TrialOutput {
+  id: number;
+  status: TrialStatus;
+  exit_code: number | null;
+  msg: string | null;
+  data: string; // 从请求 offset 起的新增输出
+  offset: number; // 新的偏移，下次带上
+  size: number;
 }
 
 // 用户提交策略：未配置的用户 = 不限并发、优先级0（与不开启限流时行为一致）。

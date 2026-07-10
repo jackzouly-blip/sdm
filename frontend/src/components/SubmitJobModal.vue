@@ -1,11 +1,15 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { ref, computed, watch, onMounted } from "vue";
 import { api, errMsg } from "@/api";
 import type { JobTemplate } from "@/api/types";
-import { X, Loader2, Rocket, CheckCircle2 } from "lucide-vue-next";
+import { X, Loader2, Rocket, CheckCircle2, FlaskConical } from "lucide-vue-next";
 
 const props = defineProps<{ initDir: string; inputFile?: string }>();
 const emit = defineEmits<{ close: []; submitted: [jobid: string] }>();
+
+// 任务类型：pbs=常规(提交到 PBS 队列) / trial=试算(管理节点直跑，不进 PBS)
+const taskType = ref<"pbs" | "trial">("pbs");
+const isTrial = computed(() => taskType.value === "trial");
 
 // 作业名默认取初始路径的目录名（用户可手动修改）
 const name = ref(props.initDir.split("/").filter(Boolean).pop() || "");
@@ -23,11 +27,26 @@ const submitting = ref(false);
 const error = ref("");
 const okJobid = ref("");
 const queuedInfo = ref<{ id: number; total: number } | null>(null); // 本地排队中(未进入PBS)
+const trialOk = ref<{ id: number } | null>(null); // 试算已启动
+
+// 按任务类型过滤模板（作业模板 vs 试算模板）
+const visibleTemplates = computed(() =>
+  templates.value.filter((t) =>
+    isTrial.value ? t.kind === "trial" : (t.kind || "pbs") === "pbs"
+  )
+);
+
+// 切换类型后，把模板选择重置为当前类型下的第一个
+watch([taskType, templates], () => {
+  const cur = visibleTemplates.value;
+  if (!cur.some((t) => t.id === templateId.value)) {
+    templateId.value = cur.length ? cur[0].id : null;
+  }
+});
 
 onMounted(async () => {
   try {
     templates.value = await api.listTemplates();
-    if (templates.value.length) templateId.value = templates.value[0].id;
     // 仅列当前目录的 .k/.key（不递归）；子目录文件用"手动输入路径"
     try {
       const r = await api.listDir(props.initDir);
@@ -53,12 +72,25 @@ onMounted(async () => {
 
 async function submit() {
   error.value = "";
-  if (!name.value.trim()) return (error.value = "请填写作业名称");
-  if (!cores.value || cores.value < 1) return (error.value = "核数无效");
+  if (!name.value.trim()) return (error.value = "请填写任务名称");
+  if (!isTrial.value && (!cores.value || cores.value < 1))
+    return (error.value = "核数无效");
   if (!inputFile.value.trim()) return (error.value = "请填写输入文件（相对初始路径）");
-  if (templateId.value === null) return (error.value = "请选择模板");
+  if (templateId.value === null)
+    return (error.value = isTrial.value ? "请选择试算模板" : "请选择模板");
   submitting.value = true;
   try {
+    if (isTrial.value) {
+      const r = await api.submitTrial({
+        name: name.value.trim(),
+        init_dir: initDir.value,
+        input_file: inputFile.value.trim(),
+        template_id: templateId.value,
+      });
+      trialOk.value = { id: r.id };
+      // 不立即 emit submitted（避免父级关闭弹窗），让成功页给出"去看输出"的引导
+      return;
+    }
     const r = await api.submitJob({
       name: name.value.trim(),
       cores: Number(cores.value),
@@ -86,7 +118,7 @@ async function submit() {
   <div class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-6" @click.self="emit('close')">
     <div class="bg-white rounded-xl shadow-xl w-full max-w-lg flex flex-col max-h-[88vh]">
       <div class="flex items-center px-5 py-3 border-b border-slate-200">
-        <div class="font-medium text-slate-800">提交作业</div>
+        <div class="font-medium text-slate-800">提交任务</div>
         <button class="ml-auto p-1.5 rounded hover:bg-slate-100 text-slate-500" @click="emit('close')">
           <X :size="18" />
         </button>
@@ -117,19 +149,52 @@ async function submit() {
           <button class="mt-2 px-4 py-1.5 text-sm rounded-md bg-blue-600 text-white hover:bg-blue-700" @click="emit('close')">完成</button>
         </div>
 
+        <!-- 试算已启动：在管理节点直接运行 -->
+        <div v-else-if="trialOk" class="py-8 flex flex-col items-center gap-3 text-center">
+          <FlaskConical :size="40" class="text-indigo-500" />
+          <div class="text-slate-700">试算已启动（T{{ trialOk.id }}）</div>
+          <div class="text-xs text-slate-400">
+            正在管理节点直接运行，可在「任务」列表实时查看输出，并随时中断
+          </div>
+          <button class="mt-2 px-4 py-1.5 text-sm rounded-md bg-blue-600 text-white hover:bg-blue-700" @click="emit('submitted', `trial:${trialOk.id}`); emit('close')">完成</button>
+        </div>
+
         <template v-else>
-          <div class="grid grid-cols-2 gap-3">
+          <!-- 任务类型：常规(PBS) / 试算(管理节点直跑) -->
+          <div class="flex gap-2">
+            <button
+              type="button"
+              class="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 text-sm rounded-md border transition"
+              :class="!isTrial ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'"
+              @click="taskType = 'pbs'"
+            >
+              <Rocket :size="15" /> 常规作业
+            </button>
+            <button
+              type="button"
+              class="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 text-sm rounded-md border transition"
+              :class="isTrial ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'"
+              @click="taskType = 'trial'"
+            >
+              <FlaskConical :size="15" /> 试算
+            </button>
+          </div>
+          <p v-if="isTrial" class="text-xs text-indigo-600 -mt-1">
+            试算不进 PBS 队列，直接在管理节点运行所选试算模板的命令，适合快速验证。
+          </p>
+
+          <div class="grid gap-3" :class="isTrial ? 'grid-cols-1' : 'grid-cols-2'">
             <label class="text-sm">
               <span class="text-slate-500">名称 <span class="text-rose-500">*</span></span>
-              <input v-model="name" class="mt-1 w-full px-2 py-1.5 border border-slate-300 rounded-md" placeholder="作业名" />
+              <input v-model="name" class="mt-1 w-full px-2 py-1.5 border border-slate-300 rounded-md" placeholder="任务名" />
             </label>
-            <label class="text-sm">
+            <label v-if="!isTrial" class="text-sm">
               <span class="text-slate-500">核数 <span class="text-rose-500">*</span></span>
               <input v-model.number="cores" type="number" min="1" class="mt-1 w-full px-2 py-1.5 border border-slate-300 rounded-md" />
             </label>
           </div>
 
-          <label class="text-sm block">
+          <label v-if="!isTrial" class="text-sm block">
             <span class="text-slate-500">队列</span>
             <input v-model="queue" class="mt-1 w-full px-2 py-1.5 border border-slate-300 rounded-md" placeholder="batch" />
           </label>
@@ -171,10 +236,12 @@ async function submit() {
           </div>
 
           <label class="text-sm block">
-            <span class="text-slate-500">模板 <span class="text-rose-500">*</span></span>
+            <span class="text-slate-500">{{ isTrial ? "试算模板" : "模板" }} <span class="text-rose-500">*</span></span>
             <select v-model="templateId" class="mt-1 w-full px-2 py-1.5 border border-slate-300 rounded-md">
-              <option v-if="!templates.length" :value="null" disabled>无模板（请管理员先在「模板管理」创建）</option>
-              <option v-for="t in templates" :key="t.id" :value="t.id">{{ t.name }}</option>
+              <option v-if="!visibleTemplates.length" :value="null" disabled>
+                {{ isTrial ? "无试算模板（请管理员在「模板管理」新建试算模板）" : "无模板（请管理员先在「模板管理」创建）" }}
+              </option>
+              <option v-for="t in visibleTemplates" :key="t.id" :value="t.id">{{ t.name }}</option>
             </select>
           </label>
 
@@ -182,14 +249,18 @@ async function submit() {
         </template>
       </div>
 
-      <div v-if="!loading && !okJobid" class="px-5 py-3 border-t border-slate-200 flex justify-end gap-2">
+      <div v-if="!loading && !okJobid && !queuedInfo && !trialOk" class="px-5 py-3 border-t border-slate-200 flex justify-end gap-2">
         <button class="px-3 py-1.5 text-sm rounded-md border border-slate-300 hover:bg-slate-50" @click="emit('close')">取消</button>
         <button
-          class="flex items-center gap-1.5 px-4 py-1.5 text-sm rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60"
+          class="flex items-center gap-1.5 px-4 py-1.5 text-sm rounded-md text-white disabled:opacity-60"
+          :class="isTrial ? 'bg-indigo-600 hover:bg-indigo-700' : 'bg-blue-600 hover:bg-blue-700'"
           :disabled="submitting"
           @click="submit"
         >
-          <Loader2 v-if="submitting" :size="15" class="animate-spin" /><Rocket v-else :size="15" /> 提交作业
+          <Loader2 v-if="submitting" :size="15" class="animate-spin" />
+          <FlaskConical v-else-if="isTrial" :size="15" />
+          <Rocket v-else :size="15" />
+          {{ isTrial ? "开始试算" : "提交作业" }}
         </button>
       </div>
     </div>

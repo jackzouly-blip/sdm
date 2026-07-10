@@ -36,6 +36,22 @@ export function jobBadge(
   if (derived === "queue_failed") {
     return { text: "提交失败", cls: "bg-rose-100 text-rose-700" };
   }
+  // 试算（管理节点直跑，不进 PBS）
+  if (derived === "trial_running") {
+    return { text: "试算中", cls: "bg-indigo-100 text-indigo-700" };
+  }
+  if (derived === "trial_done") {
+    return { text: "试算完成", cls: "bg-emerald-100 text-emerald-700" };
+  }
+  if (derived === "trial_failed") {
+    return { text: "试算失败", cls: "bg-rose-100 text-rose-700" };
+  }
+  if (derived === "trial_killed") {
+    return { text: "试算已中断", cls: "bg-slate-200 text-slate-600" };
+  }
+  if (derived === "trial_interrupted") {
+    return { text: "试算中断", cls: "bg-slate-200 text-slate-600" };
+  }
   switch (pbsState) {
     case "R":
       return { text: "运行中", cls: "bg-blue-100 text-blue-700" };

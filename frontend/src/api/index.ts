@@ -9,6 +9,9 @@ import type {
   JobDetail,
   JobSummary,
   JobTemplate,
+  TemplateKind,
+  TrialSubmitResult,
+  TrialOutput,
   UserPolicy,
   SubmitResult,
   ListResponse,
@@ -64,6 +67,13 @@ export const api = {
   async cancelQueuedSubmission(queueId: number): Promise<{ id: number; cancelled: boolean }> {
     const { data } = await http.post<{ id: number; cancelled: boolean }>(
       `/jobs/queue/${queueId}/cancel`
+    );
+    return data;
+  },
+  // 删除一条“提交失败”的本地排队记录（仅 failed 状态可删）
+  async deleteFailedSubmission(queueId: number): Promise<{ id: number; deleted: boolean }> {
+    const { data } = await http.delete<{ id: number; deleted: boolean }>(
+      `/jobs/queue/${queueId}`
     );
     return data;
   },
@@ -411,12 +421,21 @@ export const api = {
     const { data } = await http.get<JobTemplate[]>("/templates");
     return data;
   },
-  async createTemplate(name: string, content: string): Promise<JobTemplate> {
-    const { data } = await http.post<JobTemplate>("/templates", { name, content });
+  async createTemplate(
+    name: string,
+    content: string,
+    kind: TemplateKind = "pbs"
+  ): Promise<JobTemplate> {
+    const { data } = await http.post<JobTemplate>("/templates", { name, content, kind });
     return data;
   },
-  async updateTemplate(id: number, name: string, content: string): Promise<JobTemplate> {
-    const { data } = await http.put<JobTemplate>(`/templates/${id}`, { name, content });
+  async updateTemplate(
+    id: number,
+    name: string,
+    content: string,
+    kind: TemplateKind = "pbs"
+  ): Promise<JobTemplate> {
+    const { data } = await http.put<JobTemplate>(`/templates/${id}`, { name, content, kind });
     return data;
   },
   async deleteTemplate(id: number): Promise<void> {
@@ -452,6 +471,32 @@ export const api = {
     script?: string;
   }): Promise<SubmitResult> {
     const { data } = await http.post<SubmitResult>("/jobs/submit", payload);
+    return data;
+  },
+
+  // --- 试算（管理节点直跑，不进 PBS）---
+  async submitTrial(payload: {
+    name: string;
+    init_dir: string;
+    input_file: string;
+    template_id: number;
+  }): Promise<TrialSubmitResult> {
+    const { data } = await http.post<TrialSubmitResult>("/trials/submit", payload);
+    return data;
+  },
+  // 增量拉取试算命令输出（带上次 offset）
+  async trialOutput(id: number, offset = 0): Promise<TrialOutput> {
+    const { data } = await http.get<TrialOutput>(
+      `/trials/${id}/output`,
+      { params: { offset } }
+    );
+    return data;
+  },
+  // 中断运行中的试算
+  async cancelTrial(id: number): Promise<{ id: number; cancelled: boolean }> {
+    const { data } = await http.post<{ id: number; cancelled: boolean }>(
+      `/trials/${id}/cancel`
+    );
     return data;
   },
 };
