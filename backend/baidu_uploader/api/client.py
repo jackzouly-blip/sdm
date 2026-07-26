@@ -84,24 +84,54 @@ class BaiduPanClient:
     def upload_part(
         self, remote_path: str, uploadid: str, partseq: int, chunk: bytes
     ) -> dict:
-        """上传单个分片。"""
-        resp = self._client.post(
-            SUPERFILE,
-            params={
-                "method": "upload",
-                "access_token": self._get_token(),
-                "type": "tmpfile",
-                "path": remote_path,
-                "uploadid": uploadid,
-                "partseq": str(partseq),
-            },
-            files={"file": ("chunk", chunk, "application/octet-stream")},
-        )
-        payload = self._json(resp)
-        # superfile2 成功返回含 md5，无 errno；出错才带 error_code
-        if "md5" not in payload and payload.get("error_code"):
-            raise BaiduApiError("upload_part", payload.get("error_code", -1), payload)
-        return payload
+        """上传单个分片。
+
+        superfile2 会偶发返回空体 HTTP 5xx，也可能连接中断——都是暂时性故障。
+        单片重传是幂等的（同一 uploadid + partseq 覆盖写），故就地退避重试。
+        不重试 4xx：那是参数/权限一类的确定性错误，重试只是浪费。
+
+        没有这层重试时，一片偶发 500 就会让整个文件失败，GB 级文件因分片多、
+        耗时长，撞上的概率相当可观。
+        """
+        attempts = 4  # 首次 + 3 次重试，退避 2/4/8s
+        last_err: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                resp = self._client.post(
+                    SUPERFILE,
+                    params={
+                        "method": "upload",
+                        "access_token": self._get_token(),
+                        "type": "tmpfile",
+                        "path": remote_path,
+                        "uploadid": uploadid,
+                        "partseq": str(partseq),
+                    },
+                    files={"file": ("chunk", chunk, "application/octet-stream")},
+                )
+                if resp.status_code < 500:
+                    payload = self._json(resp)  # 4xx 带响应体抛出；2xx 正常解析
+                    # superfile2 成功返回含 md5，无 errno；出错才带 error_code
+                    if "md5" not in payload and payload.get("error_code"):
+                        raise BaiduApiError(
+                            "upload_part", payload.get("error_code", -1), payload
+                        )
+                    return payload
+                body = (resp.text or "")[:200]
+                last_err = BaiduHttpError(
+                    resp.status_code, SUPERFILE, body or "<空响应体>"
+                )
+            except httpx.TransportError as e:  # 连接/读写中断
+                last_err = e
+
+            if attempt < attempts - 1:
+                wait = 2 ** (attempt + 1)
+                log.warning(
+                    "分片 %d 上传失败（%s），%ss 后重试 (%d/%d): %s",
+                    partseq, last_err, wait, attempt + 1, attempts - 1, remote_path,
+                )
+                time.sleep(wait)
+        raise last_err  # type: ignore[misc]
 
     # --- step 3: create ------------------------------------------------
 

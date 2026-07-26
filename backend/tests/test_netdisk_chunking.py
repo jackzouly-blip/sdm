@@ -9,8 +9,10 @@
 import hashlib
 import json
 
+import httpx
 import pytest
 
+from baidu_uploader.api.client import BaiduHttpError, BaiduPanClient
 from baidu_uploader.core.uploader import MAX_PARTS, Uploader, UploadTooLargeError
 from baidu_uploader.state.store import StateStore
 
@@ -79,6 +81,88 @@ def test_exactly_at_limit_still_uploads(tmp_path):
     assert client.created
     assert sorted(client.parts) == list(range(MAX_PARTS))
     assert res["fs_id"] == 1
+
+
+class _Resp:
+    def __init__(self, status, payload=None, text=""):
+        self.status_code = status
+        self._payload = payload
+        self.text = text
+        self.url = "https://d.pcs.baidu.com/rest/2.0/pcs/superfile2?x=1"
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+
+class _ScriptedHttp:
+    """按脚本依次返回响应的假 httpx client。"""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = 0
+
+    def post(self, *a, **kw):
+        self.calls += 1
+        r = self.responses.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    import baidu_uploader.api.client as mod
+
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+
+
+def test_upload_part_retries_transient_5xx(no_sleep):
+    """偶发空体 500 必须就地重试，而不是让整个文件的上传失败。"""
+    c = BaiduPanClient(lambda: "tok")
+    c._client = _ScriptedHttp([
+        _Resp(500, text=""),
+        _Resp(500, text=""),
+        _Resp(200, {"md5": "abc"}),
+    ])
+
+    assert c.upload_part("/p/f.h3d", "uid", 7, b"data")["md5"] == "abc"
+    assert c._client.calls == 3
+
+
+def test_upload_part_retries_transport_error(no_sleep):
+    c = BaiduPanClient(lambda: "tok")
+    c._client = _ScriptedHttp([
+        httpx.ConnectError("connection reset"),
+        _Resp(200, {"md5": "abc"}),
+    ])
+
+    assert c.upload_part("/p/f.h3d", "uid", 7, b"data")["md5"] == "abc"
+    assert c._client.calls == 2
+
+
+def test_upload_part_does_not_retry_4xx(no_sleep):
+    """31299 这类确定性错误重试无意义，必须立即抛出。"""
+    c = BaiduPanClient(lambda: "tok")
+    c._client = _ScriptedHttp([
+        _Resp(400, {"error_code": 31299, "error_msg": "Invalid param part_id"}),
+        _Resp(200, {"md5": "abc"}),  # 不该被用到
+    ])
+
+    with pytest.raises(BaiduHttpError) as ei:
+        c.upload_part("/p/f.h3d", "uid", 2048, b"data")
+    assert ei.value.status == 400
+    assert c._client.calls == 1, "4xx 不应重试"
+
+
+def test_upload_part_gives_up_after_max_attempts(no_sleep):
+    c = BaiduPanClient(lambda: "tok")
+    c._client = _ScriptedHttp([_Resp(500, text="") for _ in range(4)])
+
+    with pytest.raises(BaiduHttpError):
+        c.upload_part("/p/f.h3d", "uid", 7, b"data")
+    assert c._client.calls == 4
 
 
 def test_resume_requires_same_chunk_size(tmp_path):
