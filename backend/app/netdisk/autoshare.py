@@ -161,8 +161,29 @@ def _is_result_file(name: str) -> bool:
     )
 
 
+def _upload_order(path: str, size: int) -> tuple:
+    """上传排序键：小而常用的先传，最大的 h3d 垫底。
+
+    动机：分享链接在首个文件落地后就建好（早建复用），所以先传 d3plot 能让用户
+    几分钟内拿到可用链接，而不必等几个 GB 的 h3d 传完。此前按文件名排序，而
+    h3d 常以数字开头（如 2434.h3d），反而排在所有 d3plot 前面，等于每次都先啃
+    最大的那块——它一旦中断，后面的小文件全都陪着一起等。
+
+    d3plot 内部保持文件名顺序（d3plot / d3plot01 / d3plot02…是时序状态，
+    乱序上传对用户没意义）；h3d 之间则小的先传。
+    """
+    name = os.path.basename(path)
+    if _D3PLOT.match(name):
+        return (0, 0, name)
+    if _BINOUT.match(name):
+        return (1, 0, name)
+    if _D3HSP.match(name):
+        return (2, 0, name)
+    return (3, size, name)  # h3d：垫底，且小的先传
+
+
 def scan_result_entries(workdir: str) -> List[tuple]:
-    """列出 workdir 顶层结果文件 (path, size)，按文件名排序。"""
+    """列出 workdir 顶层结果文件 (path, size)，按上传优先级排序（见 _upload_order）。"""
     out: List[tuple] = []
     try:
         for e in os.scandir(workdir):
@@ -176,12 +197,12 @@ def scan_result_entries(workdir: str) -> List[tuple]:
                 out.append((e.path, size))
     except OSError as ex:
         log.warning("扫描 workdir 失败 %s: %s", workdir, ex)
-    out.sort(key=lambda t: os.path.basename(t[0]))
+    out.sort(key=lambda t: _upload_order(t[0], t[1]))
     return out
 
 
 def scan_result_files(workdir: str) -> List[str]:
-    """列出 workdir 下的结果文件路径（仅顶层，按名称排序）。"""
+    """列出 workdir 下的结果文件路径（仅顶层，按上传优先级排序）。"""
     return [p for p, _ in scan_result_entries(workdir)]
 
 
