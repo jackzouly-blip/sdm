@@ -46,8 +46,9 @@ class Settings(BaseSettings):
     office_cache_dir: str = "/tmp/hpc-portal-office"
     office_timeout: int = 120
     # 单个归档体积阈值（字节）：一组文件总量超过该值时，按文件分到多个包，
-    # 每包不超过此阈值。百度单文件硬上限约 4GiB（4MiB×1024 分片），这里按原始
-    # 大小留余量默认 3.5GiB；压缩后通常更小，故偏保守不会超限。
+    # 每包不超过此阈值。百度单文件上限 = 2048 分片 × upload.chunk_size（实测分片
+    # 序号上限 2048，与字节数无关）：4MiB 分片=8GiB，32MiB 分片=64GiB。默认 3.5GiB
+    # 对任何分片配置都安全，压缩后通常更小，故偏保守不会超限。
     package_volume_bytes: int = 3584 * 1024 * 1024  # 3.5 GiB
 
     # 网盘上传配置（baidu_uploader）
