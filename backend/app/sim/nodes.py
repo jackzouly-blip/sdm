@@ -73,6 +73,7 @@ class NodeContext:
     jobs_db: object = None
     templates_db: object = None
     settings: object = None
+    task_manager: object = None
 
 
 @dataclass
@@ -334,6 +335,46 @@ def register_builtin_node_types() -> None:
         },
         inputs=["deck_text"], outputs=["hpc_jobid"],
         executor=_exec_hpc_submit,
+    ))
+
+    # 结果侧节点实现在 results.py，此处仅注册（避免 nodes.py 无限膨胀）
+    from .results import _exec_collect_results, _exec_viewer_prepare
+
+    register_node_type(NodeType(
+        type_id="internal.collect_results",
+        label="收集结果",
+        category="internal",
+        description="扫描工作目录，把 d3plot / binout / d3hsp / h3d 登记为可查看、可分发的结果",
+        params_schema={
+            "type": "object",
+            "properties": {
+                "result_types": {
+                    "type": "object",
+                    "title": "只收集这些类型",
+                    "description": "JSON 数组，如 [\"d3plot\",\"binout\"]；留空则全收",
+                },
+            },
+        },
+        inputs=["hpc_jobid"], outputs=["sim_job_id"],
+        executor=_exec_collect_results,
+    ))
+
+    register_node_type(NodeType(
+        type_id="viewer.prepare",
+        label="生成查看产物",
+        category="internal",
+        description="为 d3plot 结果生成网页查看所需的产物，完成后即可在结果查看中打开",
+        params_schema={
+            "type": "object",
+            "properties": {
+                "max_states": {"type": "number", "title": "状态帧上限",
+                               "description": "超过则均匀抽样以控产物体积；留空用服务端默认"},
+                "max_tris": {"type": "number", "title": "三角面预算",
+                             "description": "超过则减面；0 表示不减面（高精度）"},
+            },
+        },
+        inputs=["sim_job_id"], outputs=["viewer_key"],
+        executor=_exec_viewer_prepare,
     ))
 
     register_node_type(NodeType(

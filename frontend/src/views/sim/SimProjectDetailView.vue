@@ -6,10 +6,10 @@
  * 点进去即跳到算力管理的任务详情页。
  */
 import { computed, onMounted, ref } from "vue";
-import { useRouter } from "vue-router";
+import { useRouter, type RouteLocationRaw } from "vue-router";
 import { simApi, errMsg } from "@/api";
 import type { SimJob, SimProject, SimResult, SimSubject, SimTarget } from "@/api/types";
-import { ArrowLeft, Boxes, Loader2, Plus, Trash2 } from "lucide-vue-next";
+import { ArrowLeft, Boxes, Eye, Loader2, Plus, Trash2 } from "lucide-vue-next";
 
 const props = defineProps<{ pid: string }>();
 const router = useRouter();
@@ -131,6 +131,20 @@ async function delSubject(s: SimSubject) {
 
 function fmt(ts: number | null) {
   return ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "—";
+}
+
+/**
+ * 结果 → 查看器路由。按 result_type 分发：目前只有碰撞（d3plot）有实现，
+ * 后续 CFD / NVH / 疲劳各自注册后在此扩展，其余类型返回 null（不显示入口）。
+ *
+ * 只对 d3plot 家族主文件给入口——d3plot01/02 是同一模型的后续状态帧，
+ * 查看器从主文件一并加载，逐个给链接只会让人误以为要分别打开。
+ */
+function viewerFor(r: SimResult): RouteLocationRaw | null {
+  if (r.result_type !== "d3plot") return null;
+  const name = r.file_path.split(/[/\\]/).pop() ?? "";
+  if (name.toLowerCase() !== "d3plot") return null;
+  return { name: "d3plot", query: { path: r.file_path } };
 }
 
 onMounted(load);
@@ -361,6 +375,7 @@ onMounted(load);
               <th class="text-left font-medium py-2">结果类型</th>
               <th class="text-left font-medium py-2">文件</th>
               <th class="text-left font-medium py-2">生成时间</th>
+              <th class="w-24"></th>
             </tr>
           </thead>
           <tbody>
@@ -375,6 +390,18 @@ onMounted(load);
                 {{ r.file_path }}
               </td>
               <td class="py-2 text-slate-500">{{ fmt(r.created_at) }}</td>
+              <td class="py-2">
+                <!-- 目前只有碰撞(d3plot)有查看器实现；其余类型登记后可下载，
+                     待各专业查看器插件注册后这里按 result_type 分发 -->
+                <RouterLink
+                  v-if="viewerFor(r)"
+                  :to="viewerFor(r)!"
+                  class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs text-blue-600 hover:bg-blue-50"
+                >
+                  <Eye :size="12" /> 在线查看
+                </RouterLink>
+                <span v-else class="text-xs text-slate-300">暂无查看器</span>
+              </td>
             </tr>
           </tbody>
         </table>

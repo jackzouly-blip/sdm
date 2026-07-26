@@ -13,19 +13,8 @@ from app.sim.router import router as sim_router
 
 
 @pytest.fixture(autouse=True)
-def restrict_admins(monkeypatch):
-    """配置管理员白名单。
-
-    平台默认 admin_users 为空时 is_admin() 对所有人返回 True（本地联调用），
-    那样属主隔离根本不会生效。生产必然配置该项，故测试也必须配置，
-    否则隔离用例是假通过。
-    """
-    from app import config
-
-    monkeypatch.setenv("HPC_ADMIN_USERS", "root")
-    monkeypatch.setattr(config, "_settings", None)
-    yield
-    monkeypatch.setattr(config, "_settings", None)
+def _admins(restrict_admins):
+    """启用管理员白名单（定义见 conftest）：不配置的话隔离用例是假通过。"""
 
 
 @pytest.fixture

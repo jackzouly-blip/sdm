@@ -81,6 +81,7 @@ class JobPoller:
         try:
             from ..sim.engine import get_engine
             from ..sim.hpc_bridge import on_jobs_finished, tick_queue_refs
+            from ..sim.results import tick_task_refs
 
             eng = get_engine()
             if eng is None:
@@ -89,6 +90,8 @@ class JobPoller:
                 on_jobs_finished(eng.db, self.db, finished)
             else:
                 tick_queue_refs(eng.db, self.db)
+            # 异步任务(如 d3plot 解析)完成后的回流，与作业完成无关，每轮都要查
+            tick_task_refs(eng.db, eng.task_manager)
         except Exception:  # noqa: BLE001
             log.exception("编排回流失败")
 

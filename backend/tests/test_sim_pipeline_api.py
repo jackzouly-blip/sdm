@@ -11,14 +11,8 @@ from app.sim.pipeline_router import router as pipeline_router
 
 
 @pytest.fixture(autouse=True)
-def restrict_admins(monkeypatch):
-    """不配置白名单时 is_admin() 对所有人为真，隔离用例会假通过。"""
-    from app import config
-
-    monkeypatch.setenv("HPC_ADMIN_USERS", "root")
-    monkeypatch.setattr(config, "_settings", None)
-    yield
-    monkeypatch.setattr(config, "_settings", None)
+def _admins(restrict_admins):
+    """启用管理员白名单（定义见 conftest）：不配置的话隔离用例是假通过。"""
 
 
 @pytest.fixture

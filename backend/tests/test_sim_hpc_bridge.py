@@ -83,39 +83,13 @@ def engine(db, jobs_db):
 
 
 @pytest.fixture
-def no_fs(monkeypatch):
-    """打桩落盘与准入调度：桥接逻辑与真实文件系统/PBS 无关。
-
-    app.fs.browser 依赖 fcntl（Unix 专有），在非 Unix 开发机上根本导入不了，
-    故那里注入一个桩模块；Linux 上仍打桩真实模块，走的是同一条代码路径。
-    """
-    import importlib
-    import sys
-    import types
-
+def no_fs(patch_or_stub):
+    """打桩落盘与准入调度：桥接逻辑与真实文件系统/PBS 无关。"""
     written = []
 
     def fake_write_file(user, parent, name, data, roots):
         written.append({"user": user, "parent": parent, "name": name, "data": data})
         return {"path": f"{parent}/{name}"}
-
-    def patch_or_stub(mod_name: str, attrs: dict) -> None:
-        """能导入就打桩真实模块，导不进（缺 fcntl）就注入桩模块。"""
-        try:
-            importlib.import_module(mod_name)
-        except ImportError:
-            stub = types.ModuleType(mod_name)
-            for k, v in attrs.items():
-                setattr(stub, k, v)
-            stub.FsError = type("FsError", (Exception,), {"message": ""})
-            monkeypatch.setitem(sys.modules, mod_name, stub)
-            # 同时挂到父包上，否则测试里用点号路径 monkeypatch 会解析不到
-            pkg_name, _, leaf = mod_name.rpartition(".")
-            monkeypatch.setattr(importlib.import_module(pkg_name), leaf, stub,
-                                raising=False)
-            return
-        for k, v in attrs.items():
-            monkeypatch.setattr(f"{mod_name}.{k}", v)
 
     patch_or_stub("app.fs.browser", {"write_file": fake_write_file})
     patch_or_stub("app.submit.router", {
