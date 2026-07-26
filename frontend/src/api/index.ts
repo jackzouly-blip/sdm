@@ -18,8 +18,16 @@ import type {
   LoginResponse,
   MeResponse,
   NetdiskPreview,
+  NodesResponse,
   PackageRequest,
   PreviewResponse,
+  SimJob,
+  SimProject,
+  SimProjectInput,
+  SimResult,
+  SimSubject,
+  SimTarget,
+  SimTemplate,
   TaskSnapshot,
 } from "./types";
 
@@ -131,6 +139,24 @@ export const api = {
     const { data } = await http.get("/stats/jobs", {
       params: { start, end, ...(userFilter ? { user_filter: userFilter } : {}) },
     });
+    return data;
+  },
+
+  // --- 计算节点监控（管理员）---
+  // 采集各计算节点状态（pbsnodes -a）
+  async listNodes(): Promise<NodesResponse> {
+    const { data } = await http.get<NodesResponse>("/nodes");
+    return data;
+  },
+  // ssh 到指定节点重启 pbs 服务（pbs_mom / trqauthd）
+  async restartNodeServices(
+    name: string
+  ): Promise<{ node: string; restarted: boolean; services: string[] }> {
+    const { data } = await http.post<{
+      node: string;
+      restarted: boolean;
+      services: string[];
+    }>(`/nodes/${encodeURIComponent(name)}/restart-services`);
     return data;
   },
 
@@ -537,6 +563,111 @@ export function pollTask(
   void tick();
   return stop;
 }
+
+/**
+ * SDM 仿真设计接口。
+ *
+ * 单独成组而非平铺进 api：仿真是一个独立的一级 APP，接口数量会持续增长，
+ * 与算力管理的接口混在一起会很快失去可读性。
+ */
+export const simApi = {
+  // --- 项目 ---
+  async listProjects(status?: string): Promise<SimProject[]> {
+    const { data } = await http.get<SimProject[]>("/sim/projects", {
+      params: status ? { status_filter: status } : undefined,
+    });
+    return data;
+  },
+  async createProject(body: SimProjectInput): Promise<SimProject> {
+    const { data } = await http.post<SimProject>("/sim/projects", body);
+    return data;
+  },
+  async getProject(pid: string): Promise<SimProject> {
+    const { data } = await http.get<SimProject>(`/sim/projects/${pid}`);
+    return data;
+  },
+  async updateProject(pid: string, body: Partial<SimProjectInput>): Promise<SimProject> {
+    const { data } = await http.patch<SimProject>(`/sim/projects/${pid}`, body);
+    return data;
+  },
+  async deleteProject(pid: string): Promise<void> {
+    await http.delete(`/sim/projects/${pid}`);
+  },
+
+  // --- 分析对象 ---
+  async listTargets(pid: string): Promise<SimTarget[]> {
+    const { data } = await http.get<SimTarget[]>(`/sim/projects/${pid}/targets`);
+    return data;
+  },
+  async createTarget(
+    pid: string,
+    body: { name: string; target_type?: string; source_ref?: Record<string, unknown> }
+  ): Promise<SimTarget> {
+    const { data } = await http.post<SimTarget>(`/sim/projects/${pid}/targets`, body);
+    return data;
+  },
+  async deleteTarget(tid: string): Promise<void> {
+    await http.delete(`/sim/targets/${tid}`);
+  },
+
+  // --- 工况 ---
+  async listSubjects(pid: string, status?: string): Promise<SimSubject[]> {
+    const { data } = await http.get<SimSubject[]>(`/sim/projects/${pid}/subjects`, {
+      params: status ? { status_filter: status } : undefined,
+    });
+    return data;
+  },
+  async createSubject(
+    pid: string,
+    body: {
+      name: string;
+      subject_type: string;
+      solver_type: string;
+      template_id?: string | null;
+      sim_mesh_version_id?: string | null;
+      config?: Record<string, unknown>;
+    }
+  ): Promise<SimSubject> {
+    const { data } = await http.post<SimSubject>(`/sim/projects/${pid}/subjects`, body);
+    return data;
+  },
+  async deleteSubject(sid: string): Promise<void> {
+    await http.delete(`/sim/subjects/${sid}`);
+  },
+
+  // --- 作业与结果 ---
+  async listProjectJobs(pid: string): Promise<SimJob[]> {
+    const { data } = await http.get<SimJob[]>(`/sim/projects/${pid}/jobs`);
+    return data;
+  },
+  async listProjectResults(pid: string): Promise<SimResult[]> {
+    const { data } = await http.get<SimResult[]>(`/sim/projects/${pid}/results`);
+    return data;
+  },
+
+  // --- 工况模板 ---
+  async listTemplates(subjectType?: string, solverType?: string): Promise<SimTemplate[]> {
+    const { data } = await http.get<SimTemplate[]>("/sim/templates", {
+      params: { subject_type: subjectType, solver_type: solverType },
+    });
+    return data;
+  },
+  async createTemplate(body: {
+    name: string;
+    subject_type: string;
+    solver_type: string;
+    schema?: Record<string, unknown>;
+    default_values?: Record<string, unknown>;
+    validation_rules?: Record<string, unknown>;
+    export_mapping?: Record<string, unknown>;
+  }): Promise<SimTemplate> {
+    const { data } = await http.post<SimTemplate>("/sim/templates", body);
+    return data;
+  },
+  async deleteTemplate(tid: string): Promise<void> {
+    await http.delete(`/sim/templates/${tid}`);
+  },
+};
 
 // 在线 shell WebSocket：token 同样经 query 传递，仅管理员可连。
 export function shellWs(): WebSocket {

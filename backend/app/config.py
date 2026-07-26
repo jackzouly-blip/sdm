@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     pbs_poll_interval: int = 15  # 轮询 qstat 间隔（秒）
     accounting_dir: str = "/var/spool/torque/server_priv/accounting"
 
+    # 节点监控：从管理节点 ssh 免密登录到各计算节点重启 pbs 服务时使用。
+    # 后端须以 root 运行且已配置到各节点的 ssh 免密登录。
+    node_ssh_user: str = "root"                 # ssh 登录计算节点使用的用户
+    node_restart_services: str = "pbs_mom trqauthd"  # 重启的服务名（空格分隔）
+    node_ssh_timeout: int = 30                  # 单次 ssh 命令超时（秒）
+
     # 文件浏览允许的根白名单（冒号分隔，类似 PATH）。仅这些根及其子目录可访问，
     # 再叠加 OS 权限以登录用户身份兜底。
     fs_roots: str = "/data"

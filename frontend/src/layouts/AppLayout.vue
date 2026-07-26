@@ -1,17 +1,10 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { RouterView, RouterLink, useRouter } from "vue-router";
+import { RouterView, RouterLink, useRouter, useRoute } from "vue-router";
 import { useAuthStore } from "@/stores/auth";
 import { api, errMsg } from "@/api";
+import { APPS, appForPath, visibleNav } from "@/apps/registry";
 import {
-  ListTodo,
-  FolderTree,
-  UploadCloud,
-  FileCog,
-  FileCode,
-  SlidersHorizontal,
-  TerminalSquare,
-  BarChart3,
   LogOut,
   Globe,
   Copy,
@@ -70,22 +63,19 @@ function logout() {
   router.push({ name: "login" });
 }
 
-// 在线 shell 仅管理员可见（后端同样会以 is_admin 强制校验）。
-const nav = computed(() => {
-  const items = [
-    { name: "jobs", label: "任务", icon: ListTodo },
-    { name: "files", label: "文件浏览", icon: FolderTree },
-    { name: "tasks", label: "打包记录", icon: UploadCloud },
-    { name: "rules", label: "后处理工具", icon: FileCog },
-  ];
-  if (auth.me?.is_admin) {
-    items.push({ name: "templates", label: "模板管理", icon: FileCode });
-    items.push({ name: "user-policies", label: "用户策略", icon: SlidersHorizontal });
-    items.push({ name: "stats", label: "机时统计", icon: BarChart3 });
-    items.push({ name: "shell", label: "在线终端", icon: TerminalSquare });
-  }
-  return items;
-});
+// 当前所在的一级 APP 由路径决定；APP 内导航与切换器都从注册表派生。
+const route = useRoute();
+const currentApp = computed(() => appForPath(route.path));
+// 管理员专属入口在此过滤（后端同样会以 is_admin 强制校验，这里只是不显示入口）。
+const nav = computed(() => visibleNav(currentApp.value, !!auth.me?.is_admin));
+const appSwitcherOpen = ref(false);
+
+function switchApp(appId: string) {
+  appSwitcherOpen.value = false;
+  mobileOpen.value = false;
+  const app = APPS.find((a) => a.id === appId);
+  if (app && app.id !== currentApp.value.id) router.push({ name: app.home });
+}
 </script>
 
 <template>
@@ -94,10 +84,61 @@ const nav = computed(() => {
       class="h-14 shrink-0 bg-white border-b border-slate-200 flex items-center px-3 sm:px-5 gap-3 sm:gap-6"
     >
       <img src="/cherish-logo.png" alt="CHERISH" class="h-9 w-auto shrink-0" />
-      <div class="font-semibold text-slate-800 text-base sm:text-lg whitespace-nowrap">
+      <div
+        class="font-semibold text-slate-800 text-base sm:text-lg whitespace-nowrap hidden sm:block"
+      >
         驰越诗软件计算平台V3.0
       </div>
-      <!-- 桌面导航 -->
+
+      <!-- 一级 APP 切换器 -->
+      <div class="relative shrink-0">
+        <button
+          class="flex items-center gap-2 px-2.5 py-1.5 rounded-md border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 transition"
+          @click="appSwitcherOpen = !appSwitcherOpen"
+        >
+          <component :is="currentApp.icon" :size="16" class="text-blue-600" />
+          <span class="text-sm font-medium">{{ currentApp.label }}</span>
+          <svg class="w-3 h-3 text-slate-400" viewBox="0 0 12 12" fill="none">
+            <path d="M3 4.5 6 7.5 9 4.5" stroke="currentColor" stroke-width="1.5"
+              stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+        <!-- 点击遮罩关闭 -->
+        <div
+          v-if="appSwitcherOpen"
+          class="fixed inset-0 z-10"
+          @click="appSwitcherOpen = false"
+        ></div>
+        <div
+          v-if="appSwitcherOpen"
+          class="absolute left-0 top-full mt-1 z-20 w-64 bg-white border border-slate-200 rounded-lg shadow-lg p-1"
+        >
+          <button
+            v-for="app in APPS"
+            :key="app.id"
+            class="w-full flex items-start gap-2.5 px-2.5 py-2 rounded-md text-left hover:bg-slate-50 transition"
+            :class="app.id === currentApp.id ? 'bg-blue-50' : ''"
+            @click="switchApp(app.id)"
+          >
+            <component
+              :is="app.icon"
+              :size="18"
+              class="mt-0.5 shrink-0"
+              :class="app.id === currentApp.id ? 'text-blue-600' : 'text-slate-400'"
+            />
+            <span class="min-w-0">
+              <span
+                class="block text-sm font-medium"
+                :class="app.id === currentApp.id ? 'text-blue-700' : 'text-slate-700'"
+                >{{ app.label }}</span
+              >
+              <span class="block text-xs text-slate-400">{{ app.hint }}</span>
+            </span>
+          </button>
+        </div>
+      </div>
+
+      <!-- 桌面导航（当前 APP 内） -->
       <nav class="hidden md:flex items-center gap-1">
         <RouterLink
           v-for="item in nav"

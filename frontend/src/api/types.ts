@@ -244,3 +244,130 @@ export interface TaskSnapshot {
   created_at: number;
   updated_at: number;
 }
+
+// 计算节点监控
+export interface NodeInfo {
+  name: string;
+  state: string;
+  states: string[];
+  health: "up" | "down" | "offline" | "unknown";
+  np: number | null;
+  used_slots: number;
+  running_jobs: number;
+  ntype: string | null;
+  power_state: string | null;
+  loadave: string | null;
+  ncpus: number | null;
+  physmem: string | null;
+  availmem: string | null;
+  totmem: string | null;
+  gpus: number | null;
+  raw: Record<string, string>;
+}
+
+export interface NodesResponse {
+  nodes: NodeInfo[];
+  summary: {
+    total: number;
+    up: number;
+    down: number;
+    offline: number;
+    unknown: number;
+  };
+}
+
+// --- SDM 仿真设计 ---
+
+export interface SimProjectStats {
+  targets: number;
+  subjects: number;
+  jobs: number;
+}
+
+export interface SimProject {
+  id: string;
+  name: string;
+  description: string | null;
+  owner: string;
+  dbit_project_code: string | null;
+  status: "active" | "archived";
+  default_solver: string | null;
+  unit_system: string;
+  workdir: string | null;
+  created_at: number;
+  updated_at: number;
+  stats?: SimProjectStats;
+}
+
+export interface SimProjectInput {
+  name: string;
+  description?: string | null;
+  dbit_project_code?: string | null;
+  default_solver?: string | null;
+  unit_system?: string;
+  workdir?: string | null;
+}
+
+export interface SimTarget {
+  id: string;
+  sim_project_id: string;
+  name: string;
+  target_type: string;
+  source_ref: Record<string, unknown> | null;
+  created_at: number;
+}
+
+export interface SimSubject {
+  id: string;
+  sim_project_id: string;
+  name: string;
+  subject_type: string;
+  solver_type: string;
+  template_id: string | null;
+  sim_mesh_version_id: string | null;
+  config: Record<string, unknown> | null;
+  status: "draft" | "ready" | "running" | "done" | "failed";
+  created_at: number;
+  updated_at: number;
+}
+
+export interface SimJob {
+  id: string;
+  sim_subject_id: string;
+  sim_mesh_version_id: string | null;
+  /** 跨库软引用 portal.db 的 jobs.jobid；未投递时为 null */
+  hpc_jobid: string | null;
+  submit_mode: string;
+  submit_payload: Record<string, unknown> | null;
+  status: "draft" | "submitted" | "running" | "done" | "failed";
+  error_message: string | null;
+  subject_name?: string;
+  created_at: number;
+  submitted_at: number | null;
+  finished_at: number | null;
+}
+
+export interface SimTemplate {
+  id: string;
+  name: string;
+  subject_type: string;
+  solver_type: string;
+  schema: Record<string, unknown> | null;
+  default_values: Record<string, unknown> | null;
+  validation_rules: Record<string, unknown> | null;
+  export_mapping: Record<string, unknown> | null;
+  is_builtin: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface SimResult {
+  id: string;
+  sim_job_id: string;
+  /** 查看器插件的分发键：d3plot / binout / ... */
+  result_type: string;
+  file_path: string;
+  meta: Record<string, unknown> | null;
+  subject_name?: string;
+  created_at: number;
+}

@@ -20,9 +20,12 @@ from .fs.router import router as fs_router
 from .jobs.poller import JobPoller
 from .netdisk.streamer import NetdiskStreamer, set_streamer
 from .jobs.router import router as jobs_router
+from .nodes.router import router as nodes_router
 from .logger import get_logger, setup_logging
 from .packaging.router import router as packaging_router
 from .shell.router import router as shell_router
+from .sim.db import SimDB
+from .sim.router import router as sim_router
 from .stats.router import router as stats_router
 from .submit.db import TemplatesDB
 from .submit.router import router as submit_router
@@ -45,6 +48,7 @@ async def lifespan(app: FastAPI):
     rules_db = RulesDB(str(BACKEND_DIR / "state" / "extract_rules.db"))
     templates_db = TemplatesDB(str(BACKEND_DIR / "state" / "templates.db"))
     favorites_db = FavoritesDB(str(BACKEND_DIR / "state" / "favorites.db"))
+    sim_db = SimDB(str(BACKEND_DIR / "state" / "sim.db"))
     dispatcher = Dispatcher(db, rules_db, task_manager)
     set_dispatcher(dispatcher)
     streamer = NetdiskStreamer(
@@ -68,6 +72,7 @@ async def lifespan(app: FastAPI):
     app.state.rules_db = rules_db
     app.state.templates_db = templates_db
     app.state.favorites_db = favorites_db
+    app.state.sim_db = sim_db
     app.state.dispatcher = dispatcher
     app.state.scheduler = scheduler
     app.state.trial_manager = trial_manager
@@ -95,6 +100,7 @@ async def lifespan(app: FastAPI):
         rules_db.close()
         templates_db.close()
         favorites_db.close()
+        sim_db.close()
         db.close()
 
 
@@ -119,6 +125,8 @@ app.include_router(d3plot_router)
 app.include_router(submit_router)
 app.include_router(stats_router)
 app.include_router(trial_router)
+app.include_router(nodes_router)
+app.include_router(sim_router)
 
 
 @app.get("/health")
