@@ -371,3 +371,102 @@ export interface SimResult {
   subject_name?: string;
   created_at: number;
 }
+
+// --- SDM 编排 ---
+
+/** 节点类型声明。画布的节点面板与参数表单完全由它生成。 */
+export interface NodeTypeDef {
+  type_id: string;
+  label: string;
+  category: "internal" | "capability" | "hpc" | "manual";
+  description: string;
+  /** JSON Schema，编辑器据此渲染参数表单 */
+  params_schema: {
+    type?: string;
+    properties?: Record<string, JsonSchemaProp>;
+    required?: string[];
+  };
+  inputs: string[];
+  outputs: string[];
+}
+
+export interface JsonSchemaProp {
+  type?: string;
+  title?: string;
+  description?: string;
+  default?: unknown;
+  enum?: unknown[];
+}
+
+export interface DagNode {
+  id: string;
+  type: string;
+  label?: string;
+  params?: Record<string, unknown>;
+  /** 只供画布，引擎忽略 */
+  position?: { x: number; y: number };
+}
+
+export interface DagEdge {
+  from: string;
+  to: string;
+}
+
+export interface DagDoc {
+  nodes: DagNode[];
+  edges: DagEdge[];
+}
+
+export interface PipelineDef {
+  id: string;
+  name: string;
+  description: string | null;
+  version: number;
+  doc: DagDoc;
+  owner: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export type NodeRunStatus =
+  | "pending"
+  | "running"
+  | "waiting"
+  | "done"
+  | "failed"
+  | "skipped";
+
+export interface NodeRun {
+  id: string;
+  pipeline_run_id: string;
+  node_id: string;
+  node_type: string;
+  status: NodeRunStatus;
+  external_ref: string | null;
+  wait_hint: string | null;
+  inputs: Record<string, unknown> | null;
+  outputs: Record<string, unknown> | null;
+  error_message: string | null;
+  started_at: number | null;
+  finished_at: number | null;
+  /** 仅待办接口返回：该节点在 DAG 文档里配置的参数 */
+  params?: Record<string, unknown>;
+  run_id?: string;
+}
+
+export interface PipelineRun {
+  id: string;
+  pipeline_def_id: string;
+  def_version: number;
+  doc_snapshot: DagDoc;
+  sim_project_id: string | null;
+  sim_subject_id: string | null;
+  owner: string;
+  status: "running" | "waiting" | "done" | "failed" | "canceled";
+  error_message: string | null;
+  created_at: number;
+  updated_at: number;
+  finished_at: number | null;
+  /** 详情接口才带 */
+  nodes?: NodeRun[];
+}

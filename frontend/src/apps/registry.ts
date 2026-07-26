@@ -17,6 +17,7 @@ import {
   FileCog,
   FlaskConical,
   FolderTree,
+  GitBranch,
   ListTodo,
   Server,
   SlidersHorizontal,
@@ -75,6 +76,7 @@ export const APPS: AppDef[] = [
     home: "sim-projects",
     nav: [
       { name: "sim-projects", label: "仿真项目", icon: FlaskConical },
+      { name: "sim-pipelines", label: "编排", icon: GitBranch },
       { name: "sim-templates", label: "工况模板", icon: FileCode },
     ],
   },

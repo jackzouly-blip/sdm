@@ -20,6 +20,11 @@ import type {
   NetdiskPreview,
   NodesResponse,
   PackageRequest,
+  DagDoc,
+  NodeRun,
+  NodeTypeDef,
+  PipelineDef,
+  PipelineRun,
   PreviewResponse,
   SimJob,
   SimProject,
@@ -642,6 +647,85 @@ export const simApi = {
   },
   async listProjectResults(pid: string): Promise<SimResult[]> {
     const { data } = await http.get<SimResult[]>(`/sim/projects/${pid}/results`);
+    return data;
+  },
+
+  // --- 编排：节点类型 / 定义 / 运行 ---
+  async listNodeTypes(): Promise<NodeTypeDef[]> {
+    const { data } = await http.get<NodeTypeDef[]>("/sim/node-types");
+    return data;
+  },
+  async listPipelines(): Promise<PipelineDef[]> {
+    const { data } = await http.get<PipelineDef[]>("/sim/pipelines");
+    return data;
+  },
+  async getPipeline(pid: string): Promise<PipelineDef> {
+    const { data } = await http.get<PipelineDef>(`/sim/pipelines/${pid}`);
+    return data;
+  },
+  async createPipeline(body: {
+    name: string;
+    description?: string | null;
+    doc: DagDoc;
+  }): Promise<PipelineDef> {
+    const { data } = await http.post<PipelineDef>("/sim/pipelines", body);
+    return data;
+  },
+  async updatePipeline(
+    pid: string,
+    body: { name?: string; description?: string | null; doc?: DagDoc }
+  ): Promise<PipelineDef> {
+    const { data } = await http.patch<PipelineDef>(`/sim/pipelines/${pid}`, body);
+    return data;
+  },
+  async deletePipeline(pid: string): Promise<void> {
+    await http.delete(`/sim/pipelines/${pid}`);
+  },
+  /** 校验但不保存——画布可在编辑时实时提示环、悬空边等问题 */
+  async validatePipeline(doc: DagDoc): Promise<{ ok: boolean; error?: string }> {
+    const { data } = await http.post<{ ok: boolean; error?: string }>(
+      "/sim/pipelines/validate",
+      { doc }
+    );
+    return data;
+  },
+  async startRun(
+    pid: string,
+    body: { sim_project_id?: string | null; sim_subject_id?: string | null }
+  ): Promise<PipelineRun> {
+    const { data } = await http.post<PipelineRun>(`/sim/pipelines/${pid}/runs`, body);
+    return data;
+  },
+  async listRuns(params?: {
+    sim_subject_id?: string;
+    active_only?: boolean;
+  }): Promise<PipelineRun[]> {
+    const { data } = await http.get<PipelineRun[]>("/sim/runs", { params });
+    return data;
+  },
+  async getRun(rid: string): Promise<PipelineRun> {
+    const { data } = await http.get<PipelineRun>(`/sim/runs/${rid}`);
+    return data;
+  },
+  async cancelRun(rid: string): Promise<PipelineRun> {
+    const { data } = await http.post<PipelineRun>(`/sim/runs/${rid}/cancel`);
+    return data;
+  },
+  /** 外部回流：HPC 完成 / 浏览器代理调完能力 / 人工确认，共用此接口 */
+  async completeNode(
+    rid: string,
+    nodeId: string,
+    body: { outputs?: Record<string, unknown>; error?: string }
+  ): Promise<PipelineRun> {
+    const { data } = await http.post<PipelineRun>(
+      `/sim/runs/${rid}/nodes/${nodeId}/complete`,
+      body
+    );
+    return data;
+  },
+  /** 浏览器代理的待办：需本机 vektor3d 执行的能力节点 */
+  async pendingCapabilityNodes(): Promise<NodeRun[]> {
+    const { data } = await http.get<NodeRun[]>("/sim/pending-capability-nodes");
     return data;
   },
 

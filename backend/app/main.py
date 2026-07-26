@@ -25,6 +25,9 @@ from .logger import get_logger, setup_logging
 from .packaging.router import router as packaging_router
 from .shell.router import router as shell_router
 from .sim.db import SimDB
+from .sim.engine import PipelineEngine, set_engine
+from .sim.nodes import register_builtin_node_types
+from .sim.pipeline_router import router as sim_pipeline_router
 from .sim.router import router as sim_router
 from .stats.router import router as stats_router
 from .submit.db import TemplatesDB
@@ -49,6 +52,9 @@ async def lifespan(app: FastAPI):
     templates_db = TemplatesDB(str(BACKEND_DIR / "state" / "templates.db"))
     favorites_db = FavoritesDB(str(BACKEND_DIR / "state" / "favorites.db"))
     sim_db = SimDB(str(BACKEND_DIR / "state" / "sim.db"))
+    register_builtin_node_types()
+    pipeline_engine = PipelineEngine(sim_db)
+    set_engine(pipeline_engine)
     dispatcher = Dispatcher(db, rules_db, task_manager)
     set_dispatcher(dispatcher)
     streamer = NetdiskStreamer(
@@ -73,6 +79,7 @@ async def lifespan(app: FastAPI):
     app.state.templates_db = templates_db
     app.state.favorites_db = favorites_db
     app.state.sim_db = sim_db
+    app.state.pipeline_engine = pipeline_engine
     app.state.dispatcher = dispatcher
     app.state.scheduler = scheduler
     app.state.trial_manager = trial_manager
@@ -127,6 +134,7 @@ app.include_router(stats_router)
 app.include_router(trial_router)
 app.include_router(nodes_router)
 app.include_router(sim_router)
+app.include_router(sim_pipeline_router)
 
 
 @app.get("/health")

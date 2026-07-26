@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..logger import get_logger
+from .pipeline_store import PIPELINE_SCHEMA, PipelineStoreMixin
 
 log = get_logger(__name__)
 
@@ -193,10 +194,12 @@ def _uid() -> str:
     return uuid.uuid4().hex
 
 
-class SimDB:
+class SimDB(PipelineStoreMixin):
     """仿真设计数据访问层。
 
     与 JobsDB 同构：请求线程与后台线程都会访问，故 check_same_thread=False + 锁。
+    编排相关的表与方法由 PipelineStoreMixin 提供——拆文件只为可读性，
+    共用同一连接与锁，故"建 run 时校验工况存在"这类操作仍有事务性。
     """
 
     def __init__(self, db_path: str):
@@ -207,6 +210,7 @@ class SimDB:
         self._lock = threading.Lock()
         with self._lock:
             self.conn.executescript(_SCHEMA)
+            self.conn.executescript(PIPELINE_SCHEMA)
             self.conn.commit()
 
     def close(self) -> None:

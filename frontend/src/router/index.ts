@@ -94,6 +94,23 @@ const router = createRouter({
           name: "sim-templates",
           component: () => import("@/views/sim/SimTemplatesView.vue"),
         },
+        {
+          path: "sim/pipelines",
+          name: "sim-pipelines",
+          component: () => import("@/views/sim/SimPipelinesView.vue"),
+        },
+        {
+          path: "sim/pipelines/:pid",
+          name: "sim-pipeline-editor",
+          component: () => import("@/views/sim/SimPipelineEditorView.vue"),
+          props: true,
+        },
+        {
+          path: "sim/runs/:rid",
+          name: "sim-run",
+          component: () => import("@/views/sim/SimRunView.vue"),
+          props: true,
+        },
 
         // --- 结果查看 ---
         { path: "viewer", redirect: "/viewer/d3plot" },
