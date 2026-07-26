@@ -5,10 +5,27 @@
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from app.db.jobs_db import ACTIVE, DONE, JobsDB
 from app.pbs.parser import parse_jobs
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qstat_f_1785.txt"
+
+
+@pytest.fixture(autouse=True)
+def restrict_admins(monkeypatch):
+    """配置管理员白名单，否则属主隔离断言是假阴性。
+
+    admin_users 为空时 is_admin() 对所有人返回 True（本地联调语义），
+    "他人访问应 403"会变成 200 —— 不配置的话这条断言等于没测。
+    """
+    from app import config
+
+    monkeypatch.setenv("HPC_ADMIN_USERS", "3dixadmin")
+    monkeypatch.setattr(config, "_settings", None)
+    yield
+    monkeypatch.setattr(config, "_settings", None)
 
 
 def _make_db() -> JobsDB:

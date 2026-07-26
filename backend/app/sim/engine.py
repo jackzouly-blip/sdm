@@ -121,8 +121,13 @@ def _node_spec(doc: Dict, node_id: str) -> Optional[Dict]:
 class PipelineEngine:
     """编排引擎。无自有线程：推进由事件触发，兜底轮询由 streamer 式的调用方驱动。"""
 
-    def __init__(self, db):
+    def __init__(self, db, jobs_db=None, templates_db=None, settings=None):
         self.db = db
+        # 需要触达现有 HPC 链路的节点用这三项；测试里可为 None，
+        # 相关节点会报明确错误而非崩溃。
+        self.jobs_db = jobs_db
+        self.templates_db = templates_db
+        self.settings = settings
         # 同一 run 的推进串行化，避免并发事件把同一节点派发两次
         self._locks: Dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
@@ -225,6 +230,9 @@ class PipelineEngine:
             sim_project_id=run["sim_project_id"],
             sim_subject_id=run["sim_subject_id"],
             db=self.db,
+            jobs_db=self.jobs_db,
+            templates_db=self.templates_db,
+            settings=self.settings,
         )
         try:
             outcome = nt.executor(ctx)

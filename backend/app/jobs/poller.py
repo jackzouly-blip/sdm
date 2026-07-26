@@ -54,6 +54,11 @@ class JobPoller:
                     d.dispatch_many(finished)
                 except Exception:  # noqa: BLE001
                     log.exception("提取派发失败")
+        # 编排回流：作业结束推进对应的 hpc.submit 节点。
+        # 即便本轮无完成作业也要调一次——排队中的节点需要把 sq: 句柄升级成
+        # 真实作业号，否则"提交后很快结束"的作业会错过匹配。
+        self._advance_pipelines(finished)
+
         # 任务结束会释放核数/用户配额名额，立刻触发一次准入调度补位，
         # 不必等调度器自己的兜底轮询间隔。
         from ..submit.scheduler import get_scheduler
@@ -67,6 +72,25 @@ class JobPoller:
         self.last_ok_ts = time.time()
         self.last_error = None
         return len(jobs)
+
+    def _advance_pipelines(self, finished: list) -> None:
+        """把作业完成事件转给编排引擎。
+
+        编排是可选子系统：未装配或出错时只记日志，绝不影响作业轮询本身。
+        """
+        try:
+            from ..sim.engine import get_engine
+            from ..sim.hpc_bridge import on_jobs_finished, tick_queue_refs
+
+            eng = get_engine()
+            if eng is None:
+                return
+            if finished:
+                on_jobs_finished(eng.db, self.db, finished)
+            else:
+                tick_queue_refs(eng.db, self.db)
+        except Exception:  # noqa: BLE001
+            log.exception("编排回流失败")
 
     def _loop(self) -> None:
         while not self._stop.is_set():

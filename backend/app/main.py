@@ -53,7 +53,9 @@ async def lifespan(app: FastAPI):
     favorites_db = FavoritesDB(str(BACKEND_DIR / "state" / "favorites.db"))
     sim_db = SimDB(str(BACKEND_DIR / "state" / "sim.db"))
     register_builtin_node_types()
-    pipeline_engine = PipelineEngine(sim_db)
+    # 编排的 hpc.submit 节点复用现有提交链路，故需要 jobs_db/templates_db/settings
+    pipeline_engine = PipelineEngine(sim_db, jobs_db=db,
+                                     templates_db=templates_db, settings=settings)
     set_engine(pipeline_engine)
     dispatcher = Dispatcher(db, rules_db, task_manager)
     set_dispatcher(dispatcher)

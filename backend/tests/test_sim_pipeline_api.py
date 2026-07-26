@@ -138,8 +138,12 @@ def test_completing_twice_is_rejected(client):
 
 
 def test_claim_registers_external_ref(client):
-    """HPC 作业号 / 能力作业号登记后，回流时才能定位到节点。"""
-    doc = {"nodes": [{"id": "j", "type": "hpc.submit", "params": {}}], "edges": []}
+    """外部句柄登记后，回流时才能定位到节点。
+
+    claim 对任何等待中的节点都适用，故用 manual.confirm 测——hpc.submit 会真的
+    走提交链路，那条路径由 test_sim_hpc_bridge 覆盖。
+    """
+    doc = {"nodes": [{"id": "j", "type": "manual.confirm", "params": {}}], "edges": []}
     pid = client.post("/sim/pipelines", json={"name": "求解", "doc": doc},
                       headers=hdr("u")).json()["id"]
     rid = client.post(f"/sim/pipelines/{pid}/runs", json={}, headers=hdr("u")).json()["id"]
@@ -149,6 +153,25 @@ def test_claim_registers_external_ref(client):
     node = next(n for n in r.json()["nodes"] if n["node_id"] == "j")
     assert node["external_ref"] == "2434.hpcmaster"
     assert node["status"] == "waiting"
+
+
+def test_hpc_node_fails_loudly_when_chain_absent(client):
+    """hpc.submit 现在真的走提交链路：缺前置条件要给出可读原因而非静默挂起。
+
+    本测试的引擎刻意未装配 jobs_db/settings（路由层测试不该拉起整条提交链路），
+    故命中的是装配检查——这个顺序是对的：依赖都没有就谈不上校验项目。
+    提交链路装配齐全后的各类前置校验由 test_sim_hpc_bridge 覆盖。
+    """
+    doc = {"nodes": [{"id": "j", "type": "hpc.submit", "params": {"script": "x"}}],
+           "edges": []}
+    pid = client.post("/sim/pipelines", json={"name": "求解", "doc": doc},
+                      headers=hdr("u")).json()["id"]
+    run = client.post(f"/sim/pipelines/{pid}/runs", json={}, headers=hdr("u")).json()
+
+    node = next(n for n in run["nodes"] if n["node_id"] == "j")
+    assert node["status"] == "failed"
+    assert "未装配" in node["error_message"]
+    assert run["status"] == "failed"
 
 
 def test_capability_nodes_appear_in_browser_broker_queue(client):

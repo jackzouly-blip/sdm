@@ -68,6 +68,11 @@ class NodeContext:
     sim_project_id: Optional[str]
     sim_subject_id: Optional[str]
     db: object  # SimDB，避免循环导入故不标注具体类型
+    # 下列三项供需要触达现有 HPC 链路的节点使用；测试中可为 None，
+    # 相关节点会给出明确错误而非崩溃。
+    jobs_db: object = None
+    templates_db: object = None
+    settings: object = None
 
 
 @dataclass
@@ -229,11 +234,23 @@ def _exec_capability(ctx: NodeContext):
 def _exec_hpc_submit(ctx: NodeContext):
     """提交到 HPC 并等待求解完成。
 
-    同样是"派发后等外部"：提交走现有 HPC 链路，完成由现有作业轮询回流。
-    本期先建立挂起语义与外部句柄，与提交链路的接线在下一期完成——
-    届时只改这个执行器，DAG 定义与引擎都不动。
+    "派发后等外部"：提交复用现有链路（本地排队 → 用户配额与全局核数网关 →
+    qsub），完成由现有作业轮询回流。编排层不重新实现这两条已经成熟的链路。
+
+    句柄有两种形态，因为提交是两段式的：仍在本地排队时是 sq:<队列项 id>，
+    qsub 成功后升级为 PBS 作业号——见 hpc_bridge。
     """
-    return Waiting(ref=None, hint="等待提交并求解完成")
+    if ctx.jobs_db is None or ctx.settings is None:
+        return Failed("HPC 提交链路未装配，无法提交（引擎缺少 jobs_db/settings）")
+
+    from .hpc_bridge import submit_from_node
+
+    ref, err = submit_from_node(ctx, ctx.jobs_db, ctx.templates_db, ctx.settings)
+    if err:
+        return Failed(err)
+    hint = ("等待求解完成" if not str(ref).startswith("sq:")
+            else "已入本地排队，等待准入调度后提交")
+    return Waiting(ref=ref, hint=hint)
 
 
 def register_builtin_node_types() -> None:
@@ -294,8 +311,25 @@ def register_builtin_node_types() -> None:
         params_schema={
             "type": "object",
             "properties": {
+                "template_id": {
+                    "type": "number", "title": "提交模板 ID",
+                    "description": "算力管理里的提交脚本模板；若直接填 script 则可留空",
+                },
+                "script": {
+                    "type": "string", "title": "提交脚本",
+                    "description": "直接给出 PBS 脚本，优先于模板",
+                },
                 "queue": {"type": "string", "title": "队列", "default": "batch"},
-                "nodes": {"type": "string", "title": "资源", "default": "1:ppn=8"},
+                "cores": {
+                    "type": "number", "title": "核数",
+                    "description": "注入脚本的 ppn；0 表示沿用脚本自带的 nodes 行",
+                    "default": 0,
+                },
+                "deck_filename": {
+                    "type": "string", "title": "输入卡文件名",
+                    "description": "上游生成的输入卡写成什么文件；实际会附加运行号后缀避免重跑冲突",
+                    "default": "input.k",
+                },
             },
         },
         inputs=["deck_text"], outputs=["hpc_jobid"],
