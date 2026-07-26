@@ -86,10 +86,19 @@ class StateStore:
         """创建或重置一个上传任务。
 
         若已有记录但内容 MD5 变了（文件被修改），重置 uploadid/uploaded 重新上传。
+
+        chunk_size 也必须一致才能续传：uploadid 是 precreate 时按当时的分片划分
+        建立的，配置改了分片大小后 block_list 完全不同，拿旧 uploadid 去合并必然
+        对不上。此时同样按新任务重来。
         """
         row = self.get(remote_path)
-        if row and row["content_md5"] == content_md5 and row["status"] != DONE:
-            # 同一文件未完成，保留 uploadid 与已传分片以便续传
+        if (
+            row
+            and row["content_md5"] == content_md5
+            and row["chunk_size"] == chunk_size
+            and row["status"] != DONE
+        ):
+            # 同一文件、同一分片划分且未完成，保留 uploadid 与已传分片以便续传
             return row
 
         self.conn.execute(

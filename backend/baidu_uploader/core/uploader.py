@@ -16,6 +16,29 @@ from .hashing import file_md5, read_chunk, slice_md5_list
 
 log = get_logger(__name__)
 
+# 百度 superfile2 对单个 uploadid 的分片序号上限：partseq 合法范围是 0..2047。
+# 超出后每一片都返回 HTTP 400 / error_code 31299 "Invalid param part_id"，
+# 分片永远补不齐，create 合并这一步根本走不到。该上限是分片“个数”而非字节数，
+# 已实测：32 MiB 分片下 partseq=447（字节偏移 13.97 GiB）正常接受，
+# 而 partseq=2048 依旧被拒。所以单文件容量 = MAX_PARTS × chunk_size。
+MAX_PARTS = 2048
+
+
+class UploadTooLargeError(RuntimeError):
+    """文件分片数超出百度单 uploadid 上限，当前分片大小下无法上传。"""
+
+    def __init__(self, local: Path, size: int, chunk_size: int, parts: int):
+        super().__init__(
+            f"{local.name} 需要 {parts} 个分片，超出百度上限 {MAX_PARTS}："
+            f"文件 {size / 1024**3:.2f} GiB，当前分片 {chunk_size // 1024**2} MiB，"
+            f"该分片大小下单文件上限 {MAX_PARTS * chunk_size / 1024**3:.0f} GiB。"
+            f"请调大 config 中的 upload.chunk_size（普通用户上限 4 MiB，"
+            f"会员 16 MiB，超级会员 32 MiB）。"
+        )
+        self.size = size
+        self.chunk_size = chunk_size
+        self.parts = parts
+
 
 class Uploader:
     def __init__(
@@ -40,6 +63,11 @@ class Uploader:
         block_list, size = slice_md5_list(local, self.chunk_size)
         content_md5 = file_md5(local)
         mtime = local.stat().st_mtime
+
+        # 预检：分片数超限的文件必然失败，提前报错。否则会先老实传满 2048 片
+        # （4 MiB 分片下就是 8 GiB）再对剩余每一片各撞一次 400，白费大量时间与带宽。
+        if len(block_list) > MAX_PARTS:
+            raise UploadTooLargeError(local, size, self.chunk_size, len(block_list))
 
         # 增量去重：已成功上传且内容未变 -> 跳过
         if self.store and self.store.is_unchanged(remote_path, content_md5, size):
@@ -128,11 +156,20 @@ class Uploader:
         # SQLite 连接不可跨线程：worker 仅上传，状态写入在主线程完成
         with ThreadPoolExecutor(max_workers=self.concurrency) as ex:
             futures = {ex.submit(_do, seq): seq for seq in partseqs}
-            for fut in as_completed(futures):
-                seq = fut.result()  # 异常向上抛出，由上层重试
-                if self.store:
-                    self.store.mark_part_done(remote_path, seq)
-                done += 1
-                log.info("分片进度 %d/%d", done, total)
-                if self.progress_cb is not None:
-                    self.progress_cb(done, total)
+            try:
+                for fut in as_completed(futures):
+                    seq = fut.result()  # 异常向上抛出，由上层重试
+                    if self.store:
+                        self.store.mark_part_done(remote_path, seq)
+                    done += 1
+                    log.info("分片进度 %d/%d", done, total)
+                    if self.progress_cb is not None:
+                        self.progress_cb(done, total)
+            except Exception:
+                # 一片失败即整体失败：取消尚未开跑的分片。否则 with 退出时
+                # shutdown(wait=True) 会把已提交的分片全部跑完——一个必失败的
+                # 大文件能因此多发几千个无谓请求，把 worker 占住几十分钟。
+                cancelled = sum(1 for f in futures if f.cancel())
+                if cancelled:
+                    log.warning("分片失败，已取消未开始的 %d/%d 个分片", cancelled, total)
+                raise

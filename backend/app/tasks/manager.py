@@ -71,6 +71,11 @@ def register_task(task_type: str):
 
 
 class TaskManager:
+    # 独占线程池的任务类型 -> worker 数。
+    # 网盘上传单文件耗时以十分钟计（GB 级），与提取/打包共用默认池时会把两个
+    # worker 长期占满，导致其它任务全堵在队列里。给它单独一个池彼此隔离。
+    _DEDICATED_POOLS = {"netdisk_autoshare": 2}
+
     def __init__(self, db_path: str, max_workers: int = 2):
         self.path = Path(db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -81,12 +86,18 @@ class TaskManager:
             self.conn.executescript(_SCHEMA)
             self.conn.commit()
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="task")
+        self._pools = {
+            t: ThreadPoolExecutor(max_workers=n, thread_name_prefix=f"task-{t}")
+            for t, n in self._DEDICATED_POOLS.items()
+        }
         # 进度订阅者：task_id -> set(回调)。回调签名 cb(snapshot: dict)
         self._subscribers: Dict[str, set] = {}
         self._reap_interrupted()
 
     def close(self) -> None:
         self.executor.shutdown(wait=False)
+        for ex in self._pools.values():
+            ex.shutdown(wait=False)
         self.conn.close()
 
     # --- 提交 / 执行 ---------------------------------------------------
@@ -104,7 +115,9 @@ class TaskManager:
                 (task_id, task_type, owner, json.dumps(params), QUEUED, "排队中", 0.0, now, now),
             )
             self.conn.commit()
-        self.executor.submit(self._run, task_id, task_type, owner, params)
+        self._pools.get(task_type, self.executor).submit(
+            self._run, task_id, task_type, owner, params
+        )
         log.info("任务已提交 id=%s type=%s owner=%s", task_id, task_type, owner)
         return task_id
 
