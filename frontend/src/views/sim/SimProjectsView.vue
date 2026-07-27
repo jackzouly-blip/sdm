@@ -35,6 +35,7 @@ async function create() {
       name: form.value.name.trim(),
       description: form.value.description.trim() || null,
       default_solver: form.value.default_solver.trim() || null,
+      // workdir 不在这里问:由后端按系统配置(HPC_SIM_WORKDIR_ROOT)派生
     });
     showCreate.value = false;
     form.value = { name: "", description: "", default_solver: "" };

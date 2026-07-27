@@ -17,14 +17,24 @@ from fastapi import (
     Depends,
     File,
     Form,
+    Header,
     HTTPException,
+    Query,
     Request,
     UploadFile,
     status,
 )
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
-from ..auth.session import current_user, current_user_query, is_admin_request
+from ..auth.session import (
+    current_user,
+    current_user_query,
+    is_admin_request,
+    issue_scoped_token,
+    principal_is_admin,
+    resolve_scoped_principal,
+)
 from ..config import get_settings
 from ..logger import get_logger
 from .db import SimDB
@@ -228,6 +238,10 @@ def create_project(
         unit_system=body.unit_system,
         workdir=body.workdir,
     )
+    # 未显式指定则按系统配置派生。建项目时就定下来,而不是等到导入数模才报
+    # "未设置工作目录"——那时用户已经选好文件了,再回头去配是最差的顺序。
+    if not (body.workdir or "").strip():
+        db.update_project(pid, workdir=derive_workdir(user, pid))
     log.info("创建仿真项目 id=%s owner=%s name=%s", pid, user, body.name)
     return _row(db.get_project(pid))
 
@@ -341,6 +355,32 @@ def add_geometry(
     return _row(db.get_geometry(gid), GEOM_JSON)
 
 
+def derive_workdir(owner: str, pid: str) -> str:
+    """按系统配置派生项目工作目录：<HPC_SIM_WORKDIR_ROOT>/<属主>/<项目 id>。
+
+    用项目 id 而非项目名:改名不该搬目录,重名也不该撞车。可读性由页面负责
+    (详情页把完整路径显示出来),不靠路径本身。
+    """
+    base = get_settings().sim_workdir_base_dir
+    return os.path.join(base, owner or "shared", pid)
+
+
+def _project_workdir(db: SimDB, proj: sqlite3.Row) -> str:
+    """取项目工作目录;没有就按系统配置派生并回写。
+
+    惰性补齐是为了老项目——它们建于"workdir 靠人工填"的年代,大多是空的。
+    与其要求做一次数据迁移、或让用户自己去猜一个集群路径,不如在真正要用到
+    的这一刻按同一规则算出来并落库,此后就与新项目完全一致。
+    """
+    existing = str(proj["workdir"] or "").strip()
+    if existing:
+        return existing
+    derived = derive_workdir(proj["owner"], proj["id"])
+    db.update_project(proj["id"], workdir=derived)
+    log.info("项目 %s 未设工作目录,已按系统配置派生: %s", proj["id"], derived)
+    return derived
+
+
 def _geometry_dir(db: SimDB, target: sqlite3.Row) -> str:
     """几何文件的存放目录：<项目 workdir>/sdm_geometry/<分析对象 id>。
 
@@ -348,12 +388,9 @@ def _geometry_dir(db: SimDB, target: sqlite3.Row) -> str:
     单独再建一套存储会让备份、配额、清理各有一套口径。
     """
     proj = db.get_project(target["sim_project_id"])
-    if proj is None or not proj["workdir"]:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "仿真项目未设置工作目录（workdir），无法存放几何文件",
-        )
-    return os.path.join(proj["workdir"], "sdm_geometry", target["id"])
+    if proj is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "仿真项目不存在")
+    return os.path.join(_project_workdir(db, proj), "sdm_geometry", target["id"])
 
 
 @router.post("/targets/{tid}/geometries/upload", status_code=status.HTTP_201_CREATED)
@@ -475,18 +512,110 @@ def add_geometry_from_path(
     return out
 
 
+# ── 几何转换票据 ──────────────────────────────────────────────────────────────
+#
+# vektor3d 跑在用户桌面上，只监听 localhost，集群**永远调不通它**；反过来桌面能访问
+# 集群。所以调用由浏览器发起，而源文件的拉取与产物的回传是 vektor3d 直连本服务完成的
+# ——它需要一份能访问这两个端点的凭据。
+#
+# 那份凭据不能是用户的会话 JWT（8 小时、全部接口）。这里签一个 scope=geometry.convert、
+# 绑定单个 gid、十分钟过期的受限令牌：即便泄露，能做的也只有"读这一个源文件、
+# 写这一个产物"。契约第 5 节列的"短期令牌待补"即指此项。
+
+GEOMETRY_CONVERT_SCOPE = "geometry.convert"
+_bearer = HTTPBearer(auto_error=False)
+
+
+def _geometry_principal(
+    gid: str,
+    token: Optional[str] = Query(None),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    act_as: Optional[str] = Header(None, alias="X-Act-As-User"),
+) -> str:
+    """几何源文件/产物端点的调用者。
+
+    既接受常规用户令牌（页面自己下载源文件、加载产物），也接受本 gid 的转换票据
+    （vektor3d 拉取与回传）。票据换到别的 gid 或别的接口一律 401/403。
+    """
+    raw = token or (creds.credentials if creds else None)
+    return resolve_scoped_principal(
+        raw, act_as, scope=GEOMETRY_CONVERT_SCOPE, bindings={"gid": gid}
+    )
+
+
+def _geometry_is_admin(
+    user: str = Depends(_geometry_principal),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    portal_admin: Optional[str] = Header(None, alias="X-Hpc-Portal-Admin"),
+) -> bool:
+    """同 is_admin_request，但主体由 _geometry_principal 解析。
+
+    不能直接复用 is_admin_request：它依赖 current_user，而 current_user 按设计
+    拒绝一切受限票据——那样 vektor3d 拿票据来下载会在这一步就被 401。
+    """
+    return principal_is_admin(user, creds.credentials if creds else None, portal_admin)
+
+
+class ConvertTicket(BaseModel):
+    """交给浏览器、再由浏览器转交 vektor3d 的一次性转换票据。
+
+    URL 由**前端**用 window.location.origin 拼，不在这里生成：后端看到的 base_url
+    在开发期是 127.0.0.1:8000（浏览器实际访问 5173 的 vite 代理）、生产期是 nginx
+    反代后的内网地址，都不等于浏览器/桌面真正能访问到的地址。浏览器最清楚自己
+    是从哪个地址进来的，而 vektor3d 与浏览器在同一台机器上。
+    """
+    gid: str
+    token: str
+    expires_in: int
+    source_name: str
+    source_path_suffix: str = Field(description="源文件下载路径（相对 /api）")
+    upload_path_suffix: str = Field(description="产物回传路径（相对 /api）")
+
+
+@router.post("/geometries/{gid}/convert-ticket")
+def create_convert_ticket(
+    request: Request,
+    gid: str,
+    ttl_seconds: int = Query(1800, ge=60, le=7200),
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> ConvertTicket:
+    """为一次几何转换签发受限令牌。
+
+    只有常规用户令牌能调它——票据不能自我续签，否则十分钟有效期形同虚设
+    （`current_user` 会拒绝任何带 scp 的令牌）。
+    """
+    db = _db(request)
+    row = _owned_geometry(db, gid, user, is_admin)
+    src = _json_or_none(row["source_file_json"]) or {}
+    if not src.get("path"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "该几何版本没有源文件，无法转换")
+
+    token = issue_scoped_token(user, GEOMETRY_CONVERT_SCOPE, ttl_seconds, gid=gid)
+    log.info("签发几何转换票据 gid=%s user=%s ttl=%ss", gid, user, ttl_seconds)
+    return ConvertTicket(
+        gid=gid,
+        token=token,
+        expires_in=ttl_seconds,
+        source_name=src.get("name") or os.path.basename(src["path"]),
+        source_path_suffix=f"/sim/geometries/{gid}/download",
+        upload_path_suffix=f"/sim/geometries/{gid}/lightweight",
+    )
+
+
 @router.get("/geometries/{gid}/download")
 def download_geometry(
     request: Request,
     gid: str,
-    user: str = Depends(current_user_query),
-    is_admin: bool = Depends(is_admin_request),
+    user: str = Depends(_geometry_principal),
+    is_admin: bool = Depends(_geometry_is_admin),
 ):
     """下载几何源文件。
 
     契约里 vektor3d 就是通过这个地址拉取源文件的（见
-    docs/vektor3d-geometry-capability-contract.md）。用 current_user_query
-    是因为下载可能由 <a href> 或非浏览器客户端发起，未必能带 Authorization 头。
+    docs/vektor3d-geometry-capability-contract.md）。凭据可以是常规用户令牌
+    （query 或 Authorization 头——<a href> 直链下载设不了头），也可以是本 gid 的
+    转换票据。
     """
     from fastapi.responses import FileResponse
 
@@ -506,8 +635,8 @@ async def upload_lightweight(
     gid: str,
     file: UploadFile = File(...),
     meta: Optional[str] = Form(None, description="转换元数据 JSON：三角面数/包围盒/单位等"),
-    user: str = Depends(current_user),
-    is_admin: bool = Depends(is_admin_request),
+    user: str = Depends(_geometry_principal),
+    is_admin: bool = Depends(_geometry_is_admin),
 ) -> Dict:
     """回传轻量化产物（glTF/GLB）。
 
@@ -557,10 +686,16 @@ async def upload_lightweight(
 def download_lightweight(
     request: Request,
     gid: str,
-    user: str = Depends(current_user_query),
-    is_admin: bool = Depends(is_admin_request),
+    user: str = Depends(_geometry_principal),
+    is_admin: bool = Depends(_geometry_is_admin),
 ):
-    """取轻量化产物，供前端 three.js GLTFLoader 直接加载。"""
+    """取轻量化产物，供前端 three.js GLTFLoader 直接加载。
+
+    主体解析必须与 download 用同一套:GLTFLoader 是拿 URL 直接 fetch 的,设不了
+    Authorization 头,令牌只能走 query。曾经这里配的是
+    `current_user_query + is_admin_request`——后者内部依赖 current_user(只读请求头),
+    于是 query 里的令牌还没被看一眼,就先在管理员判定那步 401 了。
+    """
     from fastapi.responses import FileResponse
 
     db = _db(request)

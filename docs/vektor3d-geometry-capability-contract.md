@@ -76,12 +76,36 @@ out/<job>/
 
 | glTF 需要的 | 现有产物里的来源 |
 |---|---|
-| 场景图层级（node 树） | `bom.json` 的 `asmList` |
-| node 的稳定零件标识 | `manifest.json` 的 `partNo` / `partKey`（来自 CAD，天然稳定） |
-| node 的 transform | `model.3dix` 的 `transform` |
+| 场景图层级（node 树） | `bom.json` 的 `asmList`（边：`fromFilePath` → `toFilePath`） |
+| node 的稳定零件标识 | `bom.json` `fileList[].PartNumber`（**不是 `partKey`**，见下方 ⚠️ 更正一） |
+| node 的 transform | `bom.json` `asmList[].matrix`（**不是 `model.3dix.transform`**，见下方 ⚠️ 更正二） |
 | mesh 的 position / index | `faceShapes[].vertices` / `vertexindices` |
 | 材质颜色 | `faceShapes[].color` |
-| 相同零件复用 mesh | 同一 `partKey` 的多个实例引用同一 mesh，各带自己 transform |
+| 相同零件复用 mesh | 同一源文件的多个实例引用同一 mesh，各带自己 transform |
+
+#### ⚠️ 更正一：`partKey` 不稳定，不能作为零件标识
+
+实测两次转换的同一个文件（同一 `fileMd5=d6e191…`），`partKey` 分别是
+`L-EC996598435A` 与 `L-BA454BFA5DFE`；`bom-pipeline.js` 里还专门有
+`_canonicalizePartKeys()` 用 `fileName`/`partNo` 覆写它。它是每次运行的临时键。
+
+因此实现取 **`PartNumber`**（CATIA 侧真实零件号）作为 `extras.partId`，
+并附 `extras.sourceMd5` 供 SDM 判断内容是否变过；原始 `partKey` 仅作诊断字段
+`extras.converterPartKey` 保留。
+
+#### ⚠️ 更正二：实例变换在 `asmList` 的边上，不在 `model.3dix` 里
+
+`asmList` 每条边形如：
+
+```jsonc
+{ "fromFilePath": "…/BG-Dumper.CATProduct",
+  "toFilePath":   "…/2780-Black.CATPart",
+  "matrix": "1,0,0,-396, 0,-1,0,-139.438827, 0,0,-1,478.922491",  // 3x4 行主序
+  "instanceName": "2780-Black.1" }
+```
+
+这比契约设想的更好：几何按零件存一份、变换挂在边上，**"相同零件复用 mesh" 是数据
+结构自带的**，不需要额外去重。实测样本 27 个零件 / 261 条装配边，复用比接近 10:1。
 
 #### 为什么这一步必须在 vektor3d 侧完成，而不是把 `.3dix` 交给 SDM
 
@@ -298,11 +322,35 @@ Origin 白名单。生产地址为 `http://<集群主机>:8088`（IPv6 入口同
 层级被拍平或零件无标识时直接告警。因此第一个 GLB 回传后，
 2.1 中那三条装配要求是否落实，打开即可判断。
 
-### 待补（不阻塞对接）
+### 已补齐（原「待补」两项）
 
-- 短期令牌：目前上述端点走门户的常规鉴权。契约中的 `authToken` 会在联调阶段
-  换成与单个几何版本绑定、有效期以分钟计的短期令牌。
-- 浏览器代理客户端：待 `geometry.convert` 可用后接入。
+- **短期令牌已实现**：`POST /api/sim/geometries/{gid}/convert-ticket` 签发
+  `scope=geometry.convert`、绑定单个 `gid`、默认 30 分钟过期的受限令牌，
+  契约中的 `authToken` 传的就是它。该令牌**在门户其余接口上一律 401**
+  （默认拒绝，不是逐个接口排除），换个 `gid` 则 403，也不能用它再签新票据。
+- **浏览器代理客户端已接入**：几何面板对 CAD 原生格式给出「轻量化」按钮，
+  流程为 探测 vektor3d → 申请票据 → `POST /v1/jobs` → 轮询进度 → 刷新并可预览。
+  用轮询而非 SSE：`GET /v1/jobs/{id}` 返回的 `progress` 是全量数组，信息与订阅
+  等价，而 `EventSource` 设不了 `X-Vektor-Token` 头（配对令牌一启用就用不了）。
+
+`sourceUrl` / `uploadUrl` 由**浏览器**用 `window.location.origin` 拼出，不由后端生成
+——后端看到的 base_url（开发期 127.0.0.1:8000、生产期 nginx 反代后的内网地址）
+都不等于浏览器与桌面真正能访问到的地址。
+
+### ⚠️ 联调前必看：浏览器的「私有网络访问」会拦截这条链
+
+Chrome 对**非安全上下文（http）的公网页面 → 127.0.0.1** 的请求有 PNA 限制，
+表现与"没装 vektor3d"一模一样（fetch 直接抛错）。vektor3d 侧已回
+`Access-Control-Allow-Private-Network: true`，但那只解决预检、不解决不安全上下文。
+
+处理办法按推荐度：
+
+1. **门户挂 HTTPS**（推荐）。Chrome 视 `http://127.0.0.1` 为可信来源，
+   https 页面调它不算混合内容，PNA 也随之放行。
+2. 企业策略 `InsecurePrivateNetworkRequestsAllowedForUrls` 放行门户地址。
+3. 临时验证可开 `chrome://flags/#block-insecure-private-network-requests`。
+
+几何面板在 http 访问时会直接把这条提示显示出来，不必靠猜。
 
 ### 联调环境
 
@@ -311,7 +359,7 @@ Origin 白名单。生产地址为 `http://<集群主机>:8088`（IPv6 入口同
 
 ---
 
-## 6. 需要 vektor3d 团队确认的问题
+## 6. 需要 vektor3d 团队确认的问题 —— 答复见第 7 节
 
 1. `geometry.convert` 是否可行、预计排期？
 2. `.3dix + bom.json + manifest.json → 单个 GLB` 的封装步骤（见 2.1 映射表），
@@ -323,3 +371,114 @@ Origin 白名单。生产地址为 `http://<集群主机>:8088`（IPv6 入口同
    最后一条是 SDM 做零件级操作的前提，也是最容易被忽略的一条。
 5. 单位与坐标系约定：是否统一输出 mm、Y-up？
 6. 是否支持 Draco / meshopt 压缩？大装配的传输与加载都依赖它。
+
+---
+
+## 7. vektor3d 侧答复与实现状态
+
+**`geometry.convert` 与 `geometry.inspect` 已实现并注册在既有 `/v1` 上，可以对接联调。**
+自测：`pnpm run test:geometry`（装配导出 10 组 + 传输链 13 组断言）。
+⚠️ **尚未在真机转换器上跑过整装配**，联调第一件事就是这个。
+
+### 7.1 逐条答复
+
+**① 可行性与排期** —— 已落地。三块能力仓内本就有，只是没串起来：
+`.3dix → 合并网格`（`storage-service/file-cache.js` 的 mesh shard，XR 通道在用）、
+`网格 → GLB 容器`（`xr-gateway/glb-exporter.js`）、
+`矩阵规范化`（`cad-pipeline/assembly-transform.js`）。本次新增的是装配场景图、
+在线收发链、以及把上面三块提成两条链共用的实现。
+
+**② 有没有你们没看到的坑** —— 有三个：
+
+- `partKey` 不稳定（更正一）。若按契约原文用它做 `partId`，SDM 侧零件级选择会在
+  每次重新转换后全部失效——正是契约最担心的那个后果，只是原因不同。
+- 装配的实例变换在 `asmList` 上（更正二），不在 `.3dix` 里。
+- 桌面主链路转装配时会加 `--root-only`（只转根节点几何，子件各自有独立转换任务）。
+  在线链**不能**沿用这条，否则产出的 GLB 只有根节点那点几何。已在能力实现里显式
+  置 `rootOnly: false`。
+
+顶点焊接那个坑不会踩：现有合并实现（`shared/tdix-mesh.js`）本来就是纯拼接 + 索引
+偏移，逐顶点法线也依赖顶点不合并；自测里有一条断言专门守着它。
+
+**③ 原生环境与 `ready()`** —— `ready()` 三态：
+
+| 情况 | `ready` | `notReadyReason` |
+|---|---|---|
+| 已配置转换器且文件存在 | `true` | 无 |
+| 未配置转换器 | `true` | 「未配置本地 CAD 转换器：仅支持 STEP/STP 输入（进程内 WASM 转换）；CATIA/NX/SolidWorks 等需在系统设置配置 DbitConvert」 |
+| 配置了但文件不存在 | `false` | 「转换器不存在: <路径>」 |
+
+即：**STEP/STP 不需要任何外部环境**（走进程内 WASM，跨平台），其余格式需要本机
+DbitConvert。请把 `notReadyReason` 直接透给用户——它已经是可操作的人话。
+注意第二行 `ready=true` 但带 reason，表示"受限可用"。
+
+**④ 装配三条硬要求** —— 全部满足，且每条都有自测守着：
+
+```jsonc
+"extras": {
+  "partId":       "SEAT-FRAME-001",          // = CAD 的 PartNumber，重新转换不变
+  "instancePath": "Seat.CATProduct/Frame.1/Bracket_L.1",
+  "sourceFile":   "Bracket.CATPart",
+  "sourceMd5":    "d6e191397b4d80415649af8697b8531a",  // 内容指纹，判断是否真的变了
+  "converterPartKey": "L-BA454BFA5DFE"       // 仅诊断用，每次转换都会变，勿依赖
+}
+```
+
+- 层级保留，不拍平；`result.assemblyDepth` 给出深度供你们的预览器校验
+- 相同零件复用 mesh；`result.partCount`（去重后的 mesh 数）与
+  `result.instanceCount`（node 数）之比即复用比
+- `result.identifiedNodeCount` = 带 `partId` 的 node 数，与 `instanceCount` 不等
+  就说明有零件缺零件号，`geometry.inspect` 会以 `PART_ID_MISSING` 报出来
+
+**⑤ 单位与坐标系** —— 输出 **mm**，场景 **Y-up**，但请注意实现方式：
+
+几何数值保持源 CAD 坐标（**mm、Z-up**）**不做任何缩放或旋转**，Z-up → Y-up 的差异由
+**根节点上的一次旋转矩阵**吸收。这样 GLB 里的顶点数值与 STEP/BREP、与
+`result.boundingBox` 完全一致，SDM 后续赋材料、网格划分、尺寸标注都不必换算。
+`result.unit` / `result.upAxis` 与 GLB 的 `asset.extras` 都会声明这一点。
+`result.boundingBox` 报的是**源坐标系（Z-up, mm）**下的值，含实例变换。
+
+**⑥ Draco / meshopt** —— **本期未实现**，仓内没有任何减面/压缩实现，需新引依赖。
+`options.maxTriangles` 同理：传了不会报错，但只会在 `warnings` 里提示"未减面，
+已按原始精度输出"，**不会静默减面**。若大装配的传输/加载确实撑不住，
+按契约 2.1 的优先级排序，下一步就做 Draco；请在联调后给出真实的体积与加载耗时，
+以此决定是否立项。当前缓解手段：GLB 本身是二进制（相对 `.3dix` 约 1/2.5），
+且 ≥150MB 的源文件会自动降精度转换（`--quality low`）。
+
+### 7.2 SDM 侧需要配合的两件事
+
+**① 装配必须以 zip 上传。** `.CATProduct` 只是引用壳，外部 `.CATPart` 不在其中；
+单个 `sourceUrl` 传一个 CATProduct 只会转出一个空装配。请打包为 zip
+（`sourceName` 以 `.zip` 结尾，或直接靠文件头识别，两者都支持）。
+
+入口文件的选择规则是确定的，**选不出来就报错并列出候选，绝不猜**：
+
+1. 传了 `options.entryFile`（zip 内相对路径）→ 用它
+2. 否则包内装配文件（`.CATProduct`/`.SLDASM`/`.asm`/`.iam`/`.3dxml`）恰好一个 → 用它
+3. 否则 CAD 文件恰好一个 → 用它
+4. 否则报错并列出候选，请求指定 `entryFile`
+
+zip 解包会丢弃目录穿越条目，文件名支持 UTF-8 与 GBK（Windows 中文环境打的包）。
+
+**② Origin 白名单。** 把 SDM 页面地址加进「系统 → 能力服务」的白名单，
+默认拒绝一切浏览器跨源调用。
+
+### 7.3 已知缺口（联调不阻塞，但请知悉）
+
+- **取消暂不能中断转换**：`POST /v1/jobs/{id}/cancel` 会把作业标记为已取消，
+  但正在跑的转换器子进程不会被打断（现有 AI 能力也是同样的限制）。
+- **STEP 装配会被拍平**：STEP 走进程内 WASM 转换，产出单一零件、无装配树。
+  需要装配树的 STEP 请改传原生格式，或等这条路径接上原生转换器。
+- **未做真机整装配验证**：合成产物自测通过，真实 CATIA 装配的表现待联调确认。
+
+### 7.4 实现落点
+
+| | 落点 |
+|---|---|
+| 在线链（下载 → 解包 → 转换 → 回传） | `packages/app-electron/src/geometry-capability.js` |
+| 装配 → glTF | `packages/cad-pipeline/src/gltf-assembly-exporter.js` |
+| GLB 容器写出（与 XR 通道共用） | `packages/shared/src/glb-writer.js` |
+| 3dix → 合并网格（与桌面渲染共用） | `packages/shared/src/tdix-mesh.js` |
+| 无状态转换执行（与桌面主链路共用） | `packages/cad-pipeline/src/convert-runner.js` |
+| 能力注册 | `packages/app-electron/src/capability-server/index.js` |
+| 自测 | `pnpm run test:geometry` |

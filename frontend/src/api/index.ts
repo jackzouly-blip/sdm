@@ -30,6 +30,7 @@ import type {
   SimProject,
   SimProjectInput,
   SimGeometry,
+  SimConvertTicket,
   SimResult,
   SimSubject,
   SimTarget,
@@ -667,6 +668,34 @@ export const simApi = {
     return `/api/sim/geometries/${gid}/download?token=${encodeURIComponent(
       getToken() ?? ""
     )}`;
+  },
+  /**
+   * 取一次几何转换的受限票据，并拼出 vektor3d 要用的两个绝对地址。
+   *
+   * 地址在**前端**拼：后端看到的 base_url 开发期是 127.0.0.1:8000（浏览器实际走
+   * 5173 的 vite 代理）、生产期是 nginx 反代后的内网地址，都不等于浏览器与桌面
+   * 真正能访问到的地址。浏览器最清楚自己是从哪进来的，而 vektor3d 就在同一台机器上。
+   */
+  async convertTicket(gid: string, ttlSeconds = 1800): Promise<SimConvertTicket> {
+    const { data } = await http.post<{
+      gid: string;
+      token: string;
+      expires_in: number;
+      source_name: string;
+      source_path_suffix: string;
+      upload_path_suffix: string;
+    }>(`/sim/geometries/${gid}/convert-ticket`, null, {
+      params: { ttl_seconds: ttlSeconds },
+    });
+    const origin = window.location.origin;
+    return {
+      gid: data.gid,
+      token: data.token,
+      expiresIn: data.expires_in,
+      sourceName: data.source_name,
+      sourceUrl: `${origin}/api${data.source_path_suffix}`,
+      uploadUrl: `${origin}/api${data.upload_path_suffix}`,
+    };
   },
 
   // --- 工况 ---

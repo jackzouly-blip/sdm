@@ -16,7 +16,7 @@ import type {
   SimSubject,
   SimTarget,
 } from "@/api/types";
-import { ArrowLeft, Boxes, ChevronRight, Eye, Loader2, Plus, Trash2 } from "lucide-vue-next";
+import { ArrowLeft, Boxes, ChevronRight, Eye, FolderCog, Loader2, Plus, Trash2 } from "lucide-vue-next";
 import GeometryPanel from "./GeometryPanel.vue";
 import GeometryViewer from "./GeometryViewer.vue";
 
@@ -138,6 +138,34 @@ async function delSubject(s: SimSubject) {
   }
 }
 
+// 工作目录：几何/网格/产物的落盘位置,由系统配置(HPC_SIM_WORKDIR_ROOT)按
+// <根>/<属主>/<项目 id> 自动派生,不需要人工填。这里给的是**覆盖**入口——
+// 个别项目要指向一个既有分析目录时才用得上。
+const editingWorkdir = ref(false);
+const workdirDraft = ref("");
+const savingWorkdir = ref(false);
+
+function startEditWorkdir() {
+  workdirDraft.value = project.value?.workdir ?? "";
+  editingWorkdir.value = true;
+}
+
+async function saveWorkdir() {
+  if (!project.value) return;
+  savingWorkdir.value = true;
+  error.value = "";
+  try {
+    project.value = await simApi.updateProject(project.value.id, {
+      workdir: workdirDraft.value.trim() || null,
+    });
+    editingWorkdir.value = false;
+  } catch (e) {
+    error.value = errMsg(e);
+  } finally {
+    savingWorkdir.value = false;
+  }
+}
+
 function fmt(ts: number | null) {
   return ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "—";
 }
@@ -199,6 +227,43 @@ onMounted(load);
           <span v-if="project.dbit_project_code" class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700">
             dbit {{ project.dbit_project_code }}
           </span>
+        </div>
+
+        <!-- 工作目录:未设置时导入数模必失败,所以缺失要显眼、且能就地补 -->
+        <div class="flex items-center gap-2 mt-2 text-xs">
+          <span class="text-slate-500 shrink-0">工作目录</span>
+          <template v-if="editingWorkdir">
+            <input
+              v-model="workdirDraft"
+              class="flex-1 max-w-xl px-2 py-1 border border-slate-300 rounded font-mono"
+              placeholder="如：/caedata/project-ext/hpc-portal/sdm/x90-seat-crash"
+              @keyup.enter="saveWorkdir"
+            />
+            <button
+              class="px-2 py-1 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+              :disabled="savingWorkdir"
+              @click="saveWorkdir"
+            >
+              保存
+            </button>
+            <button class="px-2 py-1 rounded text-slate-500 hover:bg-slate-100" @click="editingWorkdir = false">
+              取消
+            </button>
+          </template>
+          <template v-else>
+            <code v-if="project.workdir" class="px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">
+              {{ project.workdir }}
+            </code>
+            <span v-else class="px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">
+              按系统配置自动创建
+            </span>
+            <button
+              class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-slate-500 hover:bg-slate-100"
+              @click="startEditWorkdir"
+            >
+              <FolderCog :size="12" /> {{ project.workdir ? "覆盖" : "指定其他目录" }}
+            </button>
+          </template>
         </div>
       </div>
 

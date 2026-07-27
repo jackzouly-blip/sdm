@@ -30,13 +30,56 @@ def issue_token(username: str) -> str:
     return jwt.encode(payload, s.jwt_secret, algorithm=s.jwt_algorithm)
 
 
+def issue_scoped_token(
+    username: str, scope: str, ttl_seconds: int, **claims: object
+) -> str:
+    """签发**受限**令牌：只能用于声明的 scope，且以分钟计过期。
+
+    用途是把凭据交给本机以外的执行方（如桌面端 vektor3d 拉源文件、回传产物）。
+    交常规会话 JWT 出去等于把整个账号（8 小时、全部接口）借出去；这里的令牌带
+    `scp` 声明，`_resolve_principal` 默认拒绝任何带 `scp` 的令牌，只有显式声明
+    接受该 scope 的接口才认——即便泄露，能做的也只有那一件事。
+    """
+    s = get_settings()
+    now = int(time.time())
+    payload = {
+        "sub": username,
+        "scp": scope,
+        "iat": now,
+        "exp": now + max(1, int(ttl_seconds)),
+        **claims,
+    }
+    return jwt.encode(payload, s.jwt_secret, algorithm=s.jwt_algorithm)
+
+
 def _decode(token: str) -> dict:
     s = get_settings()
     return jwt.decode(token, s.jwt_secret, algorithms=[s.jwt_algorithm])
 
 
-def _resolve_principal(raw_token: Optional[str], act_as: Optional[str]) -> str:
-    """把凭据解析成目标用户名；未登录/过期/无效则 401。"""
+def _decode_or_401(raw_token: str) -> dict:
+    try:
+        return _decode(raw_token)
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="会话已过期")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效的令牌")
+
+
+def _resolve_principal(
+    raw_token: Optional[str],
+    act_as: Optional[str],
+    *,
+    allow_scope: Optional[str] = None,
+    bindings: Optional[dict] = None,
+) -> str:
+    """把凭据解析成目标用户名；未登录/过期/无效则 401。
+
+    带 `scp` 的受限令牌**默认一律拒绝**：只有把 allow_scope 显式传成同名 scope 的
+    接口才接受它，并逐条核对 bindings（如 gid 必须等于路径上的那一个）。
+    默认拒绝是关键——反过来做成"默认接受、个别接口排除"，漏掉一个接口就等于
+    把受限令牌变成了通行证。
+    """
     if not raw_token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未登录")
     s = get_settings()
@@ -49,13 +92,36 @@ def _resolve_principal(raw_token: Optional[str], act_as: Optional[str]) -> str:
             )
         return act_as
     # 按用户 JWT
-    try:
-        payload = _decode(raw_token)
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="会话已过期")
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效的令牌")
+    payload = _decode_or_401(raw_token)
+    scope = payload.get("scp")
+    if scope:
+        if scope != allow_scope:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"该令牌仅限 {scope} 用途，不能用于此接口",
+            )
+        for key, expected in (bindings or {}).items():
+            if payload.get(key) != expected:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"令牌未授权访问该资源（{key} 不匹配）",
+                )
     return payload["sub"]
+
+
+def resolve_scoped_principal(
+    raw_token: Optional[str],
+    act_as: Optional[str],
+    *,
+    scope: str,
+    bindings: dict,
+) -> str:
+    """供业务模块构造"既接受常规用户令牌、也接受某个受限令牌"的依赖。
+
+    放在这里而不是各业务模块自己解 JWT：签发与校验必须共用一处，
+    否则 scp 的默认拒绝语义迟早会在某个模块里被绕过。
+    """
+    return _resolve_principal(raw_token, act_as, allow_scope=scope, bindings=bindings)
 
 
 def current_user(
@@ -77,6 +143,22 @@ def current_user_query(
     return _resolve_principal(raw, act_as)
 
 
+def principal_is_admin(
+    user: str, raw_token: Optional[str], portal_admin: Optional[str]
+) -> bool:
+    """给定已解析出的用户，判断这次调用是否拥有管理员视图。
+
+    单独提出来是因为并非所有接口都用 current_user 解析主体（几何端点还接受受限
+    票据）；管理员判据必须只有这一处实现，否则各接口迟早各判各的。
+    """
+    s = get_settings()
+    if s.is_admin(user):
+        return True
+    if s.agent_api_token and raw_token == s.agent_api_token and portal_admin == "1":
+        return True
+    return False
+
+
 def is_admin_request(
     user: str = Depends(current_user),
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
@@ -88,11 +170,10 @@ def is_admin_request(
       ① agent 侧 HPC_ADMIN_USERS 白名单命中目标用户名；
       ② 可信门户（agent token）通过 X-Hpc-Portal-Admin: 1 断言调用者是门户管理员。
     门户断言仅在持有 agent token 时才被采信，普通按用户 JWT 无法借此提权。
+
+    ⚠ 不要与 `current_user_query` 搭配：它依赖 `current_user`（只读 Authorization 头），
+    凑在一起会让"允许 query 传 token"的端点在这一步就 401——而报错完全看不出与
+    管理员判定有关。这类端点应像 sim 的几何端点那样，用 `principal_is_admin()`
+    自建一个与该端点同源的管理员依赖。
     """
-    s = get_settings()
-    if s.is_admin(user):
-        return True
-    raw = creds.credentials if creds else None
-    if s.agent_api_token and raw == s.agent_api_token and portal_admin == "1":
-        return True
-    return False
+    return principal_is_admin(user, creds.credentials if creds else None, portal_admin)

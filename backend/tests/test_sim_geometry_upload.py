@@ -112,14 +112,23 @@ def test_catia_upload_is_archived_without_lightweight(client, target):
     assert g["step_file"] is None
 
 
-def test_upload_requires_project_workdir(client, tmp_path):
-    pid = client.post("/sim/projects", json={"name": "无工作目录"},
+def test_upload_works_without_manually_set_workdir(client, tmp_path, monkeypatch):
+    """不再要求人工填工作目录：按系统配置派生。
+
+    这条曾断言"没设 workdir 就 400"——那是让每个新项目都必须先去手填一个集群
+    绝对路径的年代。现在 workdir 由 HPC_SIM_WORKDIR_ROOT 派生,该报错不复存在。
+    """
+    monkeypatch.setenv("HPC_SIM_WORKDIR_ROOT", str(tmp_path / "simroot"))
+    from app import config
+    monkeypatch.setattr(config, "_settings", None)
+
+    pid = client.post("/sim/projects", json={"name": "没手填工作目录"},
                       headers=hdr("u")).json()["id"]
     tid = client.post(f"/sim/projects/{pid}/targets", json={"name": "x"},
                       headers=hdr("u")).json()["id"]
     r = upload(client, tid, "seat.stp")
-    assert r.status_code == 400
-    assert "工作目录" in r.json()["detail"]
+    assert r.status_code == 201, r.text
+    assert r.json()["source_file"]["path"].startswith(str(tmp_path / "simroot"))
 
 
 def test_upload_rejects_other_users(client, target):
@@ -200,3 +209,157 @@ def test_geometry_list_reflects_uploads(client, target):
     rows = client.get(f"/sim/targets/{target['tid']}/geometries",
                       headers=hdr("u")).json()
     assert [r["version_no"] for r in rows] == [1, 2]
+
+
+# --- 转换票据（浏览器发起、vektor3d 执行的那条链）-----------------------
+#
+# vektor3d 在用户桌面上、只监听 localhost，集群调不通它；所以调用由浏览器发起，
+# 文件由 vektor3d 直连本服务收发。它需要一份凭据——但不能是用户的会话 JWT。
+
+def test_convert_ticket_is_scoped_to_one_geometry(client, target):
+    g = upload(client, target["tid"], "seat.CATPart", b"\x00CATIA").json()
+    r = client.post(f"/sim/geometries/{g['id']}/convert-ticket", headers=hdr("u"))
+    assert r.status_code == 200, r.text
+    t = r.json()
+    assert t["gid"] == g["id"]
+    assert t["source_name"] == "seat.CATPart"
+    # URL 由前端用 window.location.origin 拼；后端只给路径后缀
+    assert t["source_path_suffix"] == f"/sim/geometries/{g['id']}/download"
+    assert t["upload_path_suffix"] == f"/sim/geometries/{g['id']}/lightweight"
+
+    # 票据能拉源文件、能回传产物——这正是 vektor3d 要做的两件事
+    tok = {"Authorization": f"Bearer {t['token']}"}
+    assert client.get(f"/sim/geometries/{g['id']}/download", headers=tok).content == b"\x00CATIA"
+    r = client.post(
+        f"/sim/geometries/{g['id']}/lightweight",
+        files={"file": ("seat.glb", io.BytesIO(b"glTF\x02\x00\x00\x00"), "model/gltf-binary")},
+        data={"meta": json.dumps({"partCount": 3})},
+        headers=tok,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["topo_summary"]["partCount"] == 3
+
+
+def test_convert_ticket_cannot_touch_other_geometries(client, target):
+    """绑定 gid 是关键：票据换个 gid 就该被拒，否则等于给了整个账号。"""
+    a = upload(client, target["tid"], "a.stp").json()
+    b = upload(client, target["tid"], "b.stp").json()
+    t = client.post(f"/sim/geometries/{a['id']}/convert-ticket", headers=hdr("u")).json()
+    tok = {"Authorization": f"Bearer {t['token']}"}
+
+    assert client.get(f"/sim/geometries/{a['id']}/download", headers=tok).status_code == 200
+    r = client.get(f"/sim/geometries/{b['id']}/download", headers=tok)
+    assert r.status_code == 403
+    assert "不匹配" in r.json()["detail"]
+
+
+def test_convert_ticket_is_useless_elsewhere(client, target):
+    """受限令牌默认被所有普通接口拒绝——否则漏掉一个接口就成了通行证。"""
+    g = upload(client, target["tid"], "seat.stp").json()
+    t = client.post(f"/sim/geometries/{g['id']}/convert-ticket", headers=hdr("u")).json()
+    tok = {"Authorization": f"Bearer {t['token']}"}
+
+    assert client.get("/sim/projects", headers=tok).status_code == 401
+    assert client.get(f"/sim/targets/{target['tid']}/geometries", headers=tok).status_code == 401
+    # 也不能拿票据再签一张新票据（否则有效期形同虚设）
+    r = client.post(f"/sim/geometries/{g['id']}/convert-ticket", headers=tok)
+    assert r.status_code == 401
+    assert "仅限" in r.json()["detail"]
+
+
+def test_convert_ticket_expires(client, target, monkeypatch):
+    """票据是短期的：过期后 vektor3d 再拿它拉源文件就该 401。
+
+    过期用"签发时把时钟拨回去"来构造,而不是拨快校验端的时钟——
+    exp 由 PyJWT 用它自己的时钟校验,拨 session 的时钟对校验没有影响。
+    """
+    from app.auth import session
+
+    g = upload(client, target["tid"], "seat.stp").json()
+    real_time = session.time.time
+    monkeypatch.setattr(session.time, "time", lambda: real_time() - 3600)
+    t = client.post(f"/sim/geometries/{g['id']}/convert-ticket",
+                    params={"ttl_seconds": 60}, headers=hdr("u")).json()
+    monkeypatch.undo()
+
+    r = client.get(f"/sim/geometries/{g['id']}/download",
+                   headers={"Authorization": f"Bearer {t['token']}"})
+    assert r.status_code == 401
+    assert "过期" in r.json()["detail"]
+
+
+def test_convert_ticket_rejects_other_users(client, target):
+    g = upload(client, target["tid"], "seat.stp").json()
+    r = client.post(f"/sim/geometries/{g['id']}/convert-ticket", headers=hdr("intruder"))
+    assert r.status_code == 404
+
+
+# --- 工作目录：来自系统配置，不该要求人工填 -----------------------------
+
+def test_new_project_gets_workdir_from_system_config(client, tmp_path, monkeypatch):
+    """建项目就把 workdir 定下来——等到导入数模才报"未设置"是最差的顺序。"""
+    monkeypatch.setenv("HPC_SIM_WORKDIR_ROOT", str(tmp_path / "simroot"))
+    from app import config
+    monkeypatch.setattr(config, "_settings", None)
+
+    p = client.post("/sim/projects", json={"name": "无需填工作目录"},
+                    headers=hdr("u")).json()
+    assert p["workdir"] == os.path.join(str(tmp_path / "simroot"), "u", p["id"])
+
+
+def test_legacy_project_without_workdir_is_backfilled_on_use(client, tmp_path, monkeypatch):
+    """老项目 workdir 为空:首次用到时按同一规则派生并回写,不需要数据迁移。"""
+    monkeypatch.setenv("HPC_SIM_WORKDIR_ROOT", str(tmp_path / "simroot"))
+    from app import config
+    monkeypatch.setattr(config, "_settings", None)
+
+    pid = client.post("/sim/projects", json={"name": "老项目"}, headers=hdr("u")).json()["id"]
+    client.app.state.sim_db.update_project(pid, workdir=None)  # 还原成历史状态
+    tid = client.post(f"/sim/projects/{pid}/targets", json={"name": "座椅"},
+                      headers=hdr("u")).json()["id"]
+
+    g = upload(client, tid, "seat.stp").json()
+    expected = os.path.join(str(tmp_path / "simroot"), "u", pid, "sdm_geometry", tid)
+    assert g["source_file"]["path"].startswith(expected)
+    # 已回写,后续不再重算
+    assert client.get(f"/sim/projects/{pid}", headers=hdr("u")).json()["workdir"] \
+        == os.path.join(str(tmp_path / "simroot"), "u", pid)
+
+
+def test_explicit_workdir_still_wins(client, tmp_path, monkeypatch):
+    """个别项目要指向既有分析目录时,显式值不能被派生值覆盖。"""
+    monkeypatch.setenv("HPC_SIM_WORKDIR_ROOT", str(tmp_path / "simroot"))
+    from app import config
+    monkeypatch.setattr(config, "_settings", None)
+
+    custom = str(tmp_path / "existing-analysis")
+    p = client.post("/sim/projects", json={"name": "指定目录", "workdir": custom},
+                    headers=hdr("u")).json()
+    assert p["workdir"] == custom
+
+
+def test_lightweight_download_accepts_query_token(client, target):
+    """three.js 的 GLTFLoader 拿 URL 直接 fetch,设不了 Authorization 头,
+    令牌只能走 query——这条曾经因为管理员依赖只读请求头而 401,渲染全线打不开。"""
+    g = upload(client, target["tid"], "seat.stp").json()
+    glb = b"glTF\x02\x00\x00\x00fake"
+    client.post(
+        f"/sim/geometries/{g['id']}/lightweight",
+        files={"file": ("seat.glb", io.BytesIO(glb), "model/gltf-binary")},
+        headers=hdr("u"),
+    )
+    from app.auth.session import issue_token
+
+    r = client.get(f"/sim/geometries/{g['id']}/lightweight",
+                   params={"token": issue_token("u")})  # 刻意不带 Authorization 头
+    assert r.status_code == 200, r.text
+    assert r.content == glb
+
+
+def test_lightweight_download_still_rejects_other_users(client, target):
+    from app.auth.session import issue_token
+
+    g = upload(client, target["tid"], "seat.stp").json()
+    r = client.get(f"/sim/geometries/{g['id']}/lightweight",
+                   params={"token": issue_token("intruder")})
+    assert r.status_code == 404

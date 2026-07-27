@@ -471,6 +471,21 @@ export interface PipelineRun {
   nodes?: NodeRun[];
 }
 
+/**
+ * 一次几何转换的受限票据。交给桌面端 vektor3d，让它自己来拉源文件、推产物。
+ * token 只对这一个 gid、只对这两个端点有效，且以分钟计过期。
+ */
+export interface SimConvertTicket {
+  gid: string;
+  token: string;
+  expiresIn: number;
+  sourceName: string;
+  /** vektor3d GET 这个地址拉源文件 */
+  sourceUrl: string;
+  /** vektor3d 转换完 POST 这个地址回传 GLB */
+  uploadUrl: string;
+}
+
 export interface SimGeometry {
   id: string;
   sim_target_id: string;

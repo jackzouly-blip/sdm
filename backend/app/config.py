@@ -103,6 +103,25 @@ class Settings(BaseSettings):
     # 规则为全局生效且会以任务属主身份执行命令，应仅限运维配置。
     admin_users: str = ""
 
+    # 仿真项目工作目录的根：几何数模、网格与轻量化产物按 <根>/<属主>/<项目 id> 落盘。
+    # 必须在 fs_roots 白名单内，否则写入会被拒。留空=取白名单第一个根下的 hpc-portal/sim。
+    sim_workdir_root: str = ""
+
+    @property
+    def sim_workdir_base_dir(self) -> str:
+        """仿真项目工作目录的根。
+
+        项目的 workdir 由它派生（`<根>/<属主>/<项目 id>`），不再要求人工填一个
+        集群绝对路径——那既是每个新项目必踩的坑，也把基础设施布局泄进了页面。
+        留空则回退到文件根白名单的第一个根下的 hpc-portal/sim，保证派生结果
+        天然落在白名单内（否则写入会被 403 拒掉）。
+        """
+        configured = (self.sim_workdir_root or "").strip().rstrip("/")
+        if configured:
+            return configured
+        roots = self.fs_root_list
+        return f"{roots[0]}/hpc-portal/sim" if roots else "/tmp/hpc-portal-sim"
+
     @property
     def fs_root_list(self) -> list[str]:
         """归一化后的根白名单（去尾斜杠、去空项）。"""
