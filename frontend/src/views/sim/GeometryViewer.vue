@@ -20,7 +20,16 @@ const emit = defineEmits<{ (e: "close"): void }>();
 const host = ref<HTMLDivElement | null>(null);
 const loading = ref(true);
 const error = ref("");
-const stats = ref<{ tris: number; objects: number } | null>(null);
+const stats = ref<{
+  tris: number;
+  objects: number;
+  /** 装配层级深度；1 表示被拍平了 */
+  depth: number;
+  /** 带稳定零件标识的 node 数 */
+  withPartId: number;
+  /** 去重后的 mesh 数；远小于 objects 说明相同零件复用生效 */
+  uniqueMeshes: number;
+} | null>(null);
 
 // three 对象用 shallowRef：它们内部状态庞大，深层响应式代理会拖垮渲染性能
 const renderer = shallowRef<THREE.WebGLRenderer | null>(null);
@@ -76,17 +85,37 @@ onMounted(async () => {
     ctl.target.copy(center);
     ctl.update();
 
+    // 统计同时充当契约验收读数：装配层级、零件标识、mesh 复用这三条要求
+    // （见 docs/vektor3d-geometry-capability-contract.md 的装配小节）
+    // 是否被满足，在这里一眼可见，不必等用久了才发现标识是随机生成的。
     let tris = 0;
     let objects = 0;
+    let depth = 0;
+    let withPartId = 0;
+    const meshIds = new Set<number>();
     gltf.scene.traverse((o) => {
+      let d = 0;
+      for (let p = o.parent; p; p = p.parent) d += 1;
+      depth = Math.max(depth, d);
+      if (o.userData?.partId || o.userData?.instancePath) withPartId += 1;
       const m = o as THREE.Mesh;
       if (m.isMesh && m.geometry) {
         objects += 1;
-        const idx = m.geometry.getIndex();
-        tris += (idx ? idx.count : m.geometry.getAttribute("position")?.count ?? 0) / 3;
+        // 同一 geometry 被多个 node 引用 => 复用生效，几何只存一份
+        if (!meshIds.has(m.geometry.id)) {
+          meshIds.add(m.geometry.id);
+          const idx = m.geometry.getIndex();
+          tris += (idx ? idx.count : m.geometry.getAttribute("position")?.count ?? 0) / 3;
+        }
       }
     });
-    stats.value = { tris: Math.round(tris), objects };
+    stats.value = {
+      tris: Math.round(tris),
+      objects,
+      depth,
+      withPartId,
+      uniqueMeshes: meshIds.size,
+    };
   } catch (e) {
     error.value = `加载失败：${e instanceof Error ? e.message : String(e)}`;
   } finally {
@@ -131,8 +160,24 @@ onMounted(async () => {
         </span>
         <span class="text-xs text-slate-400">v{{ geometry.version_no }}</span>
         <span v-if="stats" class="text-xs text-slate-500">
-          {{ stats.objects }} 个网格 · {{ stats.tris.toLocaleString() }} 三角面
+          {{ stats.objects }} 个零件 · {{ stats.tris.toLocaleString() }} 三角面
+          <template v-if="stats.uniqueMeshes < stats.objects">
+            （复用后 {{ stats.uniqueMeshes }} 份几何）
+          </template>
         </span>
+        <!-- 契约验收：层级被拍平、或零件缺标识，都会让后续的零件级操作做不了 -->
+        <span
+          v-if="stats && stats.depth <= 1 && stats.objects > 1"
+          class="text-xs px-1.5 py-0.5 rounded bg-amber-50 text-amber-700"
+          title="装配层级被拍平成一层，无法按子系统操作。见几何能力契约的装配小节。"
+          >层级已拍平</span
+        >
+        <span
+          v-if="stats && stats.objects > 1 && stats.withPartId === 0"
+          class="text-xs px-1.5 py-0.5 rounded bg-amber-50 text-amber-700"
+          title="零件没有稳定标识（node.extras.partId），无法按零件赋材料或圈定范围。见几何能力契约的装配小节。"
+          >零件无标识</span
+        >
         <button
           class="ml-auto p-1 rounded hover:bg-slate-100 text-slate-500"
           @click="emit('close')"
