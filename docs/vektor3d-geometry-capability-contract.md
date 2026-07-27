@@ -279,12 +279,35 @@ Origin 白名单。生产地址为 `http://<集群主机>:8088`（IPv6 入口同
 
 ## 5. SDM 侧的准备情况
 
-- 数据模型已就位：`sim_geometry_version` 表含 `source_file_json`、`step_file`、
-  `brep_file`、`lightweight_file`、`topo_summary_json` 等列。
-- 编排引擎已就位：`capability.invoke` 节点会挂起等待浏览器代理完成，
-  能力一上线即可编入流水线。
-- 待能力可用后 SDM 侧补齐：文件上传/下载端点与短期令牌、浏览器代理客户端、
-  three.js GLTF 预览。
+**接口已经部署上线，可以直接对接联调**，不是待建状态。
+
+### 已就绪
+
+| 项 | 状态 |
+|---|---|
+| 数据模型 | `sim_geometry_version` 表含 `source_file_json` / `step_file` / `brep_file` / `lightweight_file` / `topo_summary_json` |
+| 源文件下载（对应契约的 `sourceUrl`） | `GET /api/sim/geometries/{gid}/download` 已上线 |
+| 产物回传（对应契约的 `uploadUrl`） | `POST /api/sim/geometries/{gid}/lightweight` 已上线，multipart，字段 `file` + 可选 `meta`（JSON 字符串，对应 2.1 的输出 schema） |
+| 网页渲染 | three.js + `GLTFLoader` 已接好，产物一回传即可预览 |
+| 编排 | `capability.invoke` 节点会挂起等待，能力上线即可编入流水线 |
+
+产物回传接口**会拒绝非 `.glb` / `.gltf` 的文件**并返回本文链接——这是刻意的，
+避免私有格式被无意中引入。
+
+预览器还会给出验收读数：装配层级深度、带零件标识的 node 数、去重后的 mesh 数；
+层级被拍平或零件无标识时直接告警。因此第一个 GLB 回传后，
+2.1 中那三条装配要求是否落实，打开即可判断。
+
+### 待补（不阻塞对接）
+
+- 短期令牌：目前上述端点走门户的常规鉴权。契约中的 `authToken` 会在联调阶段
+  换成与单个几何版本绑定、有效期以分钟计的短期令牌。
+- 浏览器代理客户端：待 `geometry.convert` 可用后接入。
+
+### 联调环境
+
+生产地址 `http://<集群主机>:8088`。需要 vektor3d 侧把该源加入 capability server
+的 Origin 白名单（IPv6 入口同理）。具体主机与账号请联系 SDM 侧。
 
 ---
 
