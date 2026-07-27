@@ -59,7 +59,48 @@ IGES、SolidWorks、NX —— 以现有 `cad-pipeline` 已支持的为准。
    两边不共享任何私有实现。
 
 如果内部管线产出的仍是 `.3dix`，只需在能力的 `run` 里加一步 `.3dix → GLB` 的导出即可，
-SDM 不关心中间过程。
+SDM 不关心中间过程。**这一步基本是机械映射**，见下。
+
+#### `.3dix → glTF` 的映射（说明这不是新开发）
+
+现有转换器的产物已经具备组装 glTF 所需的全部信息：
+
+```
+out/<job>/
+├── bom.json        装配结构：fileList / asmList
+├── manifest.json   零件清单：partKey / partNo / name / tdixPath / faceCount
+└── parts/<partKey>/model.3dix   每零件一个：box / transform / faceShapes / pmi
+```
+
+对应关系：
+
+| glTF 需要的 | 现有产物里的来源 |
+|---|---|
+| 场景图层级（node 树） | `bom.json` 的 `asmList` |
+| node 的稳定零件标识 | `manifest.json` 的 `partNo` / `partKey`（来自 CAD，天然稳定） |
+| node 的 transform | `model.3dix` 的 `transform` |
+| mesh 的 position / index | `faceShapes[].vertices` / `vertexindices` |
+| 材质颜色 | `faceShapes[].color` |
+| 相同零件复用 mesh | 同一 `partKey` 的多个实例引用同一 mesh，各带自己 transform |
+
+#### 为什么这一步必须在 vektor3d 侧完成，而不是把 `.3dix` 交给 SDM
+
+`.3dix` 是 UTF-8 JSON。实测一个零件样本：1077 三角面 / 63,834 字节，
+**约 59 字节每三角面**（且该样本 `normals` 为空、`vertices` 不跨 faceShape 共享，
+真实情况更大）。对比：
+
+| 格式 | 每三角面 | 5M 三角面的装配 |
+|---|---|---|
+| `.3dix`（JSON） | ~59 B | ~295 MB |
+| glTF/GLB（二进制） | ~24 B | ~120 MB |
+| GLB + Draco | ~3–5 B | **~20 MB** |
+
+若把 `.3dix` 交给 SDM 自行转换，那 ~300 MB 的 JSON 就要跨网传输并 `JSON.parse`，
+浏览器侧几乎必然失败；且需按零件拉 N 个文件而非 1 个。在源头转换，
+网络与浏览器只承受最终那 ~20 MB。
+
+**这不是"依赖外部团队"**——转换器由你们自己实现即可，只是应当部署在持有原始产物的
+那一侧运行。
 
 #### 输入 schema
 
@@ -227,7 +268,8 @@ Origin 白名单。生产地址为 `http://<集群主机>:8088`（IPv6 入口同
 ## 6. 需要 vektor3d 团队确认的问题
 
 1. `geometry.convert` 是否可行、预计排期？
-2. 能否直接输出 glTF/GLB？若管线内部只能出 `.3dix`，能否在能力里加一步导出？
+2. `.3dix + bom.json + manifest.json → 单个 GLB` 的封装步骤（见 2.1 映射表），
+   工作量评估如何？从产物结构看应是机械映射，若有我们没看到的坑请指出。
 3. 转换器（DbitConvert）是否需要 CATIA 等原生环境？无环境时 `ready()` 应返回什么，
    以便 SDM 能给用户明确提示。
 4. 装配体（见 2.1 的装配小节）：能否保留装配层级、复用相同零件的 mesh、
