@@ -401,6 +401,80 @@ async def upload_geometry(
     return _row(db.get_geometry(gid), GEOM_JSON)
 
 
+class GeometryFromPath(BaseModel):
+    """从集群已有文件建几何版本。
+
+    CAD 数模走浏览器上传即可，但求解器 deck 不行：主控 .key 会牵出几百 MB
+    的 include 树、散在集群目录里，浏览器传不上来。而它本就在集群上。
+    """
+    path: str = Field(min_length=1, description="集群上的绝对路径")
+    source_type: str = "cluster"
+    # LS-DYNA deck 会自动转成 GLB 供网页渲染；其余格式仅登记
+    convert: bool = True
+    max_triangles: Optional[int] = None
+
+
+# 会被当作 LS-DYNA deck 解析的扩展名
+_DECK_EXT = (".k", ".key", ".kinc", ".dyn")
+
+
+@router.post("/targets/{tid}/geometries/from-path",
+             status_code=status.HTTP_201_CREATED)
+def add_geometry_from_path(
+    request: Request,
+    tid: str,
+    body: GeometryFromPath,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """把集群上已有的文件登记为几何版本；deck 则顺带派发 GLB 转换。
+
+    只登记路径、不拷贝文件——deck 的 include 树可达数百 MB 且随作业目录演进，
+    复制一份只会立刻过期，还会平白占一倍空间。
+    """
+    from ..fs.browser import FsError, stat_path
+
+    db = _db(request)
+    target = _owned_target(db, tid, user, is_admin)
+    proj = db.get_project(target["sim_project_id"])
+
+    # 以登录用户身份校验：既确认存在，也确保他确实有权读这个路径
+    try:
+        info = stat_path(user, body.path, get_settings().fs_root_list)
+    except FsError as e:
+        raise HTTPException(e.status, f"路径不可用: {e.message}")
+    if info["is_dir"]:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "请指定文件而非目录")
+
+    path = info["path"]
+    name = os.path.basename(path)
+    gid = db.add_geometry(
+        tid,
+        source_type=body.source_type,
+        source_file={"name": name, "size": info.get("size") or 0, "path": path},
+        step_file=path if name.lower().endswith((".stp", ".step")) else None,
+    )
+
+    task_id = None
+    if body.convert and name.lower().endswith(_DECK_EXT):
+        tm = getattr(request.app.state, "task_manager", None)
+        if tm is None:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "任务管理器不可用")
+        out = os.path.join(
+            proj["workdir"] or os.path.dirname(path),
+            "sdm_geometry", tid, f"{gid}.glb",
+        ) if proj["workdir"] else os.path.join(os.path.dirname(path), f".sdm_{gid}.glb")
+        params = {"deck_path": path, "out_path": out, "gid": gid, "run_as": user}
+        if body.max_triangles is not None:
+            params["max_triangles"] = body.max_triangles
+        task_id = tm.submit("sim_deck_convert", owner=user, params=params)
+        log.info("派发 deck 转换 gid=%s task=%s deck=%s", gid, task_id, path)
+
+    out = _row(db.get_geometry(gid), GEOM_JSON)
+    out["convert_task_id"] = task_id
+    return out
+
+
 @router.get("/geometries/{gid}/download")
 def download_geometry(
     request: Request,

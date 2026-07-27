@@ -10,7 +10,7 @@
 import { onMounted, ref } from "vue";
 import { simApi, errMsg } from "@/api";
 import type { SimGeometry } from "@/api/types";
-import { Box, Download, Eye, Loader2, Upload } from "lucide-vue-next";
+import { AlertTriangle, Box, Download, Eye, FolderInput, Loader2, Upload } from "lucide-vue-next";
 
 const props = defineProps<{ targetId: string; targetName: string }>();
 const emit = defineEmits<{ (e: "preview", g: SimGeometry): void }>();
@@ -24,6 +24,59 @@ const fileInput = ref<HTMLInputElement | null>(null);
 
 /** 需要轻量化才能渲染的 CAD 原生格式 */
 const CAD_EXT = /\.(catpart|catproduct|stp|step|jt|igs|iges|3dxml|prt|sldprt|sldasm|x_t|x_b)$/i;
+/** 求解器输入卡：SDM 自己解析成 GLB，不依赖 vektor3d */
+const DECK_EXT = /\.(k|key|kinc|dyn)$/i;
+
+const clusterPath = ref("");
+const importing = ref(false);
+const converting = ref<string | null>(null);
+
+/**
+ * 从集群路径导入。deck 走这条路是必须的——主控 .key 会牵出几百 MB 的 include
+ * 树、散在集群目录里，浏览器传不上来，而它本就在集群上。
+ */
+async function importFromPath() {
+  const p = clusterPath.value.trim();
+  if (!p) return;
+  importing.value = true;
+  error.value = "";
+  try {
+    const g = await simApi.addGeometryFromPath(props.targetId, p);
+    clusterPath.value = "";
+    await load();
+    if (g.convert_task_id) {
+      converting.value = g.id;
+      pollConversion(g.id);
+    }
+  } catch (e) {
+    error.value = errMsg(e);
+  } finally {
+    importing.value = false;
+  }
+}
+
+/** deck 转换是分钟级的异步任务，轮询到产物出现为止 */
+function pollConversion(gid: string) {
+  const timer = window.setInterval(async () => {
+    try {
+      const rows = await simApi.listGeometries(props.targetId);
+      geometries.value = rows;
+      const g = rows.find((r) => r.id === gid);
+      if (g?.lightweight_file) {
+        window.clearInterval(timer);
+        converting.value = null;
+      }
+    } catch {
+      window.clearInterval(timer);
+      converting.value = null;
+    }
+  }, 5000);
+  // 兜底：整车 deck 实测约 40 秒，10 分钟仍无产物即认为失败，停止轮询
+  window.setTimeout(() => {
+    window.clearInterval(timer);
+    if (converting.value === gid) converting.value = null;
+  }, 600000);
+}
 
 async function load() {
   loading.value = true;
@@ -75,8 +128,21 @@ function fmt(ts: number) {
 function renderState(g: SimGeometry): { can: boolean; text: string } {
   if (g.lightweight_file) return { can: true, text: "可预览" };
   const name = g.source_file?.name ?? "";
+  if (converting.value === g.id) return { can: false, text: "转换中…" };
+  // deck 由 SDM 自己解析，不依赖 vektor3d；没产物说明转换失败或还没跑
+  if (DECK_EXT.test(name)) return { can: false, text: "待转换" };
   if (CAD_EXT.test(name)) return { can: false, text: "待轻量化" };
   return { can: false, text: "格式不支持预览" };
+}
+
+/** 摘要里的关键读数：include 缺失意味着模型不完整，必须显眼 */
+function deckWarning(g: SimGeometry): string | null {
+  const s = g.topo_summary as Record<string, unknown> | null;
+  if (!s) return null;
+  const missing = Number(s.missingIncludeCount ?? 0);
+  if (missing > 0) return `${missing} 个 include 缺失，模型可能不完整`;
+  if (s.truncated) return "三角面超预算，已按零件截断";
+  return null;
 }
 
 onMounted(load);
@@ -102,6 +168,25 @@ defineExpose({ reload: load });
         <Loader2 v-if="uploading" :size="15" class="animate-spin" />
         <Upload v-else :size="15" />
         {{ uploading ? `上传中 ${progress}%` : "导入数模" }}
+      </button>
+    </div>
+
+    <!-- 从集群路径导入：deck 只能走这条（include 树在集群上，传不上来） -->
+    <div class="flex gap-2 mb-3">
+      <input
+        v-model="clusterPath"
+        class="flex-1 px-3 py-1.5 border border-slate-300 rounded-md text-sm font-mono"
+        placeholder="集群路径，如 /data/project-ext/user07/.../000_Master.key"
+        @keyup.enter="importFromPath"
+      />
+      <button
+        class="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-slate-300 text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50 shrink-0"
+        :disabled="importing || !clusterPath.trim()"
+        @click="importFromPath"
+      >
+        <Loader2 v-if="importing" :size="15" class="animate-spin" />
+        <FolderInput v-else :size="15" />
+        从集群导入
       </button>
     </div>
 
@@ -156,6 +241,13 @@ defineExpose({ reload: load });
             >
               {{ renderState(g).text }}
             </span>
+            <span
+              v-if="deckWarning(g)"
+              class="ml-1 inline-flex items-center gap-0.5 text-xs text-amber-600"
+              :title="deckWarning(g)!"
+            >
+              <AlertTriangle :size="11" />
+            </span>
           </td>
           <td class="py-2 text-slate-500">{{ fmt(g.created_at) }}</td>
           <td class="py-2">
@@ -184,7 +276,7 @@ defineExpose({ reload: load });
       v-if="geometries.some((g) => !renderState(g).can)"
       class="text-xs text-slate-400 mt-3 leading-relaxed"
     >
-      标注「待轻量化」的是 CAD 原生格式，浏览器无法直接渲染，需先经 vektor3d 的
+      求解器输入卡（.k/.key）由 SDM 自行解析成 glTF，不依赖 vektor3d；标注「待轻量化」的是 CAD 原生格式，浏览器无法直接渲染，需先经 vektor3d 的
       <code class="px-1 bg-slate-100 rounded">geometry.convert</code> 能力转成
       glTF/GLB。该能力尚未上线，接口契约见
       <code class="px-1 bg-slate-100 rounded">docs/vektor3d-geometry-capability-contract.md</code>。

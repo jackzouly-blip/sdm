@@ -25,6 +25,7 @@ from .logger import get_logger, setup_logging
 from .packaging.router import router as packaging_router
 from .shell.router import router as shell_router
 from .sim.db import SimDB
+from .sim.deck import service as _sim_deck_service  # noqa: F401  注册 sim_deck_convert 任务
 from .sim.engine import PipelineEngine, set_engine
 from .sim.nodes import register_builtin_node_types
 from .sim.pipeline_router import router as sim_pipeline_router

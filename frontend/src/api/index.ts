@@ -640,6 +640,23 @@ export const simApi = {
     );
     return data;
   },
+  /**
+   * 从集群已有路径建几何版本。
+   *
+   * 求解器 deck 只能走这条路：主控 .key 会牵出几百 MB 的 include 树、散在集群
+   * 目录里，浏览器传不上来，而它本就在集群上。deck 会自动转 GLB 供网页渲染。
+   */
+  async addGeometryFromPath(
+    tid: string,
+    path: string,
+    opts?: { convert?: boolean; max_triangles?: number }
+  ): Promise<SimGeometry & { convert_task_id: string | null }> {
+    const { data } = await http.post<SimGeometry & { convert_task_id: string | null }>(
+      `/sim/targets/${tid}/geometries/from-path`,
+      { path, ...opts }
+    );
+    return data;
+  },
   /** 轻量化产物的下载地址；token 经 query 传递，供 three.js GLTFLoader 直接加载。 */
   lightweightUrl(gid: string): string {
     return `/api/sim/geometries/${gid}/lightweight?token=${encodeURIComponent(
