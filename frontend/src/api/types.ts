@@ -470,3 +470,18 @@ export interface PipelineRun {
   /** 详情接口才带 */
   nodes?: NodeRun[];
 }
+
+export interface SimGeometry {
+  id: string;
+  sim_target_id: string;
+  version_no: number;
+  source_type: string;
+  source_file: { name: string; size: number; path: string } | null;
+  step_file: string | null;
+  brep_file: string | null;
+  /** 轻量化产物（glTF/GLB）路径；未转换时为 null */
+  lightweight_file: string | null;
+  topo_summary: Record<string, unknown> | null;
+  status: string;
+  created_at: number;
+}

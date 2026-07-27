@@ -8,8 +8,17 @@
 import { computed, onMounted, ref } from "vue";
 import { useRouter, type RouteLocationRaw } from "vue-router";
 import { simApi, errMsg } from "@/api";
-import type { SimJob, SimProject, SimResult, SimSubject, SimTarget } from "@/api/types";
-import { ArrowLeft, Boxes, Eye, Loader2, Plus, Trash2 } from "lucide-vue-next";
+import type {
+  SimGeometry,
+  SimJob,
+  SimProject,
+  SimResult,
+  SimSubject,
+  SimTarget,
+} from "@/api/types";
+import { ArrowLeft, Boxes, ChevronRight, Eye, Loader2, Plus, Trash2 } from "lucide-vue-next";
+import GeometryPanel from "./GeometryPanel.vue";
+import GeometryViewer from "./GeometryViewer.vue";
 
 const props = defineProps<{ pid: string }>();
 const router = useRouter();
@@ -133,6 +142,14 @@ function fmt(ts: number | null) {
   return ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "—";
 }
 
+// 展开哪个分析对象的几何面板；同一时刻只展开一个，避免多个 3D 场景并存
+const openTarget = ref<string | null>(null);
+const previewing = ref<SimGeometry | null>(null);
+
+function onPreview(g: SimGeometry) {
+  previewing.value = g;
+}
+
 /**
  * 结果 → 查看器路由。按 result_type 分发：目前只有碰撞（d3plot）有实现，
  * 后续 CFD / NVH / 疲劳各自注册后在此扩展，其余类型返回 null（不显示入口）。
@@ -240,19 +257,40 @@ onMounted(load);
             </tr>
           </thead>
           <tbody>
-            <tr v-for="t in targets" :key="t.id" class="border-b border-slate-100">
-              <td class="py-2 text-slate-800">{{ t.name }}</td>
-              <td class="py-2 text-slate-500">{{ t.target_type }}</td>
-              <td class="py-2 text-slate-500">{{ fmt(t.created_at) }}</td>
-              <td class="py-2">
-                <button
-                  class="p-1 rounded hover:bg-rose-50 text-slate-400 hover:text-rose-600"
-                  @click="delTarget(t)"
-                >
-                  <Trash2 :size="14" />
-                </button>
-              </td>
-            </tr>
+            <template v-for="t in targets" :key="t.id">
+              <tr
+                class="border-b border-slate-100 hover:bg-slate-50 cursor-pointer"
+                @click="openTarget = openTarget === t.id ? null : t.id"
+              >
+                <td class="py-2 text-slate-800">
+                  <ChevronRight
+                    :size="14"
+                    class="inline -mt-0.5 mr-1 text-slate-400 transition-transform"
+                    :class="openTarget === t.id ? 'rotate-90' : ''"
+                  />
+                  {{ t.name }}
+                </td>
+                <td class="py-2 text-slate-500">{{ t.target_type }}</td>
+                <td class="py-2 text-slate-500">{{ fmt(t.created_at) }}</td>
+                <td class="py-2">
+                  <button
+                    class="p-1 rounded hover:bg-rose-50 text-slate-400 hover:text-rose-600"
+                    @click.stop="delTarget(t)"
+                  >
+                    <Trash2 :size="14" />
+                  </button>
+                </td>
+              </tr>
+              <tr v-if="openTarget === t.id">
+                <td colspan="4" class="bg-slate-50/60 px-4 py-3">
+                  <GeometryPanel
+                    :target-id="t.id"
+                    :target-name="t.name"
+                    @preview="onPreview"
+                  />
+                </td>
+              </tr>
+            </template>
           </tbody>
         </table>
       </div>
@@ -407,5 +445,12 @@ onMounted(load);
         </table>
       </div>
     </template>
+
+    <!-- 几何预览：轻量化产物就绪的版本才会走到这里 -->
+    <GeometryViewer
+      v-if="previewing"
+      :geometry="previewing"
+      @close="previewing = null"
+    />
   </div>
 </template>

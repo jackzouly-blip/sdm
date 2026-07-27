@@ -7,13 +7,25 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    status,
+)
 from pydantic import BaseModel, Field
 
-from ..auth.session import current_user, is_admin_request
+from ..auth.session import current_user, current_user_query, is_admin_request
+from ..config import get_settings
 from ..logger import get_logger
 from .db import SimDB
 
@@ -327,6 +339,163 @@ def add_geometry(
         body.brep_file, body.lightweight_file, body.topo_summary,
     )
     return _row(db.get_geometry(gid), GEOM_JSON)
+
+
+def _geometry_dir(db: SimDB, target: sqlite3.Row) -> str:
+    """几何文件的存放目录：<项目 workdir>/sdm_geometry/<分析对象 id>。
+
+    放在项目工作目录下而非另辟存储：仿真的输入输出本就都在集群共享盘上，
+    单独再建一套存储会让备份、配额、清理各有一套口径。
+    """
+    proj = db.get_project(target["sim_project_id"])
+    if proj is None or not proj["workdir"]:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "仿真项目未设置工作目录（workdir），无法存放几何文件",
+        )
+    return os.path.join(proj["workdir"], "sdm_geometry", target["id"])
+
+
+@router.post("/targets/{tid}/geometries/upload", status_code=status.HTTP_201_CREATED)
+async def upload_geometry(
+    request: Request,
+    tid: str,
+    file: UploadFile = File(...),
+    source_type: str = Form("upload"),
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """上传 CAD 数模，建立一个几何版本。
+
+    以项目属主身份落盘（作业要以真实用户身份读它）。每次上传落在独立子目录下，
+    因此同名文件重复上传不会互相覆盖——write_file 用 O_EXCL 拒绝覆盖，
+    不加隔离的话第二次上传必失败。
+
+    CAD 原生格式（CATIA/STEP/JT…）此时只做归档；轻量化由 vektor3d 的
+    geometry.convert 能力产出后经 /geometries/{gid}/lightweight 回传。
+    """
+    from ..fs.browser import FsError, write_file
+
+    db = _db(request)
+    target = _owned_target(db, tid, user, is_admin)
+    proj = db.get_project(target["sim_project_id"])
+    base = _geometry_dir(db, target)
+    owner = proj["owner"]
+
+    name = os.path.basename((file.filename or "").replace("\\", "/")) or "model.dat"
+    slot = uuid.uuid4().hex[:8]
+    data = await file.read()
+    try:
+        written = write_file(owner, os.path.join(base, slot), name,
+                             data, get_settings().fs_root_list)
+    except FsError as e:
+        raise HTTPException(e.status, f"写入几何文件失败: {e.message}")
+
+    gid = db.add_geometry(
+        tid,
+        source_type=source_type,
+        source_file={"name": name, "size": len(data), "path": written["path"]},
+        step_file=written["path"] if name.lower().endswith((".stp", ".step")) else None,
+    )
+    log.info("上传几何 target=%s gid=%s file=%s (%d 字节)", tid, gid, name, len(data))
+    return _row(db.get_geometry(gid), GEOM_JSON)
+
+
+@router.get("/geometries/{gid}/download")
+def download_geometry(
+    request: Request,
+    gid: str,
+    user: str = Depends(current_user_query),
+    is_admin: bool = Depends(is_admin_request),
+):
+    """下载几何源文件。
+
+    契约里 vektor3d 就是通过这个地址拉取源文件的（见
+    docs/vektor3d-geometry-capability-contract.md）。用 current_user_query
+    是因为下载可能由 <a href> 或非浏览器客户端发起，未必能带 Authorization 头。
+    """
+    from fastapi.responses import FileResponse
+
+    db = _db(request)
+    row = _owned_geometry(db, gid, user, is_admin)
+    src = _json_or_none(row["source_file_json"]) or {}
+    path = src.get("path")
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "几何源文件不存在或已被删除")
+    return FileResponse(path, filename=src.get("name") or os.path.basename(path),
+                        media_type="application/octet-stream")
+
+
+@router.post("/geometries/{gid}/lightweight")
+async def upload_lightweight(
+    request: Request,
+    gid: str,
+    file: UploadFile = File(...),
+    meta: Optional[str] = Form(None, description="转换元数据 JSON：三角面数/包围盒/单位等"),
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """回传轻量化产物（glTF/GLB）。
+
+    契约里 vektor3d 转换完成后 POST 到这里。产物落在源文件同一子目录下，
+    元数据并入 topo_summary_json 供前端展示零件数、包围盒等。
+    """
+    from ..fs.browser import FsError, write_file
+
+    db = _db(request)
+    row = _owned_geometry(db, gid, user, is_admin)
+    target = db.get_target(row["sim_target_id"])
+    proj = db.get_project(target["sim_project_id"])
+
+    src = _json_or_none(row["source_file_json"]) or {}
+    if not src.get("path"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "该几何版本没有源文件，无法关联产物")
+    parent = os.path.dirname(src["path"])
+
+    name = os.path.basename((file.filename or "").replace("\\", "/")) or "model.glb"
+    if not name.lower().endswith((".glb", ".gltf")):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "轻量化产物必须是 glTF/GLB —— 私有格式无法在浏览器中渲染，"
+            "详见 docs/vektor3d-geometry-capability-contract.md",
+        )
+    data = await file.read()
+    try:
+        written = write_file(proj["owner"], parent, name, data,
+                             get_settings().fs_root_list)
+    except FsError as e:
+        raise HTTPException(e.status, f"写入轻量化产物失败: {e.message}")
+
+    summary = _json_or_none(row["topo_summary_json"]) or {}
+    if meta:
+        try:
+            summary.update(json.loads(meta))
+        except ValueError:
+            log.warning("轻量化元数据不是合法 JSON，已忽略 gid=%s", gid)
+    summary["lightweight_bytes"] = len(data)
+
+    db.set_geometry_lightweight(gid, written["path"], summary)
+    log.info("回传轻量化产物 gid=%s file=%s (%d 字节)", gid, name, len(data))
+    return _row(db.get_geometry(gid), GEOM_JSON)
+
+
+@router.get("/geometries/{gid}/lightweight")
+def download_lightweight(
+    request: Request,
+    gid: str,
+    user: str = Depends(current_user_query),
+    is_admin: bool = Depends(is_admin_request),
+):
+    """取轻量化产物，供前端 three.js GLTFLoader 直接加载。"""
+    from fastapi.responses import FileResponse
+
+    db = _db(request)
+    row = _owned_geometry(db, gid, user, is_admin)
+    path = row["lightweight_file"]
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "尚无轻量化产物")
+    return FileResponse(path, filename=os.path.basename(path),
+                        media_type="model/gltf-binary")
 
 
 @router.get("/geometries/{gid}/meshes")

@@ -376,6 +376,22 @@ class SimDB(PipelineStoreMixin):
     def get_geometry(self, gid: str) -> Optional[sqlite3.Row]:
         return self._one("SELECT * FROM sim_geometry_version WHERE id=?", (gid,))
 
+    def set_geometry_lightweight(
+        self, gid: str, lightweight_file: str, topo_summary: Optional[Dict] = None
+    ) -> None:
+        """写入轻量化产物路径与几何摘要。
+
+        产物由 vektor3d 的 geometry.convert 能力经回传接口写入——SDM 自身不做
+        CAD 转换（3D 处理归 vektor3d，见 docs/sdm-architecture.md）。
+        """
+        self._write(
+            "UPDATE sim_geometry_version SET lightweight_file=?,"
+            " topo_summary_json=COALESCE(?, topo_summary_json) WHERE id=?",
+            (lightweight_file,
+             json.dumps(topo_summary, ensure_ascii=False) if topo_summary else None,
+             gid),
+        )
+
     def list_geometries(self, sim_target_id: str) -> List[sqlite3.Row]:
         return self._all(
             "SELECT * FROM sim_geometry_version WHERE sim_target_id=? ORDER BY version_no",

@@ -29,6 +29,7 @@ import type {
   SimJob,
   SimProject,
   SimProjectInput,
+  SimGeometry,
   SimResult,
   SimSubject,
   SimTarget,
@@ -613,6 +614,42 @@ export const simApi = {
   },
   async deleteTarget(tid: string): Promise<void> {
     await http.delete(`/sim/targets/${tid}`);
+  },
+
+  // --- 几何版本 ---
+  async listGeometries(tid: string): Promise<SimGeometry[]> {
+    const { data } = await http.get<SimGeometry[]>(`/sim/targets/${tid}/geometries`);
+    return data;
+  },
+  /** 上传 CAD 数模，建立一个几何版本。onProgress 用于大文件进度显示。 */
+  async uploadGeometry(
+    tid: string,
+    file: File,
+    onProgress?: (pct: number) => void
+  ): Promise<SimGeometry> {
+    const form = new FormData();
+    form.append("file", file);
+    const { data } = await http.post<SimGeometry>(
+      `/sim/targets/${tid}/geometries/upload`,
+      form,
+      {
+        onUploadProgress: (e) => {
+          if (onProgress && e.total) onProgress(Math.round((e.loaded / e.total) * 100));
+        },
+      }
+    );
+    return data;
+  },
+  /** 轻量化产物的下载地址；token 经 query 传递，供 three.js GLTFLoader 直接加载。 */
+  lightweightUrl(gid: string): string {
+    return `/api/sim/geometries/${gid}/lightweight?token=${encodeURIComponent(
+      getToken() ?? ""
+    )}`;
+  },
+  sourceDownloadUrl(gid: string): string {
+    return `/api/sim/geometries/${gid}/download?token=${encodeURIComponent(
+      getToken() ?? ""
+    )}`;
   },
 
   // --- 工况 ---
