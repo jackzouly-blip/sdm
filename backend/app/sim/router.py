@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import uuid
 from typing import Any, Dict, List, Optional
@@ -74,6 +75,12 @@ TEMPLATE_JSON = ("schema_json", "default_values_json",
 SUBJECT_JSON = ("config_json",)
 JOB_JSON = ("submit_payload_json",)
 RESULT_JSON = ("meta_json",)
+REQUIREMENT_JSON = ("source_file_json", "analysis_json")
+QUALITY_CARD_JSON = ("overrides_json",)
+ITEM_JSON = ("metrics_json",)
+
+# 项目没指定质量卡模板时的缺省底座(内置只读的那张碰撞通用 5mm 卡)
+DEFAULT_QUALITY_TEMPLATE = "generic-crash-5mm"
 
 
 # --- 权限 ---------------------------------------------------------------
@@ -116,6 +123,76 @@ def _owned_geometry(db: SimDB, gid: str, user: str, is_admin: bool) -> sqlite3.R
         raise HTTPException(status.HTTP_404_NOT_FOUND, "几何版本不存在")
     _owned_target(db, row["sim_target_id"], user, is_admin)
     return row
+
+
+def _owned_requirement(db: SimDB, rid: str, user: str, is_admin: bool) -> sqlite3.Row:
+    row = db.get_requirement_doc(rid)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "需求文档不存在")
+    _owned_project(db, row["sim_project_id"], user, is_admin)
+    return row
+
+
+def _owned_quality_card(db: SimDB, qid: str, user: str, is_admin: bool) -> sqlite3.Row:
+    row = db.get_quality_card(qid)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "质量卡不存在")
+    _owned_project(db, row["sim_project_id"], user, is_admin)
+    return row
+
+
+def _quality_library(request: Request):
+    """模板库句柄。用户模板落数据目录,内置模板随代码走。
+
+    用户目录放在 scratch 之外的固定位置:模板是长期资产,不能跟着临时目录被清掉。
+    """
+    from .quality import QualityCardLibrary
+
+    root = os.path.join(os.path.dirname(get_settings().db_path), "quality-templates")
+    return QualityCardLibrary(user_dir=root)
+
+
+def _quality_card_detail(card) -> Dict:
+    """把一张卡摊平成前端能直接渲染的结构。
+
+    只回启用的判据:那张 5mm 卡 28 条 shells 判据里只开了 11 条,把关掉的一起
+    铺给用户看,等于让他以为那些也在管。
+    """
+    from .quality import estimate_time_step
+
+    criteria = [
+        {
+            "name": c.name,
+            "domain": c.domain,
+            "calculation": c.calculation,       # 算法族:同一指标不同算法数值不同
+            "weight": c.weight,
+            "higherIsBetter": c.higher_is_better,
+            "thresholds": c.thresholds,
+        }
+        for c in card.criteria.enabled_criteria("shells")
+    ]
+    min_len = card.criteria.get("min length")
+    failed_len = (min_len.thresholds.get("failed") if min_len else None) or 0.0
+    return {
+        "id": card.id,
+        "name": card.name,
+        "source": card.source,
+        "revision": card.revision,
+        "scope": card.scope,
+        "description": card.description,
+        "builtin": card.builtin,
+        "ansaVersion": card.criteria.ansa_version,
+        "criteria": criteria,
+        "meshParams": {
+            "targetElementLength": card.target_element_length,
+            "minTargetLength": card.mesh_params.get_float("general_min_target_len"),
+            "maxTargetLength": card.mesh_params.get_float("general_max_target_len"),
+            "elementType": card.mesh_params.values.get("element_type", ""),
+            "featureHandling": card.mesh_params.values.get("bm_features_handling", ""),
+        },
+        # 判废线上的最小单元长度对应的显式时间步——碰撞里这才是机时的总闸
+        "timeStepAtFailedMinLength": estimate_time_step(failed_len),
+    }
 
 
 # --- 请求体 -------------------------------------------------------------
@@ -523,6 +600,9 @@ def add_geometry_from_path(
 # 写这一个产物"。契约第 5 节列的"短期令牌待补"即指此项。
 
 GEOMETRY_CONVERT_SCOPE = "geometry.convert"
+# 需求文档分析票据。与几何票据同一套机制,但绑的是 rid ——一张票据只能读一份文档,
+# 换个 rid 就 403。不共用一个 scope 是刻意的:几何票据能写产物,这张只能读。
+DOC_ANALYZE_SCOPE = "doc.analyze"
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -739,6 +819,616 @@ def add_mesh(
         body.mesh_file, body.quality,
     )
     return _row(db.get_mesh(mid), MESH_JSON)
+
+
+# --- 客户需求文档 -------------------------------------------------------
+#
+# 仿真项目的输入源头:主机厂给的 CAE 分析规范/技术协议。整条链是
+#   建项目 → 传需求文档 → 分析需求并选质量卡模板 → 派生质量卡实例 → 按需调参
+# 其中"分析"这一步的 AI 尚未接入(缺真实需求文档样本,输入形态未知),因此这里
+# 先把文档归档与实例的**手工派生**做通——AI 到位后是替人填"依据",不是推倒重来。
+
+class RequirementDocCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    doc_type: str = "spec"          # spec/agreement/standard/other
+    note: Optional[str] = None
+
+
+@router.get("/projects/{pid}/requirements")
+def list_requirement_docs(
+    request: Request,
+    pid: str,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> List[Dict]:
+    db = _db(request)
+    _owned_project(db, pid, user, is_admin)
+    return [_row(r, REQUIREMENT_JSON) for r in db.list_requirement_docs(pid)]
+
+
+@router.post("/projects/{pid}/requirements/upload", status_code=status.HTTP_201_CREATED)
+async def upload_requirement_doc(
+    request: Request,
+    pid: str,
+    file: UploadFile = File(...),
+    doc_type: str = Form("spec"),
+    note: Optional[str] = Form(None),
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """上传客户需求文档并归档。
+
+    与几何同一套落盘规则:项目工作目录下独立子目录,同名重复上传不互相覆盖。
+    """
+    from ..fs.browser import FsError, write_file
+
+    db = _db(request)
+    proj = _owned_project(db, pid, user, is_admin)
+    base = os.path.join(_project_workdir(db, proj), "sdm_requirements")
+
+    raw_name = (file.filename or "").replace("\\", "/")
+    name = os.path.basename(raw_name) or "requirement.bin"
+    data = await file.read()
+    try:
+        written = write_file(proj["owner"], os.path.join(base, uuid.uuid4().hex[:8]),
+                             name, data, get_settings().fs_root_list)
+    except FsError as e:
+        raise HTTPException(e.status, f"写入需求文档失败: {e.message}")
+
+    rid = db.add_requirement_doc(
+        pid, name=name, doc_type=doc_type,
+        source_file={"name": name, "size": len(data), "path": written["path"]},
+        note=note,
+    )
+    log.info("上传需求文档 project=%s rid=%s file=%s (%d 字节)", pid, rid, name, len(data))
+    return _row(db.get_requirement_doc(rid), REQUIREMENT_JSON)
+
+
+def _requirement_principal(
+    rid: str,
+    token: Optional[str] = Query(None),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    act_as: Optional[str] = Header(None, alias="X-Act-As-User"),
+) -> str:
+    """需求文档下载的调用者:常规用户令牌,或本 rid 的分析票据(vektor3d 用)。"""
+    raw = token or (creds.credentials if creds else None)
+    return resolve_scoped_principal(
+        raw, act_as, scope=DOC_ANALYZE_SCOPE, bindings={"rid": rid}
+    )
+
+
+def _requirement_is_admin(
+    user: str = Depends(_requirement_principal),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    portal_admin: Optional[str] = Header(None, alias="X-Hpc-Portal-Admin"),
+) -> bool:
+    """同 is_admin_request,但主体由 _requirement_principal 解析。
+
+    不能直接复用 is_admin_request:它依赖 current_user,而后者按设计拒绝一切
+    受限票据——那样 vektor3d 拿票据来拉文档会在这一步就 401。
+    """
+    return principal_is_admin(user, creds.credentials if creds else None, portal_admin)
+
+
+class AnalyzeTicket(BaseModel):
+    """交给浏览器、再转交 vektor3d 的一次性文档分析票据。
+
+    只读、只对这一份文档、以分钟计过期。与几何票据一样,URL 由前端用
+    window.location.origin 拼——后端看到的 base_url 不是浏览器真正访问的地址。
+    """
+    rid: str
+    token: str
+    expires_in: int
+    source_name: str
+    source_path_suffix: str = Field(description="文档下载路径（相对 /api）")
+
+
+@router.post("/requirements/{rid}/analyze-ticket")
+def create_analyze_ticket(
+    request: Request,
+    rid: str,
+    ttl_seconds: int = Query(1800, ge=60, le=7200),
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> AnalyzeTicket:
+    """为一次 AI 解析签发只读票据。只有常规用户令牌能调——票据不能自我续签。"""
+    db = _db(request)
+    row = _owned_requirement(db, rid, user, is_admin)
+    src = _json_or_none(row["source_file_json"]) or {}
+    if not src.get("path"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "该需求文档没有源文件")
+    token = issue_scoped_token(user, DOC_ANALYZE_SCOPE, ttl_seconds, rid=rid)
+    log.info("签发文档分析票据 rid=%s user=%s ttl=%ss", rid, user, ttl_seconds)
+    return AnalyzeTicket(
+        rid=rid,
+        token=token,
+        expires_in=ttl_seconds,
+        source_name=src.get("name") or os.path.basename(src["path"]),
+        source_path_suffix=f"/sim/requirements/{rid}/download",
+    )
+
+
+@router.get("/requirements/{rid}/download")
+def download_requirement_doc(
+    request: Request,
+    rid: str,
+    user: str = Depends(_requirement_principal),
+    is_admin: bool = Depends(_requirement_is_admin),
+):
+    from fastapi.responses import FileResponse
+
+    db = _db(request)
+    row = _owned_requirement(db, rid, user, is_admin)
+    src = _json_or_none(row["source_file_json"]) or {}
+    path = src.get("path")
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "需求文档不存在或已被删除")
+    return FileResponse(path, filename=src.get("name") or os.path.basename(path),
+                        media_type="application/octet-stream")
+
+
+@router.delete("/requirements/{rid}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_requirement_doc(
+    request: Request,
+    rid: str,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> None:
+    db = _db(request)
+    _owned_requirement(db, rid, user, is_admin)
+    db.delete_requirement_doc(rid)
+
+
+@router.post("/requirements/{rid}/extract")
+def extract_requirement_items(
+    request: Request,
+    rid: str,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """解析需求文档,产出需求条目。
+
+    走**确定性规则**,不上 AI:真实文档里分析项躺在规整表格里,规则抽得准,而且
+    抽错了能一眼看出是哪条规则的问题。重解析是整体替换而非追加——否则改一次
+    规则再跑一遍,库里就同时躺着新旧两版条目,谁也说不清哪条是当前口径。
+    """
+    from .requirements import extract_from_file, items_to_json
+
+    db = _db(request)
+    row = _owned_requirement(db, rid, user, is_admin)
+    src = _json_or_none(row["source_file_json"]) or {}
+    path = src.get("path")
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "需求文档不存在或已被删除")
+
+    try:
+        items = extract_from_file(path)
+    except ValueError as e:
+        db.set_requirement_analysis(rid, None, "failed")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+
+    payload = items_to_json(items)
+    count = db.replace_requirement_items(rid, payload)
+    summary = {
+        "itemCount": count,
+        "subjectCount": sum(1 for i in payload if i["category"] == "subject"),
+        "loadingCount": sum(1 for i in payload if i["category"] == "loading"),
+        "needsClarification": sum(1 for i in payload if i["needs_clarification"]),
+        "requiredCount": sum(1 for i in payload if i["baseline"] == "required"),
+        "loadPointTotal": sum(i["load_points"] for i in payload),
+        # 点位坐标在图上,文字层抽不到——把边界写进产出,免得下游误以为拿到了位置
+        "loadPointCoordsAvailable": False,
+        "extractor": "rule",
+    }
+    db.set_requirement_analysis(rid, summary, "done")
+    log.info("解析需求文档 rid=%s → %d 条条目(%d 待澄清)", rid, count,
+             summary["needsClarification"])
+    return {"summary": summary, "items": [_row(r, ITEM_JSON) for r in db.list_requirement_items(rid)]}
+
+
+class RequirementItemsIn(BaseModel):
+    """由 vektor3d 的 doc.analyze 产出、经浏览器回写的条目。
+
+    走浏览器回写而不是 vektor3d 直连写:写库是有副作用的操作,必须经过 SDM 自己的
+    鉴权与属主校验。让桌面端持一张能写库的票据,风险面比读大得多。
+    """
+    items: List[Dict]
+    summary: Optional[Dict] = None
+    extractor: str = "ai"
+
+
+@router.put("/requirements/{rid}/items")
+def replace_requirement_items(
+    request: Request,
+    rid: str,
+    body: RequirementItemsIn,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """整体替换条目。与规则解析同一个入口语义——重解析不追加,避免新旧两版并存。"""
+    db = _db(request)
+    _owned_requirement(db, rid, user, is_admin)
+
+    items = []
+    for raw in body.items:
+        if not str(raw.get("title") or "").strip():
+            continue
+        items.append({**raw, "extracted_by": raw.get("extracted_by") or body.extractor})
+    if not items:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "没有可写入的条目")
+
+    count = db.replace_requirement_items(rid, items)
+    summary = dict(body.summary or {})
+    summary.update({
+        "itemCount": count,
+        "subjectCount": sum(1 for i in items if i.get("category") == "subject"),
+        "loadingCount": sum(1 for i in items if i.get("category") == "loading"),
+        "needsClarification": sum(1 for i in items if i.get("needs_clarification")),
+        "requiredCount": sum(1 for i in items if i.get("baseline") == "required"),
+        "loadPointTotal": sum(int(i.get("load_points") or 0) for i in items),
+        # 无论谁抽的,这条边界不变:点位坐标在图上,文字层拿不到
+        "loadPointCoordsAvailable": False,
+        "extractor": body.extractor,
+    })
+    db.set_requirement_analysis(rid, summary, "done")
+    log.info("回写需求条目 rid=%s %d 条 extractor=%s", rid, count, body.extractor)
+    return {"summary": summary, "items": [_row(r, ITEM_JSON) for r in db.list_requirement_items(rid)]}
+
+
+@router.get("/requirements/{rid}/items")
+def list_requirement_items(
+    request: Request,
+    rid: str,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> List[Dict]:
+    db = _db(request)
+    _owned_requirement(db, rid, user, is_admin)
+    return [_row(r, ITEM_JSON) for r in db.list_requirement_items(rid)]
+
+
+class RequirementItemUpdate(BaseModel):
+    """人工修正一条条目。
+
+    改动一律记为 extracted_by=manual:规则抽的和人改过的必须分得开,
+    否则下次重解析会把人的修正无声冲掉而没人察觉。
+    """
+    title: Optional[str] = None
+    raw_text: Optional[str] = None
+    category: Optional[str] = None
+    baseline: Optional[str] = None
+    status: Optional[str] = None
+    needs_clarification: Optional[bool] = None
+    clarification_hint: Optional[str] = None
+
+
+@router.patch("/requirement-items/{iid}")
+def update_requirement_item(
+    request: Request,
+    iid: str,
+    body: RequirementItemUpdate,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    db = _db(request)
+    item = db.get_requirement_item(iid)
+    if item is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "需求条目不存在")
+    _owned_requirement(db, item["doc_id"], user, is_admin)
+
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    if "needs_clarification" in fields:
+        fields["needs_clarification"] = 1 if fields["needs_clarification"] else 0
+    if fields:
+        fields["extracted_by"] = "manual"
+        db.update_requirement_item(iid, **fields)
+    return _row(db.get_requirement_item(iid), ITEM_JSON)
+
+
+# --- 质量卡模板库与项目实例 ---------------------------------------------
+
+@router.get("/quality-templates")
+def list_quality_templates(
+    request: Request,
+    user: str = Depends(current_user),
+) -> List[Dict]:
+    """模板库:内置只读 + 用户自建。内置那张是所有项目的缺省底座。"""
+    from dataclasses import asdict
+
+    return [asdict(t) for t in _quality_library(request).list_templates()]
+
+
+@router.get("/quality-templates/{template_id}")
+def get_quality_template(
+    request: Request,
+    template_id: str,
+    user: str = Depends(current_user),
+) -> Dict:
+    try:
+        card = _quality_library(request).load(template_id)
+    except KeyError as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e))
+    return _quality_card_detail(card)
+
+
+class QualityCardCreate(BaseModel):
+    """从模板派生项目质量卡实例。
+
+    overrides 的每一项都要求 source(依据出处)。这不是形式要求:AI 从需求文档
+    生成实例时,没有出处的数值就是编的,而这个数字会一路流进网格验收。
+    """
+    template_id: str = DEFAULT_QUALITY_TEMPLATE
+    name: str = Field(min_length=1, max_length=200)
+    overrides: List[Dict] = Field(default_factory=list)
+    requirement_doc_id: Optional[str] = None
+
+
+@router.get("/projects/{pid}/quality-cards")
+def list_project_quality_cards(
+    request: Request,
+    pid: str,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> List[Dict]:
+    db = _db(request)
+    _owned_project(db, pid, user, is_admin)
+    return [_row(r, QUALITY_CARD_JSON) for r in db.list_quality_cards(pid)]
+
+
+@router.post("/projects/{pid}/quality-cards", status_code=status.HTTP_201_CREATED)
+def create_project_quality_card(
+    request: Request,
+    pid: str,
+    body: QualityCardCreate,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """派生实例。产物是**合法的 ANSA 卡**,可直接交回 ANSA 跑批处理。"""
+    from dataclasses import asdict
+
+    from .quality import Override, QualityCardLibrary
+
+    db = _db(request)
+    proj = _owned_project(db, pid, user, is_admin)
+    card_root = os.path.join(_project_workdir(db, proj), "sdm_quality_cards")
+    lib = QualityCardLibrary(user_dir=card_root)
+
+    overrides = []
+    for raw in body.overrides:
+        if not str(raw.get("source") or "").strip():
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"覆盖项 {raw.get('target')} 缺少依据(source)——无出处的阈值会一路流进网格验收",
+            )
+        overrides.append(Override(
+            target=str(raw.get("target") or ""),
+            old_value="",
+            new_value=str(raw.get("new_value") or ""),
+            source=str(raw.get("source") or ""),
+            by=str(raw.get("by") or user),
+        ))
+
+    instance_id = f"{pid[:8]}-{uuid.uuid4().hex[:6]}"
+    try:
+        meta = lib.derive(body.template_id, instance_id, body.name, overrides,
+                          source=proj["name"], scope="项目实例")
+    except (KeyError, ValueError) as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+
+    qid = db.add_quality_card(
+        pid, template_id=body.template_id, name=body.name,
+        card_dir=os.path.join(card_root, instance_id),
+        overrides=[asdict(o) for o in meta.overrides],
+        derived_from_doc_id=body.requirement_doc_id,
+    )
+    log.info("派生质量卡实例 project=%s card=%s 基于 %s,覆盖 %d 项",
+             pid, qid, body.template_id, len(meta.overrides))
+    return _row(db.get_quality_card(qid), QUALITY_CARD_JSON)
+
+
+@router.get("/quality-cards/{qid}")
+def get_project_quality_card(
+    request: Request,
+    qid: str,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """实例详情:元数据 + 解析后的判据与网格参数。"""
+    from .quality import QualityCardLibrary
+
+    db = _db(request)
+    row = _owned_quality_card(db, qid, user, is_admin)
+    out = _row(row, QUALITY_CARD_JSON)
+    card_dir = row["card_dir"]
+    if card_dir and os.path.isdir(card_dir):
+        lib = QualityCardLibrary(user_dir=os.path.dirname(card_dir))
+        out["card"] = _quality_card_detail(lib.load(os.path.basename(card_dir)))
+    return out
+
+
+@router.post("/quality-templates/import", status_code=status.HTTP_201_CREATED)
+async def import_quality_template(
+    request: Request,
+    template_id: str = Form(..., description="模板 id,英文数字与连字符"),
+    name: str = Form(...),
+    qual_file: UploadFile = File(..., description=".ansa_qual 判定侧"),
+    mpar_file: Optional[UploadFile] = File(None, description=".ansa_mpar 生成侧,可省略"),
+    source: str = Form(""),
+    revision: str = Form(""),
+    scope: str = Form(""),
+    description: str = Form(""),
+    user: str = Depends(current_user),
+) -> Dict:
+    """导入客户自己的质量卡,成为模板库里的一张模板。
+
+    mpar 允许缺省:有些客户只给判定准则、不给网格参数。缺省时沿用内置模板的
+    生成侧参数,并在 description 里注明——比塞一份空文件强,后者会让人以为
+    客户规定了这些参数。
+    """
+    import shutil
+
+    from .quality import QualityCardLibrary, ansa_mpar, ansa_qual
+    from .quality.library import BUILTIN_DIR, CRITERIA_FILE, MESH_FILE, META_FILE
+
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{1,63}", template_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "模板 id 只能用字母数字与 - _,长度 2~64")
+
+    lib = _quality_library(request)
+    dest = os.path.join(lib.user_dir, template_id)
+    if os.path.exists(dest):
+        raise HTTPException(status.HTTP_409_CONFLICT, f"模板已存在: {template_id}")
+
+    qual_text = (await qual_file.read()).decode("utf-8", errors="replace")
+    try:
+        parsed = ansa_qual.loads(qual_text)
+    except Exception as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"解析 .ansa_qual 失败: {e}")
+    if not parsed.data.criteria:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "这份 .ansa_qual 里没有解析出任何判据,请确认文件是否正确")
+
+    mpar_text = ""
+    inherited = False
+    if mpar_file is not None:
+        mpar_text = (await mpar_file.read()).decode("utf-8", errors="replace")
+        try:
+            ansa_mpar.loads(mpar_text)
+        except Exception as e:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"解析 .ansa_mpar 失败: {e}")
+    else:
+        with open(os.path.join(BUILTIN_DIR, DEFAULT_QUALITY_TEMPLATE, MESH_FILE),
+                  encoding="utf-8", newline="") as f:
+            mpar_text = f.read()
+        inherited = True
+
+    os.makedirs(dest)
+    try:
+        with open(os.path.join(dest, CRITERIA_FILE), "w", encoding="utf-8", newline="") as f:
+            f.write(qual_text)
+        with open(os.path.join(dest, MESH_FILE), "w", encoding="utf-8", newline="") as f:
+            f.write(mpar_text)
+        note = description
+        if inherited:
+            note = (note + " " if note else "") + \
+                   f"（未提供 .ansa_mpar，生成侧参数沿用内置模板 {DEFAULT_QUALITY_TEMPLATE}）"
+        with open(os.path.join(dest, META_FILE), "w", encoding="utf-8") as f:
+            json.dump({
+                "id": template_id, "name": name, "source": source, "revision": revision,
+                "scope": scope, "description": note, "builtin": False,
+                "based_on": "", "overrides": [],
+            }, f, ensure_ascii=False, indent=2)
+    except Exception:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+
+    log.info("导入质量卡模板 %s by=%s 判据 %d 条 mpar=%s",
+             template_id, user, len(parsed.data.criteria),
+             "继承内置" if inherited else "随包上传")
+    return _quality_card_detail(lib.load(template_id))
+
+
+class QualityCardEdit(BaseModel):
+    """在线编辑一张已派生的质量卡实例。
+
+    与派生时同一条规矩:每项改动必须带依据。改动直接落到 .ansa_qual/.ansa_mpar
+    上,因此编辑完的卡仍然是一份可直接交回 ANSA 的合法卡。
+    """
+    overrides: List[Dict] = Field(default_factory=list)
+
+
+@router.patch("/quality-cards/{qid}")
+def edit_quality_card(
+    request: Request,
+    qid: str,
+    body: QualityCardEdit,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """在线改阈值/网格参数。改动累加进 overrides,原样落进 ANSA 卡文件。"""
+    from dataclasses import asdict
+
+    from .quality import Override
+    from .quality.library import _apply_override
+    from .quality import ansa_mpar, ansa_qual
+    from .quality.library import CRITERIA_FILE, MESH_FILE
+
+    db = _db(request)
+    row = _owned_quality_card(db, qid, user, is_admin)
+    card_dir = row["card_dir"]
+    if not card_dir or not os.path.isdir(card_dir):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "质量卡文件不存在")
+
+    qual = ansa_qual.load(os.path.join(card_dir, CRITERIA_FILE))
+    mpar = ansa_mpar.load(os.path.join(card_dir, MESH_FILE))
+    applied = []
+    for raw in body.overrides:
+        if not str(raw.get("source") or "").strip():
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"覆盖项 {raw.get('target')} 缺少依据(source)——无出处的阈值会一路流进网格验收",
+            )
+        ov = Override(target=str(raw.get("target") or ""), old_value="",
+                      new_value=str(raw.get("new_value") or ""),
+                      source=str(raw.get("source") or ""), by=str(raw.get("by") or user))
+        try:
+            applied.append(_apply_override(qual, mpar, ov))
+        except (KeyError, ValueError) as e:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+
+    with open(os.path.join(card_dir, CRITERIA_FILE), "w", encoding="utf-8", newline="") as f:
+        f.write(qual.dumps())
+    with open(os.path.join(card_dir, MESH_FILE), "w", encoding="utf-8", newline="") as f:
+        f.write(mpar.dumps())
+
+    history = _json_or_none(row["overrides_json"]) or []
+    history.extend(asdict(o) for o in applied)
+    db.update_quality_card(qid, overrides_json=json.dumps(history, ensure_ascii=False))
+    log.info("在线编辑质量卡 %s 新增 %d 项覆盖 by=%s", qid, len(applied), user)
+    return get_project_quality_card(request, qid, user, is_admin)
+
+
+@router.get("/quality-cards/{qid}/export")
+def export_quality_card(
+    request: Request,
+    qid: str,
+    kind: str = Query("qual", description="qual=判定侧 .ansa_qual, mpar=生成侧 .ansa_mpar"),
+    user: str = Depends(current_user_query),
+    is_admin: bool = Depends(is_admin_request),
+):
+    """导出给 ANSA 用。文件是派生时就写好的,这里原样交付——不做二次生成,
+    避免"平台里看到的"与"ANSA 收到的"变成两份真相。"""
+    from fastapi.responses import FileResponse
+
+    from .quality.library import CRITERIA_FILE, MESH_FILE
+
+    db = _db(request)
+    row = _owned_quality_card(db, qid, user, is_admin)
+    card_dir = row["card_dir"]
+    if not card_dir or not os.path.isdir(card_dir):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "质量卡文件不存在")
+    fname = CRITERIA_FILE if kind == "qual" else MESH_FILE
+    path = os.path.join(card_dir, fname)
+    if not os.path.isfile(path):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"缺少 {fname}")
+    return FileResponse(path, filename=f"{row['name']}{os.path.splitext(fname)[1]}",
+                        media_type="application/octet-stream")
+
+
+@router.delete("/quality-cards/{qid}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_project_quality_card(
+    request: Request,
+    qid: str,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> None:
+    import shutil
+
+    db = _db(request)
+    row = _owned_quality_card(db, qid, user, is_admin)
+    if row["card_dir"] and os.path.isdir(row["card_dir"]):
+        shutil.rmtree(row["card_dir"], ignore_errors=True)
+    db.delete_quality_card(qid)
 
 
 # --- 工况模板 -----------------------------------------------------------

@@ -31,6 +31,13 @@ import type {
   SimProjectInput,
   SimGeometry,
   SimConvertTicket,
+  SimQualityCard,
+  SimQualityCardDetail,
+  SimQualityTemplate,
+  SimRequirementDoc,
+  SimRequirementItem,
+  SimExtractSummary,
+  SimAnalyzeTicket,
   SimResult,
   SimSubject,
   SimTarget,
@@ -696,6 +703,159 @@ export const simApi = {
       sourceUrl: `${origin}/api${data.source_path_suffix}`,
       uploadUrl: `${origin}/api${data.upload_path_suffix}`,
     };
+  },
+
+  // --- 客户需求文档 ---
+  async listRequirements(pid: string): Promise<SimRequirementDoc[]> {
+    const { data } = await http.get<SimRequirementDoc[]>(`/sim/projects/${pid}/requirements`);
+    return data;
+  },
+  async uploadRequirement(
+    pid: string,
+    file: File,
+    docType = "spec",
+    onProgress?: (pct: number) => void
+  ): Promise<SimRequirementDoc> {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("doc_type", docType);
+    const { data } = await http.post<SimRequirementDoc>(
+      `/sim/projects/${pid}/requirements/upload`,
+      form,
+      {
+        onUploadProgress: (e) => {
+          if (onProgress && e.total) onProgress(Math.round((e.loaded / e.total) * 100));
+        },
+      }
+    );
+    return data;
+  },
+  async deleteRequirement(rid: string): Promise<void> {
+    await http.delete(`/sim/requirements/${rid}`);
+  },
+  requirementDownloadUrl(rid: string): string {
+    return `/api/sim/requirements/${rid}/download?token=${encodeURIComponent(getToken() ?? "")}`;
+  },
+
+  /** 解析需求文档 → 需求条目（确定性规则，重解析整体替换） */
+  async extractRequirementItems(
+    rid: string
+  ): Promise<{ summary: SimExtractSummary; items: SimRequirementItem[] }> {
+    const { data } = await http.post(`/sim/requirements/${rid}/extract`);
+    return data;
+  },
+  /**
+   * 取一次 AI 解析的只读票据，并拼出 vektor3d 要用的下载地址。
+   *
+   * 与几何票据同理：URL 在前端拼——后端看到的 base_url 在开发/反代下都不是
+   * 浏览器与桌面真正能访问的地址。
+   */
+  async analyzeTicket(rid: string, ttlSeconds = 1800): Promise<SimAnalyzeTicket> {
+    const { data } = await http.post<{
+      rid: string;
+      token: string;
+      expires_in: number;
+      source_name: string;
+      source_path_suffix: string;
+    }>(`/sim/requirements/${rid}/analyze-ticket`, null, { params: { ttl_seconds: ttlSeconds } });
+    return {
+      rid: data.rid,
+      token: data.token,
+      expiresIn: data.expires_in,
+      sourceName: data.source_name,
+      sourceUrl: `${window.location.origin}/api${data.source_path_suffix}`,
+    };
+  },
+  /** 把 vektor3d 抽出的条目写回 SDM。整体替换，与规则解析同一语义 */
+  async putRequirementItems(
+    rid: string,
+    items: Record<string, unknown>[],
+    summary?: Record<string, unknown>,
+    extractor = "ai"
+  ): Promise<{ summary: SimExtractSummary; items: SimRequirementItem[] }> {
+    const { data } = await http.put(`/sim/requirements/${rid}/items`, { items, summary, extractor });
+    return data;
+  },
+  async listRequirementItems(rid: string): Promise<SimRequirementItem[]> {
+    const { data } = await http.get<SimRequirementItem[]>(`/sim/requirements/${rid}/items`);
+    return data;
+  },
+  async updateRequirementItem(
+    iid: string,
+    body: Partial<Pick<SimRequirementItem, "title" | "raw_text" | "category" | "baseline" | "status">>
+      & { needs_clarification?: boolean; clarification_hint?: string }
+  ): Promise<SimRequirementItem> {
+    const { data } = await http.patch<SimRequirementItem>(`/sim/requirement-items/${iid}`, body);
+    return data;
+  },
+
+  // --- 质量卡：模板库与项目实例 ---
+  async listQualityTemplates(): Promise<SimQualityTemplate[]> {
+    const { data } = await http.get<SimQualityTemplate[]>("/sim/quality-templates");
+    return data;
+  },
+  async getQualityTemplate(templateId: string): Promise<SimQualityCardDetail> {
+    const { data } = await http.get<SimQualityCardDetail>(`/sim/quality-templates/${templateId}`);
+    return data;
+  },
+  async listQualityCards(pid: string): Promise<SimQualityCard[]> {
+    const { data } = await http.get<SimQualityCard[]>(`/sim/projects/${pid}/quality-cards`);
+    return data;
+  },
+  async createQualityCard(
+    pid: string,
+    body: {
+      name: string;
+      template_id?: string;
+      requirement_doc_id?: string | null;
+      overrides?: { target: string; new_value: string; source: string }[];
+    }
+  ): Promise<SimQualityCard> {
+    const { data } = await http.post<SimQualityCard>(`/sim/projects/${pid}/quality-cards`, body);
+    return data;
+  },
+  async getQualityCard(qid: string): Promise<SimQualityCard & { card?: SimQualityCardDetail }> {
+    const { data } = await http.get(`/sim/quality-cards/${qid}`);
+    return data;
+  },
+  async deleteQualityCard(qid: string): Promise<void> {
+    await http.delete(`/sim/quality-cards/${qid}`);
+  },
+  /** 导入客户的质量卡文件成为模板。mpar 可省略——有些客户只给判定准则 */
+  async importQualityTemplate(body: {
+    template_id: string;
+    name: string;
+    qualFile: File;
+    mparFile?: File | null;
+    source?: string;
+    revision?: string;
+    scope?: string;
+    description?: string;
+  }): Promise<SimQualityCardDetail> {
+    const form = new FormData();
+    form.append("template_id", body.template_id);
+    form.append("name", body.name);
+    form.append("qual_file", body.qualFile);
+    if (body.mparFile) form.append("mpar_file", body.mparFile);
+    for (const k of ["source", "revision", "scope", "description"] as const) {
+      if (body[k]) form.append(k, body[k] as string);
+    }
+    const { data } = await http.post<SimQualityCardDetail>(
+      "/sim/quality-templates/import",
+      form
+    );
+    return data;
+  },
+  /** 在线编辑实例：改动直接落进 .ansa_qual/.ansa_mpar，每项必须带依据 */
+  async editQualityCard(
+    qid: string,
+    overrides: { target: string; new_value: string; source: string }[]
+  ): Promise<SimQualityCard & { card?: SimQualityCardDetail }> {
+    const { data } = await http.patch(`/sim/quality-cards/${qid}`, { overrides });
+    return data;
+  },
+  qualityCardExportUrl(qid: string, kind: "qual" | "mpar"): string {
+    return `/api/sim/quality-cards/${qid}/export?kind=${kind}&token=${encodeURIComponent(getToken() ?? "")}`;
   },
 
   // --- 工况 ---

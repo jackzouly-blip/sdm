@@ -27,3 +27,7 @@ frontend/dist/
 
 # 构建缓存
 frontend/tsconfig.tsbuildinfo
+
+# 客户参考资料(需求文档/规范/质量卡原件):体积大且含客户信息,不入库。
+# 其中作为内置模板的 5mm 卡已单独拷进 backend/app/sim/quality/templates/。
+ref/

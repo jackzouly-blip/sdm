@@ -125,6 +125,65 @@ CREATE TABLE IF NOT EXISTS sim_mesh_version (
 );
 CREATE INDEX IF NOT EXISTS idx_sim_mesh_geom ON sim_mesh_version(sim_geometry_version_id);
 
+-- 客户需求文档。仿真项目的输入源头：主机厂给的 CAE 分析规范/技术协议，
+-- 质量卡实例最终要从它推导出来（哪几项按客户要求改、依据是哪一句）。
+-- analysis_json 存 AI 的结构化分析产出；未分析时为空，不影响文档本身的归档。
+CREATE TABLE IF NOT EXISTS sim_requirement_doc (
+    id             TEXT PRIMARY KEY,
+    sim_project_id TEXT NOT NULL REFERENCES sim_project(id) ON DELETE CASCADE,
+    name           TEXT NOT NULL,
+    doc_type       TEXT NOT NULL DEFAULT 'spec',   -- spec/agreement/standard/other
+    source_file_json TEXT,
+    analysis_json  TEXT,
+    analysis_status TEXT NOT NULL DEFAULT 'pending', -- pending/analyzing/done/failed
+    note           TEXT,
+    created_at     REAL NOT NULL,
+    updated_at     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sim_req_project ON sim_requirement_doc(sim_project_id);
+
+-- 需求条目：需求文档解析出的最小可追溯单元。
+-- 每条带 source_ref（第几页/表格第几行），人能立刻回原文核对——条目的价值全在
+-- 可追溯，不可追溯的条目还不如不抽。metrics_json 是量纲化的指标数组。
+CREATE TABLE IF NOT EXISTS sim_requirement_item (
+    id             TEXT PRIMARY KEY,
+    doc_id         TEXT NOT NULL REFERENCES sim_requirement_doc(id) ON DELETE CASCADE,
+    seq            TEXT NOT NULL DEFAULT '',
+    category       TEXT NOT NULL,          -- subject/loading/mesh/delivery/other
+    title          TEXT NOT NULL,
+    raw_text       TEXT NOT NULL,          -- 原文，永远保留
+    metrics_json   TEXT,
+    baseline       TEXT NOT NULL DEFAULT '',  -- required=合格 / reference=参考
+    project_note   TEXT,
+    source_ref     TEXT NOT NULL DEFAULT '',
+    needs_clarification INTEGER NOT NULL DEFAULT 0,
+    clarification_hint  TEXT,
+    load_points    INTEGER NOT NULL DEFAULT 0,
+    indenter_diameter_mm REAL,
+    extracted_by   TEXT NOT NULL DEFAULT 'rule',   -- rule/ai/manual
+    status         TEXT NOT NULL DEFAULT 'draft',  -- draft/confirmed/dropped
+    created_at     REAL NOT NULL,
+    updated_at     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sim_req_item_doc ON sim_requirement_item(doc_id);
+
+-- 项目的质量卡实例。它不是一份独立的卡，而是"基于哪张模板 + 改了哪几项 + 每项依据"。
+-- 派生出的 .ansa_qual/.ansa_mpar 落在项目工作目录，card_dir 指向它——那两个文件
+-- 本身就是合法的 ANSA 卡，可直接交回 ANSA 跑批处理，不需要二次转换。
+CREATE TABLE IF NOT EXISTS sim_quality_card (
+    id             TEXT PRIMARY KEY,
+    sim_project_id TEXT NOT NULL REFERENCES sim_project(id) ON DELETE CASCADE,
+    template_id    TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    card_dir       TEXT,
+    overrides_json TEXT,        -- [{target, old_value, new_value, source, by}]
+    derived_from_doc_id TEXT,   -- 由哪份需求文档推导而来，可空（人工建卡时无）
+    status         TEXT NOT NULL DEFAULT 'active',
+    created_at     REAL NOT NULL,
+    updated_at     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sim_qcard_project ON sim_quality_card(sim_project_id);
+
 -- 工况模板：一类工况的方法论载体，三个 json 共同构成 AI 的约束边界。
 CREATE TABLE IF NOT EXISTS sim_template (
     id                    TEXT PRIMARY KEY,
@@ -451,6 +510,135 @@ class SimDB(PipelineStoreMixin):
             "UPDATE sim_mesh_version SET quality_json=? WHERE id=?",
             (json.dumps(quality, ensure_ascii=False), mid),
         )
+
+    # --- 客户需求文档 ---------------------------------------------------
+
+    def add_requirement_doc(
+        self,
+        sim_project_id: str,
+        name: str,
+        doc_type: str = "spec",
+        source_file: Optional[Dict] = None,
+        note: Optional[str] = None,
+    ) -> str:
+        rid = _uid()
+        now = time.time()
+        self._write(
+            """INSERT INTO sim_requirement_doc
+               (id, sim_project_id, name, doc_type, source_file_json, analysis_json,
+                analysis_status, note, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (rid, sim_project_id, name, doc_type,
+             json.dumps(source_file, ensure_ascii=False) if source_file else None, None,
+             "pending", note, now, now),
+        )
+        return rid
+
+    def list_requirement_docs(self, sim_project_id: str) -> List[sqlite3.Row]:
+        return self._all(
+            "SELECT * FROM sim_requirement_doc WHERE sim_project_id=? ORDER BY created_at",
+            (sim_project_id,),
+        )
+
+    def get_requirement_doc(self, rid: str) -> Optional[sqlite3.Row]:
+        return self._one("SELECT * FROM sim_requirement_doc WHERE id=?", (rid,))
+
+    def set_requirement_analysis(self, rid: str, analysis: Optional[Dict], status: str) -> None:
+        self._update("sim_requirement_doc", rid, {
+            "analysis_json": json.dumps(analysis, ensure_ascii=False) if analysis else None,
+            "analysis_status": status,
+        })
+
+    def delete_requirement_doc(self, rid: str) -> bool:
+        return self._write("DELETE FROM sim_requirement_doc WHERE id=?", (rid,)) > 0
+
+    # --- 需求条目 -------------------------------------------------------
+
+    def replace_requirement_items(self, doc_id: str, items: List[Dict]) -> int:
+        """整体替换一份文档的条目。
+
+        重解析是幂等的：先清后插，而不是追加——否则改一次解析规则再跑一遍，
+        库里就会同时躺着新旧两版条目，谁也说不清哪条是当前口径。
+        """
+        now = time.time()
+        with self._lock:
+            self.conn.execute("DELETE FROM sim_requirement_item WHERE doc_id=?", (doc_id,))
+            for it in items:
+                self.conn.execute(
+                    """INSERT INTO sim_requirement_item
+                       (id, doc_id, seq, category, title, raw_text, metrics_json, baseline,
+                        project_note, source_ref, needs_clarification, clarification_hint,
+                        load_points, indenter_diameter_mm, extracted_by, status,
+                        created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (_uid(), doc_id, it.get("seq", ""), it["category"], it["title"],
+                     it.get("raw_text", ""),
+                     json.dumps(it.get("metrics") or [], ensure_ascii=False),
+                     it.get("baseline", ""), it.get("project_note"),
+                     it.get("source_ref", ""), 1 if it.get("needs_clarification") else 0,
+                     it.get("clarification_hint"), int(it.get("load_points") or 0),
+                     it.get("indenter_diameter_mm"), it.get("extracted_by", "rule"),
+                     "draft", now, now),
+                )
+            self.conn.commit()
+        return len(items)
+
+    def list_requirement_items(self, doc_id: str) -> List[sqlite3.Row]:
+        return self._all(
+            "SELECT * FROM sim_requirement_item WHERE doc_id=? ORDER BY category DESC, rowid",
+            (doc_id,),
+        )
+
+    def get_requirement_item(self, iid: str) -> Optional[sqlite3.Row]:
+        return self._one("SELECT * FROM sim_requirement_item WHERE id=?", (iid,))
+
+    def update_requirement_item(self, iid: str, **fields) -> None:
+        allowed = {"title", "raw_text", "category", "baseline", "status",
+                   "metrics_json", "needs_clarification", "clarification_hint",
+                   "extracted_by"}
+        self._update("sim_requirement_item", iid,
+                     {k: v for k, v in fields.items() if k in allowed})
+
+    # --- 质量卡实例 -----------------------------------------------------
+
+    def add_quality_card(
+        self,
+        sim_project_id: str,
+        template_id: str,
+        name: str,
+        card_dir: Optional[str] = None,
+        overrides: Optional[List[Dict]] = None,
+        derived_from_doc_id: Optional[str] = None,
+    ) -> str:
+        qid = _uid()
+        now = time.time()
+        self._write(
+            """INSERT INTO sim_quality_card
+               (id, sim_project_id, template_id, name, card_dir, overrides_json,
+                derived_from_doc_id, status, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (qid, sim_project_id, template_id, name, card_dir,
+             json.dumps(overrides or [], ensure_ascii=False),
+             derived_from_doc_id, "active", now, now),
+        )
+        return qid
+
+    def list_quality_cards(self, sim_project_id: str) -> List[sqlite3.Row]:
+        return self._all(
+            "SELECT * FROM sim_quality_card WHERE sim_project_id=? ORDER BY created_at",
+            (sim_project_id,),
+        )
+
+    def get_quality_card(self, qid: str) -> Optional[sqlite3.Row]:
+        return self._one("SELECT * FROM sim_quality_card WHERE id=?", (qid,))
+
+    def update_quality_card(self, qid: str, **fields) -> None:
+        allowed = {"name", "card_dir", "overrides_json", "status", "template_id"}
+        self._update("sim_quality_card", qid,
+                     {k: v for k, v in fields.items() if k in allowed})
+
+    def delete_quality_card(self, qid: str) -> bool:
+        return self._write("DELETE FROM sim_quality_card WHERE id=?", (qid,)) > 0
 
     # --- 工况模板 -------------------------------------------------------
 

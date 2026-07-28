@@ -1,0 +1,9 @@
+{
+  "id": "generic-crash-5mm",
+  "name": "碰撞通用 5mm 网格卡",
+  "source": "通用规范（缺省）",
+  "revision": "1",
+  "scope": "碰撞 / 钣金壳网格 / 目标单元 5mm / LS-DYNA",
+  "description": "作为所有仿真项目的缺省模板。判据侧启用 11 条 shells 判据（solids 全关，因为碰撞以壳为主）；生成侧目标单元 5mm、下限 3mm、上限 8mm。客户有自己的规范时应新建模板覆盖，而不是改这张。",
+  "builtin": true
+}

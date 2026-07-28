@@ -18,6 +18,7 @@ import type {
 } from "@/api/types";
 import { ArrowLeft, Boxes, ChevronRight, Eye, FolderCog, Loader2, Plus, Trash2 } from "lucide-vue-next";
 import GeometryPanel from "./GeometryPanel.vue";
+import RequirementPanel from "./RequirementPanel.vue";
 import GeometryViewer from "./GeometryViewer.vue";
 
 const props = defineProps<{ pid: string }>();
@@ -28,18 +29,23 @@ const targets = ref<SimTarget[]>([]);
 const subjects = ref<SimSubject[]>([]);
 const jobs = ref<SimJob[]>([]);
 const results = ref<SimResult[]>([]);
+// 只取条数用于 tab 角标；明细由 RequirementPanel 自己加载，避免两处各拉一份
+const requirementCount = ref(0);
 const loading = ref(true);
 const error = ref("");
 
-type Tab = "targets" | "subjects" | "jobs" | "results";
+type Tab = "requirements" | "targets" | "subjects" | "jobs" | "results";
 const tab = ref<Tab>("targets");
 const TABS: { key: Tab; label: string }[] = [
+  // 需求排在最前:整条链是 需求 → 质量卡 → 几何 → 网格 → 工况 → 作业 → 结果
+  { key: "requirements", label: "客户需求" },
   { key: "targets", label: "分析对象" },
   { key: "subjects", label: "工况" },
   { key: "jobs", label: "作业" },
   { key: "results", label: "结果" },
 ];
 const counts = computed<Record<Tab, number>>(() => ({
+  requirements: requirementCount.value,
   targets: targets.value.length,
   subjects: subjects.value.length,
   jobs: jobs.value.length,
@@ -67,13 +73,15 @@ async function load() {
   loading.value = true;
   error.value = "";
   try {
-    const [p, t, s, j, r] = await Promise.all([
+    const [p, t, s, j, r, reqs] = await Promise.all([
       simApi.getProject(props.pid),
       simApi.listTargets(props.pid),
       simApi.listSubjects(props.pid),
       simApi.listProjectJobs(props.pid),
       simApi.listProjectResults(props.pid),
+      simApi.listRequirements(props.pid),
     ]);
+    requirementCount.value = reqs.length;
     project.value = p;
     targets.value = t;
     subjects.value = s;
@@ -284,8 +292,11 @@ onMounted(load);
         </button>
       </div>
 
+      <!-- 客户需求与质量卡 -->
+      <RequirementPanel v-if="tab === 'requirements'" :pid="pid" />
+
       <!-- 分析对象 -->
-      <div v-if="tab === 'targets'">
+      <div v-else-if="tab === 'targets'">
         <div class="flex gap-2 mb-3">
           <input
             v-model="newTarget.name"

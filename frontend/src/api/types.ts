@@ -486,6 +486,141 @@ export interface SimConvertTicket {
   uploadUrl: string;
 }
 
+/** 客户需求文档：仿真项目的输入源头，质量卡实例最终要从它推导出来 */
+export interface SimRequirementDoc {
+  id: string;
+  sim_project_id: string;
+  name: string;
+  doc_type: string;
+  source_file: { name: string; size: number; path: string } | null;
+  /** AI 分析产出；未接入时为 null */
+  analysis: Record<string, unknown> | null;
+  analysis_status: "pending" | "analyzing" | "done" | "failed";
+  note: string | null;
+  created_at: number;
+}
+
+/** 一个量纲化的指标。kind 区分主判定值/内控值/对外目标/项目例外 */
+export interface SimRequirementMetric {
+  quantity: string;
+  op: string;
+  value: number;
+  unit: string;
+  raw: string;
+  kind: "target" | "internal" | "external" | "override";
+  scope: string;
+}
+
+/** 需求条目：需求进入平台后的最小可追溯单元 */
+export interface SimRequirementItem {
+  id: string;
+  doc_id: string;
+  seq: string;
+  category: "subject" | "loading" | "mesh" | "delivery" | "other";
+  title: string;
+  raw_text: string;
+  metrics: SimRequirementMetric[];
+  /** required=合格(验收门槛) / reference=参考 */
+  baseline: string;
+  project_note: string | null;
+  /** 原文出处，如「第1页 表1 第3行」——条目的价值全在可追溯 */
+  source_ref: string;
+  needs_clarification: number;
+  clarification_hint: string | null;
+  load_points: number;
+  indenter_diameter_mm: number | null;
+  extracted_by: "rule" | "ai" | "manual";
+  status: string;
+}
+
+/** 一次 AI 解析的只读票据。交给桌面端 vektor3d，让它自己来拉文档原件 */
+export interface SimAnalyzeTicket {
+  rid: string;
+  token: string;
+  expiresIn: number;
+  sourceName: string;
+  sourceUrl: string;
+}
+
+export interface SimExtractSummary {
+  itemCount: number;
+  subjectCount: number;
+  loadingCount: number;
+  needsClarification: number;
+  requiredCount: number;
+  loadPointTotal: number;
+  /** 点位坐标在图上，文字层抽不到 */
+  loadPointCoordsAvailable: boolean;
+  extractor: string;
+  /** AI 读不懂/有矛盾/缺失之处，逐条说明 */
+  notes?: string[];
+}
+
+export interface SimQualityTemplate {
+  id: string;
+  name: string;
+  source: string;
+  revision: string;
+  scope: string;
+  description: string;
+  builtin: boolean;
+  based_on: string;
+  overrides: SimQualityOverride[];
+}
+
+export interface SimQualityOverride {
+  target: string;
+  old_value: string;
+  new_value: string;
+  /** 依据出处。AI 生成时必填——无出处的阈值就是编的 */
+  source: string;
+  by: string;
+}
+
+/** 一条质量判据。calculation 是算法族：同一指标按 NASTRAN 与按 IDEAS 算数值不同 */
+export interface SimQualityCriterion {
+  name: string;
+  domain: string;
+  calculation: string;
+  weight: number;
+  higherIsBetter: boolean;
+  thresholds: { best: number | null; good: number | null; failed: number | null; worst: number | null };
+}
+
+export interface SimQualityCardDetail {
+  id: string;
+  name: string;
+  source: string;
+  revision: string;
+  scope: string;
+  description: string;
+  builtin: boolean;
+  ansaVersion: string;
+  criteria: SimQualityCriterion[];
+  meshParams: {
+    targetElementLength: number;
+    minTargetLength: number;
+    maxTargetLength: number;
+    elementType: string;
+    featureHandling: string;
+  };
+  /** 判废线上的最小单元长度对应的显式时间步(秒)——碰撞机时的总闸 */
+  timeStepAtFailedMinLength: number;
+}
+
+export interface SimQualityCard {
+  id: string;
+  sim_project_id: string;
+  template_id: string;
+  name: string;
+  card_dir: string | null;
+  overrides: SimQualityOverride[];
+  derived_from_doc_id: string | null;
+  status: string;
+  created_at: number;
+  card?: SimQualityCardDetail;
+}
+
 export interface SimGeometry {
   id: string;
   sim_target_id: string;
