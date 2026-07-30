@@ -16,5 +16,6 @@ from .extract import (  # noqa: F401
     extract_from_slides,
     items_to_json,
 )
+from .merge import merge_rule_and_ai  # noqa: F401
 from .metrics import Metric, count_load_points, extract_diameter, extract_metrics  # noqa: F401
 from .pptx_reader import Slide, read_slides  # noqa: F401

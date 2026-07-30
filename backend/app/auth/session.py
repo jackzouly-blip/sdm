@@ -70,15 +70,14 @@ def _resolve_principal(
     raw_token: Optional[str],
     act_as: Optional[str],
     *,
-    allow_scope: Optional[str] = None,
-    bindings: Optional[dict] = None,
+    allow_scopes: Optional[dict] = None,
 ) -> str:
     """把凭据解析成目标用户名；未登录/过期/无效则 401。
 
-    带 `scp` 的受限令牌**默认一律拒绝**：只有把 allow_scope 显式传成同名 scope 的
-    接口才接受它，并逐条核对 bindings（如 gid 必须等于路径上的那一个）。
-    默认拒绝是关键——反过来做成"默认接受、个别接口排除"，漏掉一个接口就等于
-    把受限令牌变成了通行证。
+    带 `scp` 的受限令牌**默认一律拒绝**：只有把该 scope 列进 allow_scopes
+    （scope → bindings，如 {"gid": 路径上的那一个}）的接口才接受它，并逐条核对
+    bindings。默认拒绝是关键——反过来做成"默认接受、个别接口排除"，漏掉一个
+    接口就等于把受限令牌变成了通行证。
     """
     if not raw_token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未登录")
@@ -95,12 +94,12 @@ def _resolve_principal(
     payload = _decode_or_401(raw_token)
     scope = payload.get("scp")
     if scope:
-        if scope != allow_scope:
+        if scope not in (allow_scopes or {}):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=f"该令牌仅限 {scope} 用途，不能用于此接口",
             )
-        for key, expected in (bindings or {}).items():
+        for key, expected in (allow_scopes or {})[scope].items():
             if payload.get(key) != expected:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -121,7 +120,20 @@ def resolve_scoped_principal(
     放在这里而不是各业务模块自己解 JWT：签发与校验必须共用一处，
     否则 scp 的默认拒绝语义迟早会在某个模块里被绕过。
     """
-    return _resolve_principal(raw_token, act_as, allow_scope=scope, bindings=bindings)
+    return _resolve_principal(raw_token, act_as, allow_scopes={scope: bindings})
+
+
+def resolve_multi_scoped_principal(
+    raw_token: Optional[str],
+    act_as: Optional[str],
+    *,
+    allow_scopes: dict,
+) -> str:
+    """同上，但一个接口可接受多种受限令牌（scope → bindings 各查各的）。
+
+    场景：需求文档下载既收单文档的 doc.analyze 票据，也收整项目的 ai.read 票据。
+    """
+    return _resolve_principal(raw_token, act_as, allow_scopes=allow_scopes)
 
 
 def current_user(

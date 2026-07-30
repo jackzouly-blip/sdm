@@ -12,12 +12,14 @@ import type { Component } from "vue";
 import {
   BarChart3,
   Boxes,
+  ClipboardCheck,
   Cpu,
   FileCode,
   FileCog,
   FlaskConical,
   FolderTree,
   GitBranch,
+  Layers,
   ListTodo,
   Server,
   SlidersHorizontal,
@@ -78,6 +80,8 @@ export const APPS: AppDef[] = [
       { name: "sim-projects", label: "仿真项目", icon: FlaskConical },
       { name: "sim-pipelines", label: "编排", icon: GitBranch },
       { name: "sim-templates", label: "工况模板", icon: FileCode },
+      { name: "sim-quality-templates", label: "质量卡模板", icon: ClipboardCheck },
+      { name: "sim-materials", label: "材料库", icon: Layers },
     ],
   },
   {

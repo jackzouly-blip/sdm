@@ -245,11 +245,226 @@ meshopt 压缩加 `maxTriangles` 预算解决。
 输入同上但**不需要 `uploadUrl`**；输出为 `2.1` 中除 `uploaded`/`format`/`bytes`
 之外的那部分元数据，外加 `issues: [{level, code, message}]`。
 
-### 2.3 `mesh.generate` / `mesh.check`（后续，不阻塞本次）
+### 2.3 `mesh.generate`（已上线）
 
-这两个是仿真流程真正需要的，但可以等 `geometry.convert` 落地之后再谈。
-SDM 的编排引擎里已经预留了 `capability.invoke` 节点类型，能力一上线即可挂载，
-DAG 定义只改一处。
+CAD 原文件 → 本机 BETA CAE ANSA 无头批处理 → 求解器网格文件，产物直传回 SDM。
+调用通路、鉴权、文件收发方向与 `geometry.convert` 完全一致；作业跑在独立的
+算法队列上，不会与 AI 能力(需求分析等)互相排队。
+
+三条与几何能力不同的约定：
+
+1. **输入用 CAD 原文件**（.CATPart/.stp/.igs 等，zip 装配包同 2.1 规则）：
+   ANSA 自带 CAD 转换器直读，不经 vektor3d 的转换链二次转换。
+2. **网格参数与质量准则是文档**：SDM 质量卡以 `.ansa_mpar`（网格参数）/
+   `.ansa_qual`（质量准则）附件形态透传给 ANSA，vektor3d 不解析其内容。
+   都不给时按 ANSA 默认参数（可用 `options.elementLength` 给目标单元尺寸）。
+3. **质量违例不算失败**：`violationsRemain: true` 表示仍有质量违例或未网格化的
+   宏面，网格文件照常回传，由 SDM 决定是否接受。
+
+输入（完整 schema 见 `GET /v1/capabilities`）：
+
+```jsonc
+{
+  "sourceUrl":          "…/download",        // CAD 原文件（必填）
+  "authToken":          "…",                 // 短期票据（必填）
+  "sourceName":         "xxx.CATPart",       // 原始文件名（必填）
+  "uploadUrl":          "…/mesh-file",       // 求解器网格文件回传（必填）
+  "ansaUploadUrl":      "…/mesh-ansa",       // 强烈建议：ANSA 原生库（.ansa，网格正本）
+  "previewUploadUrl":   "…/mesh-preview",    // 可选：网格预览 GLB（见下）
+  "reportUploadUrl":    "…/mesh-report",     // 可选：质量统计报告（HTML）
+  "meshParamsUrl":      "…",                 // 可选：.ansa_mpar 文档
+  "qualityCriteriaUrl": "…",                 // 可选：.ansa_qual 文档
+  "options": {
+    "solverFormat": "nastran",               // nastran（默认）| abaqus
+    "elementLength": 5,                      // 目标单元尺寸 mm（无 mpar 时生效）
+    "meshType": "surface",                   // surface（默认）| volume（几何须构成封闭体）
+    "timeoutSeconds": 3600                   // 默认 3600，上限 14400
+  }
+}
+```
+
+`meshType: "volume"` 在导入期直接从 CAD 实体建体（CATIA/NX/SolidWorks/STEP 等
+经 CT 转换器），随后四面体填充（TETRA RAPID，失败自动改试 TETRA FEM）。
+三条体网格特有约束：
+
+- 几何必须是封闭实体；钣金/开放曲面会失败并说明原因。
+- 网格参数/质量准则文档是面网格会话专属，体网格模式暂不套用（warnings 里会标注）；
+  体网格的质量结论请用 `mesh.check`。
+- 细小特征（如螺纹）可能因边界面网格自相交而失败，错误信息会说明；
+  此时应简化几何或等参数文档细化能力（后续阶段）。
+
+`meshType: "midsurface"` 做**中面抽取**（MidSurfAuto）：从实体皮面几何直接生成
+**带厚度的中面壳网格**（厚度赋在属性上），是薄壁件壳分析的工程实践形态。
+两个专用选项：`options.minThickness`（实体最小壁厚 mm，默认 1.0，与实际不符会
+识别失败）、`options.exactMiddle`（精确中面，默认关）。适用边界（真机实证）：
+
+- **适用**：壁厚均匀的薄壁件（钣金/折弯/铸件薄壁区）——铜巴件 4 秒出带厚度中面；
+- **不适用**：厚实体为主的机加件——自动中面算法可能数小时不收敛
+  （相机支架 26MB 实测 60 分钟未收敛），超时错误里会给出改用
+  surface/volume 的建议。这类零件的壳模型依赖工程师手工中面，不在自动化范围。
+
+关于**边界层/包面**（CFD 前处理）：无头模式基础设施已验证可行（Wrap/Layers
+会话与场景创建、运行均稳定），但默认参数下产不出有意义的网格——包面长度、
+层定义等必须来自真实 CFD 需求。当前不提供独立的 meshType；有 CFD 场景时，
+经 `meshParamsUrl` 传入含 wrap/layers 参数段的完整 `.ansa_mpar` 即可落地。
+
+输出要点：`engine/engineVersion`（ANSA 版本，供追溯）、`elementCount/shellCount/
+solidCount/nodeCount/partCount`、`violationsRemain`、
+`meshParamsApplied/qualityCriteriaApplied`（文档是否真的套用成功）、`warnings`。
+
+就绪前提：该桌面节点装有 ANSA 且许可证可达（`ready()` 会如实报告），
+运行一次作业占用一个 ANSA 许可席位。取消作业会真正终止 ANSA 进程。
+
+### 2.4 `mesh.check`（已上线）
+
+对既有网格按质量卡做独立质量检查，闭合「生成 → 审核」环。只回统计结论，
+不产网格文件。输入：`meshUrl / meshName / authToken`（必填），
+`qualityCriteriaUrl`（可选，`.ansa_qual` 质量卡；不传则按 ANSA 默认准则检查，
+并在 `qualityCriteriaApplied: false` 与 warnings 里如实标注），
+`options.meshFormat`（nastran 默认 | abaqus）。
+
+输出要点：`offCounts`（`{shells: {准则名: 违例数}, solids: {…}}` 逐准则统计）、
+`violationCount`（违例单元总数）、`passed`（违例为 0）、
+`elementCount/shellCount/solidCount/nodeCount`。
+
+**网格预览是"审查级"的**：GLB 从 Nastran 派生文件构建——四边形单元保持
+四边形观感、含**真实单元边线**（LINES 图元）、按 PID 分组上色，用现有 glTF
+浏览链直接渲染。超大网格（默认 >50 万面）只出面片不出边线并在 warnings 标注；
+`.nas` 解析失败时回退 STL 三角面片预览（`previewSource` 字段如实标注来源）。
+
+**`.ansa` 是网格的正本**：几何+网格+属性+厚度全量保留。SDM 落库之后，
+手工微调（工程师用 ANSA 打开无损）、装配合并、按需导出任意求解器格式
+（`mesh.export`）都以它为源；`uploadUrl` 回传的求解器文件只是派生产物。
+每次生成都应传 `ansaUploadUrl` 保存正本。
+
+### 2.5 `mesh.params.derive`（已上线）
+
+把**人读的质量卡文档**（.docx/.xlsx/.pdf 等）解析成 ANSA 能直接吃的参数文件，
+打通「SDM 质量卡是普通文档」的真实场景。AI（agents/cae-mesh-quality-analyst.md）
+只负责从文档抽结构化参数；`.ansa_mpar`/`.ansa_qual` 的文件结构由确定性渲染器保证
+（模板取自 ANSA 导出的默认文件，只补丁文档明确给出的值）。
+
+输入：`projectId / sourceUrl / sourceName`（必填，原件归档进对应工作区），
+`authToken / hint` 可选。属 AI 能力（`kind: ai-skill`），走 AI 队列，需引擎就绪。
+
+输出要点：`ansaMpar / ansaQual`（渲染好的文件**文本**，SDM 落库为附件后，
+经 `meshParamsUrl / qualityCriteriaUrl` 喂给 `mesh.generate`，或喂给 `mesh.check`；
+无可套用内容时为 null，绝不返回"全默认值"文件冒充质量卡配置）、
+`meshParams / qualityCriteria`（结构化抽取结果，供 SDM 展示与人工核对）、
+`unmapped`（映射不进 ANSA 准则表的条目，原文保留）、
+`renderWarnings / notes`（渲染丢弃项与 AI 的疑问，逐条可读）。
+
+推荐编排：质量卡上传 → `mesh.params.derive` → 工程师核对结构化结果 →
+`mesh.generate`（带派生文件）→ `mesh.check`（复核）。
+
+### 2.6 `mesh.export`（已上线）
+
+把 `.ansa` 原生库（网格正本）按需导出为求解器格式——同一份网格反复导出
+不同格式，**不重新划网格**。输入：`ansaUrl / uploadUrl / authToken`（必填），
+`options.solverFormat`：`nastran`（默认，.nas）| `abaqus`（.inp）|
+`lsdyna`（.k）| `ansys`（.cdb）| `optistruct`（.fem）。
+
+可选 `previewUploadUrl`：顺带产出网格预览 GLB(带真实单元边线)——
+这是 **.ansa 手工修改检入后重新出预览**的通道；主格式非 nastran 时
+ANSA 会话内会顺带导一份 Nastran 作为渲染源。
+
+输出要点：`solverFormat / solverFileBytes / elementCount / shellCount /
+solidCount / nodeCount`（与生成时的正本自洽）、`previewUploaded`。
+注意 `.ansa` 有版本性：由更高版本 ANSA 保存的库低版本打不开，错误信息会说明。
+
+### 2.7 `mesh.classify`（已上线）
+
+逐零件形态分类 → 网格策略建议，供 SDM 编排「逐零件网格」时选策略。
+输入与 `geometry.inspect` 相同（`sourceUrl / sourceName`，zip 装配包同规则），
+可选 `options.thresholds` 覆盖阈值。
+
+分类信号（从转换产物的三角网格确定性计算，不经 AI）：
+**水密性**（边界边占比）、**平均壁厚**（2V/A）、**尺度比**（面内尺度/壁厚）、
+**实心度**（V/包围盒体积）。规则与真实锚点件对齐：
+
+| 形态 | 建议 meshType | fallback |
+|---|---|---|
+| 不水密 / 无体积（曲面模型） | `surface` | — |
+| 封闭 + 薄壁均匀 | `midsurface` | `volume` |
+| 封闭 + 厚实 | `volume` | `surface` |
+| 封闭但实心度极低（薄壁结构外皮/框架，等效壁厚失真） | `surface` + **needsReview** | `volume` |
+
+**二级复核（BREP 壁厚分布）**：一级是网格统计（毫秒级、均值口径），对变厚度件与
+空心包络会失真。`options.refine`（`auto` 默认/`always`/`never`）控制是否用
+python 特征提取的**壁厚分布**（主导壁厚/占比/离散度）复核：均匀薄壁 → midsurface
+坐实并给出 `recommendedMinThickness`（直接喂中面抽取）；变厚度件 → 强制人工；
+均匀厚壁 → volume 坐实。约束：仅 STEP 源可用、分布是文件级的（只修正低置信的件，
+不覆盖一级高置信判定）、本机需 PythonOCC（不可用时优雅降级并留痕）。
+
+输出：`parts[]`（逐零件/逐体 `meshType / fallback / confidence / needsReview /
+refined? / recommendedMinThickness? / reasons[] / signals{}`）与
+`summary`（各策略计数 + 待人工数）。
+**合并 STEP（整装配一个文件）会自动做连通域拆体**：一个"零件"里多个不相连的体
+各自独立分类，`partId` 形如 `xxx#body-2`，`signals.bbox`（全局坐标）用于与
+`mesh.inventory` 的零件清单对齐。`needsReview: true` 的零件**建议进人工桶**。
+
+### 2.8 `mesh.inventory`（已上线）
+
+用 **ANSA 产品树**列出 CAD 文件的零件清单——合并 STEP 逐零件编排的权威拆解口径
+（ANSA 认出的结构就是工程师在 GUI 里看到的结构）。只导入不划网格，秒级到十秒级。
+输入同 `mesh.classify`（`sourceUrl / authToken / sourceName`）。
+
+输出：`parts[]`（`{index, id, name, moduleId, faceCount,
+bbox:[minx,miny,minz,maxx,maxy,maxz]}`）。`name` 直接作为 `mesh.generate` 的
+`options.partFilter`；`bbox` 与 `mesh.classify` 拆体结果按包围盒对齐。
+
+### 2.9 `mesh.merge`（已上线）
+
+把多份**逐零件的 `.ansa` 网格正本**合并回装成一个装配模型——总体策略的回装环节。
+零件由 `mesh.generate(partFilter)` 生成时已保持装配全局坐标，合并只拼库不摆位；
+节点/属性/材料/集合的 ID 冲突一律 offset 错开（逐零件各自从 1 号编起是常态，
+keep-old/keep-new 都会静默丢数据）。
+
+输入：`ansaUrls[]`（≥2，第一个为合并基底）、`uploadUrl`（merged.ansa 回传，必填）、
+可选 `solverUploadUrl + options.solverFormat`（顺带导出合并后的求解器文件）、
+可选 `previewUploadUrl`（合并网格预览 GLB）。
+
+输出要点：`mergedCount / partCount / elementCount / nodeCount`（应等于各零件之和，
+逐零件网格不共节点）、`ansaFileBytes`。合并正本仍是 `.ansa`，
+后续手工微调 / `mesh.export` / `mesh.check` 都照常适用。
+**注意**：合并只负责几何回装，零件间的连接（螺栓 BEAM/焊点）不在本能力范围，
+由工程师在 ANSA 中处理或等后续连接能力。
+
+### 2.10 `mesh.checkout`（已上线）
+
+人工回路的**取出端**：把 SDM 上的 `.ansa` 正本下载到本机受管工作副本区
+（`<dataDir>/mesh-checkouts/<checkoutId>/`），并**启动本机 ANSA GUI 打开它**。
+这是能力服务里刻意的有状态例外——本地保存的是工作副本，**正本仍在 SDM**；
+副本与校验和记录在 manifest，跨应用重启可找回。
+
+输入：`ansaUrl / authToken`（必填）、`fileName`、`meta`（业务标注，原样保存）。
+输出：**`checkoutId`（SDM 必须保存，检入靠它）**、`localPath / sha256 / launched`。
+
+### 2.11 `mesh.checkin`（已上线）
+
+人工回路的**提交端**：工程师在 ANSA 里改完、保存到原位后，SDM 发起检入——
+按 `checkoutId` 找回工作副本，hash 比对判断是否真有改动（未改动**如实标注但不拦截**），
+作为新版本上传回 SDM；可选 `previewUploadUrl` 经 ANSA 重出修改后的预览 GLB。
+**显式动作，绝不做文件监听自动上传**——半成品被自动同步的风险远大于多点一次按钮。
+
+输入：`checkoutId / uploadUrl / authToken`（必填）、`previewUploadUrl`（可选）。
+输出：`changed / uploaded / sha256 / previewUploaded / elementCount`（预览重出时
+顺带清点，供 SDM 展示改动后的规模）。
+
+**合并 STEP 的完整编排**：
+
+```
+上传 → mesh.inventory(零件清单,ANSA 口径)
+     + mesh.classify (逐体策略建议,含 bbox)
+     → SDM 按 bbox 对齐两份清单,得到「零件 → 策略」表
+     → 逐零件 mesh.generate(partFilter=零件名, meshType=建议值, ansaUploadUrl=…)
+       ——零件保持装配全局坐标,每件出独立 .ansa 正本
+     → 失败/needsReview 的零件进人工桶(工程师在 ANSA 处理)
+     → mesh.merge(逐零件 .ansa → 装配正本,可顺带出求解器文件与预览)
+     → 连接建模/手工微调:mesh.checkout(本机 ANSA 打开)
+        → 工程师修改保存 → mesh.checkin(新版本 + 新预览回 SDM)
+     → mesh.check 复核 → mesh.export 交付
+```
 
 ---
 
@@ -307,13 +522,37 @@ Origin 白名单。生产地址为 `http://<集群主机>:8088`（IPv6 入口同
 
 ### 已就绪
 
+**几何链（2.1 / 2.2）**
+
 | 项 | 状态 |
 |---|---|
-| 数据模型 | `sim_geometry_version` 表含 `source_file_json` / `step_file` / `brep_file` / `lightweight_file` / `topo_summary_json` |
-| 源文件下载（对应契约的 `sourceUrl`） | `GET /api/sim/geometries/{gid}/download` 已上线 |
+| 数据模型 | `sim_geometry_version` 表含 `source_file_json` / `step_file` / `brep_file` / `lightweight_file` / `topo_summary_json`，另加 `part_inventory_json`（2.8 产出）与 `mesh_strategy_json`（2.7 产出） |
+| 源文件下载（对应契约的 `sourceUrl`） | `GET /api/sim/geometries/{gid}/download` 已上线（同时接受几何票据与网格票据） |
 | 产物回传（对应契约的 `uploadUrl`） | `POST /api/sim/geometries/{gid}/lightweight` 已上线，multipart，字段 `file` + 可选 `meta`（JSON 字符串，对应 2.1 的输出 schema） |
 | 网页渲染 | three.js + `GLTFLoader` 已接好，产物一回传即可预览 |
-| 编排 | `capability.invoke` 节点会挂起等待，能力上线即可编入流水线 |
+| 编排 | `capability.invoke` 节点会挂起等待；**浏览器代理循环尚未接线**，故网格链先走页面按钮直调（与几何链同一模式） |
+
+**网格链（2.3~2.11）—— 逐字段落点**
+
+| 契约字段 | SDM 端点 / 落库列 |
+|---|---|
+| 网格票据（绑 gid，默认 2h，上限 8h） | `POST /api/sim/geometries/{gid}/mesh-ticket` → `{token, source_path_suffix, mesh_path_prefix}` |
+| `sourceUrl`（生成/清点/分类的输入） | `GET /api/sim/geometries/{gid}/download` |
+| `ansaUploadUrl` → **正本** | `POST …/meshes/{mid}/artifact/ansa` → `sim_mesh_version.ansa_file` |
+| `uploadUrl`（求解器文件） | `POST …/meshes/{mid}/artifact/solver` → `solver_file` + `solver_format`（取自 `meta.solverFormat`） |
+| `previewUploadUrl` | `POST …/meshes/{mid}/artifact/preview` → `preview_file`（只收 .glb/.gltf） |
+| `reportUploadUrl` | `POST …/meshes/{mid}/artifact/report` → `report_file`（只收 .html） |
+| `ansaUrl`（export/check/merge/checkout 的输入） | `GET …/meshes/{mid}/artifact/ansa` |
+| 2.7 `mesh.classify` 产出 | `PUT /api/sim/geometries/{gid}/analysis` → `mesh_strategy_json` |
+| 2.8 `mesh.inventory` 产出 | 同上 → `part_inventory_json`；`parts[].name` 直接作为 `options.partFilter` |
+| 2.9 `mesh.merge` 溯源 | `sim_mesh_version.source_mesh_ids_json` |
+| 2.10 `checkoutId` | `POST …/meshes/{mid}/checkout` → `checkout_id` / `checkout_by`（**排他**：被他人占用时 409） |
+| 2.11 检入 | `POST …/meshes/{mid}/checkin` 释放占用；新版本文件仍走 `artifact/ansa` |
+| 作业状态回写 | `PATCH …/meshes/{mid}` → `status`（generating/ready/failed/checked-out）+ `quality` |
+
+网格作业先以 `status='generating'` 登记一行再跑——作业动辄几十分钟，
+页面必须先有行才能显示进度；失败原因写进 `quality.summary`（页面本就在读它）。
+前端入口在 `MeshPanel.vue`（嵌在几何版本行下：网格隶属几何版本）。
 
 产物回传接口**会拒绝非 `.glb` / `.gltf` 的文件**并返回本文链接——这是刻意的，
 避免私有格式被无意中引入。

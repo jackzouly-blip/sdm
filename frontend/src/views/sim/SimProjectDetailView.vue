@@ -16,13 +16,16 @@ import type {
   SimSubject,
   SimTarget,
 } from "@/api/types";
-import { ArrowLeft, Boxes, ChevronRight, Eye, FolderCog, Loader2, Plus, Trash2 } from "lucide-vue-next";
+import { ArrowLeft, Boxes, ChevronRight, Eye, FolderCog, Loader2, Plus, Sparkles, Trash2 } from "lucide-vue-next";
 import GeometryPanel from "./GeometryPanel.vue";
 import RequirementPanel from "./RequirementPanel.vue";
 import GeometryViewer from "./GeometryViewer.vue";
+import AiSessionPanel from "./AiSessionPanel.vue";
 
 const props = defineProps<{ pid: string }>();
 const router = useRouter();
+
+const showAi = ref(false);
 
 const project = ref<SimProject | null>(null);
 const targets = ref<SimTarget[]>([]);
@@ -182,8 +185,17 @@ function fmt(ts: number | null) {
 const openTarget = ref<string | null>(null);
 const previewing = ref<SimGeometry | null>(null);
 
+/** 网格预览：几何仍要传（查看器要它兜底），但实际加载的是网格 GLB */
+const previewMeshSrc = ref<{ src: string; title: string } | null>(null);
+
 function onPreview(g: SimGeometry) {
+  previewMeshSrc.value = null;
   previewing.value = g;
+}
+
+function onPreviewMesh(payload: { src: string; title: string; geometry: SimGeometry }) {
+  previewMeshSrc.value = { src: payload.src, title: payload.title };
+  previewing.value = payload.geometry;
 }
 
 /**
@@ -222,7 +234,16 @@ onMounted(load);
 
     <template v-else-if="project">
       <div class="mb-4">
-        <h1 class="text-lg font-semibold text-slate-800">{{ project.name }}</h1>
+        <div class="flex items-center">
+          <h1 class="text-lg font-semibold text-slate-800">{{ project.name }}</h1>
+          <button
+            class="ml-auto inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-indigo-200 text-indigo-700 text-sm hover:bg-indigo-50"
+            title="围绕本项目与 AI 对话：澄清需求、修改条目、调整质量卡（改动经确认后留痕）"
+            @click="showAi = !showAi"
+          >
+            <Sparkles :size="14" /> AI 会话
+          </button>
+        </div>
         <p class="text-sm text-slate-500 mt-0.5">
           {{ project.description || "无说明" }}
         </p>
@@ -363,6 +384,7 @@ onMounted(load);
                     :target-id="t.id"
                     :target-name="t.name"
                     @preview="onPreview"
+                    @preview-mesh="onPreviewMesh"
                   />
                 </td>
               </tr>
@@ -522,11 +544,16 @@ onMounted(load);
       </div>
     </template>
 
-    <!-- 几何预览：轻量化产物就绪的版本才会走到这里 -->
+    <!-- 几何/网格预览：同一个查看器，网格走 src 覆盖(带真实单元边线的 GLB) -->
     <GeometryViewer
       v-if="previewing"
       :geometry="previewing"
-      @close="previewing = null"
+      :src="previewMeshSrc?.src"
+      :title="previewMeshSrc?.title"
+      @close="previewing = null; previewMeshSrc = null"
     />
+
+    <!-- AI 会话抽屉：消息流是主数据，改动全部走提案-确认 -->
+    <AiSessionPanel v-if="showAi" :pid="pid" @close="showAi = false" />
   </div>
 </template>

@@ -45,7 +45,12 @@ function normalizeBodyColor(c: THREE.Color): THREE.Color {
   return c;
 }
 
-const props = defineProps<{ geometry: SimGeometry }>();
+/**
+ * src / title 可选：网格预览复用同一个查看器（vektor3d 回传的网格 GLB 带真实
+ * 单元边线，渲染要求与几何 GLB 完全一样，没有理由再写一个）。不传就按几何版本
+ * 的轻量化产物加载，保持既有调用方零改动。
+ */
+const props = defineProps<{ geometry: SimGeometry; src?: string; title?: string }>();
 const emit = defineEmits<{ (e: "close"): void }>();
 
 const host = ref<HTMLDivElement | null>(null);
@@ -185,7 +190,9 @@ onMounted(async () => {
   controls.value = ctl;
 
   try {
-    const gltf = await new GLTFLoader().loadAsync(simApi.lightweightUrl(props.geometry.id));
+    const gltf = await new GLTFLoader().loadAsync(
+      props.src || simApi.lightweightUrl(props.geometry.id)
+    );
     scene.add(gltf.scene);
     const look = applyWorkbenchLook(gltf.scene);
     edgesSkipped.value = look.skipped;
@@ -274,9 +281,9 @@ onMounted(async () => {
     <div class="bg-white rounded-lg shadow-xl w-full max-w-5xl h-[80vh] flex flex-col">
       <div class="flex items-center gap-2 px-4 py-2.5 border-b border-slate-200">
         <span class="font-medium text-slate-800 text-sm">
-          {{ geometry.source_file?.name ?? "几何预览" }}
+          {{ title ?? geometry.source_file?.name ?? "几何预览" }}
         </span>
-        <span class="text-xs text-slate-400">v{{ geometry.version_no }}</span>
+        <span v-if="!title" class="text-xs text-slate-400">v{{ geometry.version_no }}</span>
         <span v-if="stats" class="text-xs text-slate-500">
           {{ stats.objects }} 个零件 · {{ stats.tris.toLocaleString() }} 三角面
           <template v-if="stats.uniqueMeshes < stats.objects">

@@ -31,13 +31,21 @@ import type {
   SimProjectInput,
   SimGeometry,
   SimConvertTicket,
+  SimMesh,
+  SimMeshTicket,
   SimQualityCard,
+  SimMaterial,
+  SimMaterialDetail,
+  SimMaterialImportReport,
   SimQualityCardDetail,
   SimQualityTemplate,
   SimRequirementDoc,
   SimRequirementItem,
   SimExtractSummary,
   SimAnalyzeTicket,
+  SimAiSession,
+  SimAiMessage,
+  SimAiProposal,
   SimResult,
   SimSubject,
   SimTarget,
@@ -705,6 +713,92 @@ export const simApi = {
     };
   },
 
+  // --- 网格（契约 2.3~2.11）---
+
+  /** 取单个几何版本（网格作业进行中反复刷它读分析结果，不必拉整个列表） */
+  async getGeometry(gid: string): Promise<SimGeometry> {
+    const { data } = await http.get<SimGeometry>(`/sim/geometries/${gid}`);
+    return data;
+  },
+  async listMeshes(gid: string): Promise<SimMesh[]> {
+    const { data } = await http.get<SimMesh[]>(`/sim/geometries/${gid}/meshes`);
+    return data;
+  },
+  /**
+   * 登记一个网格版本。能力作业动辄几十分钟，先落 status='generating' 的一行，
+   * 页面才能显示进度；产物与终态由 vektor3d 回传 + updateMesh 补齐。
+   */
+  async addMesh(
+    gid: string,
+    body: {
+      mesh_type: string;
+      mesh_engine?: string;
+      mesh_params?: Record<string, unknown>;
+      status?: string;
+      part_filter?: string | null;
+      source_mesh_ids?: string[] | null;
+    }
+  ): Promise<SimMesh> {
+    const { data } = await http.post<SimMesh>(`/sim/geometries/${gid}/meshes`, body);
+    return data;
+  },
+  async updateMesh(
+    gid: string,
+    mid: string,
+    body: { status?: string; quality?: Record<string, unknown> }
+  ): Promise<SimMesh> {
+    const { data } = await http.patch<SimMesh>(`/sim/geometries/${gid}/meshes/${mid}`, body);
+    return data;
+  },
+  /** 回写 mesh.inventory / mesh.classify 的产出（落在几何版本上） */
+  async setGeometryAnalysis(
+    gid: string,
+    body: { part_inventory?: unknown[]; mesh_strategy?: Record<string, unknown> }
+  ): Promise<SimGeometry> {
+    const { data } = await http.put<SimGeometry>(`/sim/geometries/${gid}/analysis`, body);
+    return data;
+  },
+  /**
+   * 取网格作业票据并拼出 vektor3d 要用的绝对地址（理由同 convertTicket）。
+   * 默认 2 小时：网格作业比几何转换慢一个量级，票据先过期会让回传功亏一篑。
+   */
+  async meshTicket(gid: string, ttlSeconds = 7200): Promise<SimMeshTicket> {
+    const { data } = await http.post<{
+      gid: string;
+      token: string;
+      expires_in: number;
+      source_name: string;
+      source_path_suffix: string;
+      mesh_path_prefix: string;
+    }>(`/sim/geometries/${gid}/mesh-ticket`, null, { params: { ttl_seconds: ttlSeconds } });
+    const origin = window.location.origin;
+    return {
+      gid: data.gid,
+      token: data.token,
+      expiresIn: data.expires_in,
+      sourceName: data.source_name,
+      sourceUrl: `${origin}/api${data.source_path_suffix}`,
+      meshUrlPrefix: `${origin}/api${data.mesh_path_prefix}`,
+    };
+  },
+  /** 网格产物地址。kind ∈ ansa/solver/preview/report；token 走 query 供 GLTFLoader 直载 */
+  meshArtifactUrl(gid: string, mid: string, kind: string): string {
+    return `/api/sim/geometries/${gid}/meshes/${mid}/artifact/${kind}?token=${encodeURIComponent(
+      getToken() ?? ""
+    )}`;
+  },
+  async checkoutMesh(gid: string, mid: string, checkoutId: string): Promise<SimMesh> {
+    const { data } = await http.post<SimMesh>(
+      `/sim/geometries/${gid}/meshes/${mid}/checkout`,
+      { checkout_id: checkoutId }
+    );
+    return data;
+  },
+  async checkinMesh(gid: string, mid: string): Promise<SimMesh> {
+    const { data } = await http.post<SimMesh>(`/sim/geometries/${gid}/meshes/${mid}/checkin`);
+    return data;
+  },
+
   // --- 客户需求文档 ---
   async listRequirements(pid: string): Promise<SimRequirementDoc[]> {
     const { data } = await http.get<SimRequirementDoc[]>(`/sim/projects/${pid}/requirements`);
@@ -846,6 +940,51 @@ export const simApi = {
     );
     return data;
   },
+  /** 改模板元数据（名称/来源/说明等）。阈值不可改——那必须走派生留痕 */
+  async updateQualityTemplate(
+    templateId: string,
+    body: Partial<Pick<SimQualityTemplate, "name" | "source" | "revision" | "scope" | "description">>
+  ): Promise<SimQualityTemplate> {
+    const { data } = await http.patch<SimQualityTemplate>(
+      `/sim/quality-templates/${templateId}`,
+      body
+    );
+    return data;
+  },
+  /** 删用户模板。既有项目实例不受影响（实例文件派生时已拷走） */
+  async deleteQualityTemplate(templateId: string): Promise<void> {
+    await http.delete(`/sim/quality-templates/${templateId}`);
+  },
+  /** 在线改用户模板内容（阈值/网格参数）。每项改动必须带依据，追加进 overrides 留痕 */
+  async editQualityTemplateContent(
+    templateId: string,
+    overrides: { target: string; new_value: string; source: string }[]
+  ): Promise<SimQualityCardDetail> {
+    const { data } = await http.patch<SimQualityCardDetail>(
+      `/sim/quality-templates/${templateId}/content`,
+      { overrides }
+    );
+    return data;
+  },
+  /** 从既有模板（含内置）派生新的用户模板。内置模板只读，想改它就走这条路 */
+  async deriveQualityTemplate(
+    baseId: string,
+    body: {
+      new_id: string;
+      name: string;
+      overrides?: { target: string; new_value: string; source: string }[];
+      source?: string;
+      revision?: string;
+      scope?: string;
+      description?: string;
+    }
+  ): Promise<SimQualityTemplate> {
+    const { data } = await http.post<SimQualityTemplate>(
+      `/sim/quality-templates/${baseId}/derive`,
+      body
+    );
+    return data;
+  },
   /** 在线编辑实例：改动直接落进 .ansa_qual/.ansa_mpar，每项必须带依据 */
   async editQualityCard(
     qid: string,
@@ -856,6 +995,109 @@ export const simApi = {
   },
   qualityCardExportUrl(qid: string, kind: "qual" | "mpar"): string {
     return `/api/sim/quality-cards/${qid}/export?kind=${kind}&token=${encodeURIComponent(getToken() ?? "")}`;
+  },
+
+  // --- 材料库（全局资产；写仅管理员）---
+  async listMaterials(params?: {
+    category?: string;
+    q?: string;
+    status?: string;
+  }): Promise<SimMaterial[]> {
+    const { data } = await http.get<SimMaterial[]>("/sim/materials", { params });
+    return data;
+  },
+  async getMaterial(mid: string): Promise<SimMaterialDetail> {
+    const { data } = await http.get<SimMaterialDetail>(`/sim/materials/${mid}`);
+    return data;
+  },
+  /** 导入 LS-DYNA 关键字文件的材料段。幂等：未变跳过，变了整体替换并 revision+1 */
+  async importMaterials(
+    file: File,
+    unitSystem = "t-mm-s",
+    solverType = "lsdyna"
+  ): Promise<SimMaterialImportReport> {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("unit_system", unitSystem);
+    form.append("solver_type", solverType);
+    const { data } = await http.post<SimMaterialImportReport>("/sim/materials/import", form);
+    return data;
+  },
+  /** 只改元数据。性能/曲线/卡只能整体走导入——单点改数会让卡原文与结构化参数分叉 */
+  async updateMaterial(
+    mid: string,
+    body: Partial<Pick<SimMaterial, "name" | "category" | "standard_code" | "description" | "source" | "status">>
+  ): Promise<SimMaterial> {
+    const { data } = await http.patch<SimMaterial>(`/sim/materials/${mid}`, body);
+    return data;
+  },
+  async deleteMaterial(mid: string): Promise<void> {
+    await http.delete(`/sim/materials/${mid}`);
+  },
+
+  // --- AI 会话（契约：docs/vektor3d-ai-session-contract.md）---
+  /** 项目级只读票据：交给 vektor3d 拉主数据填充 workspace。写永远走提案-确认 */
+  async aiReadTicket(pid: string, ttlSeconds = 1800): Promise<{
+    pid: string;
+    token: string;
+    expiresIn: number;
+    contextUrl: string;
+  }> {
+    const { data } = await http.post<{
+      pid: string;
+      token: string;
+      expires_in: number;
+      context_path_suffix: string;
+    }>(`/sim/projects/${pid}/ai-read-ticket`, null, { params: { ttl_seconds: ttlSeconds } });
+    return {
+      pid: data.pid,
+      token: data.token,
+      expiresIn: data.expires_in,
+      contextUrl: `${window.location.origin}/api${data.context_path_suffix}`,
+    };
+  },
+  async listAiSessions(pid: string): Promise<SimAiSession[]> {
+    const { data } = await http.get<SimAiSession[]>(`/sim/projects/${pid}/ai-sessions`);
+    return data;
+  },
+  async createAiSession(pid: string, title = ""): Promise<SimAiSession> {
+    const { data } = await http.post<SimAiSession>(`/sim/projects/${pid}/ai-sessions`, { title });
+    return data;
+  },
+  /** 会话详情含全部消息（消息流是主数据，跨设备可见） */
+  async getAiSession(sid: string): Promise<SimAiSession & { messages: SimAiMessage[] }> {
+    const { data } = await http.get(`/sim/ai-sessions/${sid}`);
+    return data;
+  },
+  async deleteAiSession(sid: string): Promise<void> {
+    await http.delete(`/sim/ai-sessions/${sid}`);
+  },
+  async addAiMessage(
+    sid: string,
+    body: {
+      role: "user" | "assistant" | "system";
+      content: string;
+      proposals?: Omit<SimAiProposal, "status" | "decided_by" | "decided_at">[];
+      citations?: { text?: string; ref: string }[];
+      meta?: Record<string, unknown>;
+    }
+  ): Promise<SimAiMessage> {
+    const { data } = await http.post<SimAiMessage>(`/sim/ai-sessions/${sid}/messages`, body);
+    return data;
+  },
+  /** 裁决一条提案（只翻 UI 状态；数据变更由前端另行调既有接口完成） */
+  async decideAiProposal(
+    sid: string,
+    mid: string,
+    index: number,
+    decision: "confirmed" | "rejected",
+    note = ""
+  ): Promise<SimAiMessage> {
+    const { data } = await http.post<SimAiMessage>(
+      `/sim/ai-sessions/${sid}/messages/${mid}/proposal-decision`,
+      { index, decision, note }
+    );
+    return data;
   },
 
   // --- 工况 ---

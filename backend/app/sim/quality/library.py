@@ -56,20 +56,28 @@ class TemplateMeta:
     description: str = ""
     builtin: bool = False
     based_on: str = ""                      # 派生自哪张模板
+    created_by: str = ""                    # 导入/派生者;老模板此字段为空,视为仅管理员可管
     overrides: List[Override] = field(default_factory=list)
 
 
 class QualityCardLibrary:
-    """模板库:内置只读 + 用户可写,按 id 统一寻址。"""
+    """模板库:内置只读 + 用户可写,按 id 统一寻址。
 
-    def __init__(self, user_dir: str = "") -> None:
+    extra_dirs 是额外的只读检索目录。项目派生实例时用它把全局模板库挂进来:
+    派生的**产物**落项目目录(user_dir),而派生的**底座**可以来自全局库——
+    没有它,导入的客户模板在项目里根本选不着。
+    """
+
+    def __init__(self, user_dir: str = "", extra_dirs: Optional[List[str]] = None) -> None:
         self.user_dir = user_dir
+        self.extra_dirs = list(extra_dirs or [])
         if user_dir:
             os.makedirs(user_dir, exist_ok=True)
 
     # ── 查 ──────────────────────────────────────────────────────────────────
     def _dirs(self) -> List[str]:
-        return [d for d in (BUILTIN_DIR, self.user_dir) if d and os.path.isdir(d)]
+        return [d for d in (BUILTIN_DIR, *self.extra_dirs, self.user_dir)
+                if d and os.path.isdir(d)]
 
     def _resolve(self, template_id: str) -> str:
         # 用户目录后查,因此同名时用户模板生效——但内置的 builtin 标记会跟着变,
@@ -92,6 +100,9 @@ class QualityCardLibrary:
                     continue
                 out[name] = self._read_meta(meta_path)
         return list(out.values())
+
+    def get_meta(self, template_id: str) -> TemplateMeta:
+        return self._read_meta(os.path.join(self._resolve(template_id), META_FILE))
 
     @staticmethod
     def _read_meta(path: str) -> TemplateMeta:
@@ -138,6 +149,7 @@ class QualityCardLibrary:
         revision: str = "",
         scope: str = "",
         description: str = "",
+        created_by: str = "",
     ) -> TemplateMeta:
         """从一张模板派生出新模板/项目实例,并把改动逐项留痕。
 
@@ -169,7 +181,8 @@ class QualityCardLibrary:
 
             meta = TemplateMeta(
                 id=new_id, name=name, source=source, revision=revision, scope=scope,
-                description=description, builtin=False, based_on=base_id, overrides=applied,
+                description=description, builtin=False, based_on=base_id,
+                created_by=created_by, overrides=applied,
             )
             with open(os.path.join(dest, META_FILE), "w", encoding="utf-8") as f:
                 json.dump(asdict(meta), f, ensure_ascii=False, indent=2)
@@ -178,11 +191,61 @@ class QualityCardLibrary:
             shutil.rmtree(dest, ignore_errors=True)
             raise
 
+    def edit_content(self, template_id: str, overrides: List[Override]) -> TemplateMeta:
+        """在线修改用户模板的内容(阈值/网格参数),逐项留痕。
+
+        与派生同一条规矩:改动直接落进 .ansa_qual/.ansa_mpar 并追加进 overrides
+        ——模板改完仍是一份可直接交回 ANSA 的合法卡,且每项改动都能指回出处。
+        内置模板不可改:改了它等于悄悄改掉所有历史项目的验收标准,想改就以它
+        为底座派生一张用户模板。
+        """
+        path = self._resolve(template_id)
+        if _in_builtin(path):
+            raise PermissionError("内置模板不可修改,请从它派生一张用户模板后再改")
+        meta = self._read_meta(os.path.join(path, META_FILE))
+        qual = ansa_qual.load(os.path.join(path, CRITERIA_FILE))
+        mpar = ansa_mpar.load(os.path.join(path, MESH_FILE))
+        # 先全部在内存里落好:有一条无效就一个字节都不写盘,不留半张卡
+        applied = [_apply_override(qual, mpar, ov) for ov in overrides]
+        with open(os.path.join(path, CRITERIA_FILE), "w", encoding="utf-8", newline="") as f:
+            f.write(qual.dumps())
+        with open(os.path.join(path, MESH_FILE), "w", encoding="utf-8", newline="") as f:
+            f.write(mpar.dumps())
+        meta.overrides.extend(applied)
+        with open(os.path.join(path, META_FILE), "w", encoding="utf-8") as f:
+            json.dump(asdict(meta), f, ensure_ascii=False, indent=2)
+        return meta
+
+    def update_meta(self, template_id: str, **fields) -> TemplateMeta:
+        """改用户模板的元数据(名称/来源/说明等)。
+
+        只动 template.json,不碰 .ansa_qual/.ansa_mpar——阈值改动必须走
+        edit_content 或派生,两条路都逐项留痕;元数据编辑不能成为绕过留痕
+        改卡的口子。
+        """
+        path = self._resolve(template_id)
+        if _in_builtin(path):
+            raise PermissionError("内置模板不可修改")
+        meta = self._read_meta(os.path.join(path, META_FILE))
+        allowed = {"name", "source", "revision", "scope", "description"}
+        for k, v in fields.items():
+            if k in allowed and v is not None:
+                setattr(meta, k, str(v))
+        with open(os.path.join(path, META_FILE), "w", encoding="utf-8") as f:
+            json.dump(asdict(meta), f, ensure_ascii=False, indent=2)
+        return meta
+
     def delete(self, template_id: str) -> None:
         path = self._resolve(template_id)
-        if os.path.commonpath([path, BUILTIN_DIR]) == os.path.abspath(BUILTIN_DIR):
+        if _in_builtin(path):
             raise PermissionError("内置模板不可删除")
         shutil.rmtree(path)
+
+
+def _in_builtin(path: str) -> bool:
+    # 不用 os.path.commonpath:Windows 上跨盘符比较会直接抛 ValueError
+    return os.path.normcase(os.path.dirname(os.path.abspath(path))) == \
+        os.path.normcase(os.path.abspath(BUILTIN_DIR))
 
 
 def _apply_override(qual: "ansa_qual.QualFile", mpar: "ansa_mpar.MparFile", ov: Override) -> Override:

@@ -125,7 +125,7 @@ def test_builtin_template_is_the_default_base(client):
 def test_template_detail_exposes_criteria_and_algorithms(client):
     d = client.get("/sim/quality-templates/generic-crash-5mm", headers=hdr()).json()
     assert d["ansaVersion"] == "19.1.1"
-    # 只回启用的判据——把关掉的一起铺出来，等于让人以为那些也在管
+    # criteria 只含启用的 shells 判据——"这张卡在管什么"的答案
     assert len(d["criteria"]) == 11
     by_name = {c["name"]: c for c in d["criteria"]}
     assert by_name["aspect ratio"]["calculation"] == "NASTRAN"
@@ -134,6 +134,28 @@ def test_template_detail_exposes_criteria_and_algorithms(client):
     assert d["meshParams"]["targetElementLength"] == 5.0
     # 判废线 3mm 对应的时间步 ≈ 0.58μs，碰撞里这是机时的总闸
     assert d["timeStepAtFailedMinLength"] == pytest.approx(5.8e-7, rel=0.02)
+
+
+def test_template_detail_exposes_whole_card_not_just_enabled_rows(client):
+    """卡远不止启用的 11 行:停用判据、solids 域、生成侧全部参数都要能看到,
+    否则用户会以为整张卡就一屏——而其余内容其实都会原样交给 ANSA。"""
+    d = client.get("/sim/quality-templates/generic-crash-5mm", headers=hdr()).json()
+
+    # 全量判据:两个域都在,停用的带着 enabled=False 一起回
+    assert len(d["allCriteria"]) > len(d["criteria"])
+    assert {c["domain"] for c in d["allCriteria"]} == {"shells", "solids"}
+    assert sum(c["enabled"] for c in d["allCriteria"]) == 11
+    taper = next(c for c in d["allCriteria"]
+                 if c["name"] == "taper" and c["domain"] == "shells")
+    assert taper["enabled"] is False and taper["calculation"] == "PATRAN"
+
+    # 生成侧参数按 .ansa_mpar 的分节分组,一项不落
+    groups = {g["title"]: g["params"] for g in d["meshGroups"]}
+    assert "CFD" in groups and "Fillets" in groups
+    total = sum(len(p) for p in groups.values())
+    assert total > 150
+    general = {p["key"]: p["value"] for p in groups["General Mesh"]}
+    assert general["target_element_length"] == "5."   # 原始字符串,不是 5.0
 
 
 def test_unknown_template_404(client):
@@ -404,6 +426,144 @@ def test_extract_rejects_unsupported_format(client, project):
     assert r.status_code == 400 and "暂不支持" in r.json()["detail"]
 
 
+# --- 规则/AI 交叉核对合并 -----------------------------------------------
+
+from app.sim.requirements.merge import merge_rule_and_ai
+
+
+def _rule_item(**kw):
+    base = {"category": "subject", "title": "", "raw_text": "", "metrics": [],
+            "baseline": "", "source_ref": "", "needs_clarification": False,
+            "clarification_hint": "", "extracted_by": "rule", "load_points": 0,
+            "indenter_diameter_mm": None}
+    return {**base, **kw}
+
+
+def _ai_item(**kw):
+    return {**_rule_item(extracted_by="ai"), **kw}
+
+
+def test_merge_corroborates_split_items_via_row_anchor():
+    """AI 按方向拆条,但都指向同一表行——锚点对齐要吃下一对多,点位数按组求和。"""
+    rule = [_rule_item(title="IP系统大屏刚度", source_ref="第1页 表1 第4行",
+                       baseline="required", load_points=6)]
+    ai = [_ai_item(title="IP系统大屏刚度测试 X向", source_ref="第1页 表1 第4行",
+                   baseline="required", load_points=3),
+          _ai_item(title="IP系统大屏刚度测试 Z向", source_ref="第1页 表1 第4行",
+                   baseline="required", load_points=3)]
+    merged, stats = merge_rule_and_ai(rule, ai)
+    assert stats == {"ruleTotal": 1, "aiTotal": 2, "agreed": 1,
+                     "conflicts": 0, "ruleOnly": 0, "aiOnly": 0}
+    assert len(merged) == 2 and not any(i["needs_clarification"] for i in merged)
+
+
+def test_merge_conflict_keeps_both_readings_and_forces_clarification():
+    """数值冲突不裁决谁对:标待澄清,两个读数都进 hint 交给人。"""
+    rule = [_rule_item(title="安装卡接孔刚度", source_ref="第1页 表1 第7行",
+                       metrics=[{"quantity": "施加力值", "op": "=", "value": 240.0,
+                                 "unit": "N", "raw": "240N"}])]
+    ai = [_ai_item(title="安装卡接孔刚度", source_ref="第1页 表1 第7行",
+                   metrics=[{"quantity": "施加力值", "op": "=", "value": 36.0,
+                             "unit": "N", "raw": "36N"}])]
+    merged, stats = merge_rule_and_ai(rule, ai)
+    assert stats["conflicts"] == 1 and stats["agreed"] == 0
+    assert merged[0]["needs_clarification"] is True
+    hint = merged[0]["clarification_hint"]
+    assert "240" in hint and "36" in hint and "规则/AI 读数不一致" in hint
+
+
+def test_merge_kind_mismatch_is_not_a_conflict():
+    """规则把 50mm 归为 T29 例外、AI 归为主值——归类差异不是读数矛盾。"""
+    rule = [_rule_item(title="IP系统膝碰", source_ref="第1页 表1 第2行",
+                       metrics=[{"quantity": "侵入量", "op": "", "value": 35.0,
+                                 "unit": "mm", "raw": "", "kind": "target"},
+                                {"quantity": "侵入量", "op": "", "value": 50.0,
+                                 "unit": "mm", "raw": "", "kind": "override"}])]
+    ai = [_ai_item(title="IP系统膝碰", source_ref="第1页 表1 第2行",
+                   metrics=[{"quantity": "侵入量", "op": "≤", "value": 50.0,
+                             "unit": "mm", "raw": "", "kind": "target"}])]
+    _, stats = merge_rule_and_ai(rule, ai)
+    assert stats["conflicts"] == 0 and stats["agreed"] == 1
+
+
+def test_merge_falls_back_to_page_and_title_then_keeps_rule_only():
+    """工况条目只有页码锚点,按同页+归一化标题对齐;两边都没有的规则条目兜底保留。"""
+    rule = [
+        _rule_item(title="IP系统静态头碰", category="loading",
+                   source_ref="第4页", load_points=6),
+        _rule_item(title="手套箱(打开)", category="loading",
+                   source_ref="第9页", load_points=2),      # AI 漏掉的页
+    ]
+    ai = [_ai_item(title="IP系统静态头碰测试", category="loading",
+                   source_ref="第 4 页", load_points=6),
+          _ai_item(title="仪表板下体膝碰", category="loading",
+                   source_ref="第12页", load_points=4)]     # 规则没抽到的
+    merged, stats = merge_rule_and_ai(rule, ai)
+    assert stats == {"ruleTotal": 2, "aiTotal": 2, "agreed": 1,
+                     "conflicts": 0, "ruleOnly": 1, "aiOnly": 1}
+    fallback = [i for i in merged if i["extracted_by"] == "rule"]
+    assert len(fallback) == 1 and fallback[0]["title"] == "手套箱(打开)"
+
+
+def test_ai_writeback_cross_checks_with_rule_extraction(client, project, tmp_path):
+    """AI 回写时服务端独立跑规则抽取:冲突转待澄清、AI 漏页由规则兜底。"""
+    doc = _upload_pptx(client, project, tmp_path)
+    r = client.put(
+        f"/sim/requirements/{doc['id']}/items",
+        json={"extractor": "ai", "items": [
+            # 与规则同表行,但变形量读数不同(规则读 ≤1.0mm)→ 应转待澄清
+            {"category": "subject", "title": "IP系统表面刚度",
+             "raw_text": "直径50mm;90N,变形量≤2.0mm", "baseline": "required",
+             "source_ref": "第1页 表1 第1行",
+             "metrics": [{"quantity": "变形量", "op": "≤", "value": 2.0,
+                          "unit": "mm", "raw": "变形量≤2.0mm"}]},
+            # 规则没有的条目,原样保留
+            {"category": "loading", "title": "仪表板下体膝碰",
+             "source_ref": "第5页", "load_points": 4},
+            # 注意:没有回写第2页工况 → 模拟视觉失败页,应由规则兜底
+        ], "summary": {"notes": ["第2页解析失败"]}},
+        headers=hdr(),
+    )
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["summary"]["merge"] == {
+        "ruleTotal": 2, "aiTotal": 2, "agreed": 0,
+        "conflicts": 1, "ruleOnly": 1, "aiOnly": 1,
+    }
+    # notes 与合并统计并存
+    assert out["summary"]["notes"] == ["第2页解析失败"]
+
+    items = out["items"]
+    assert len(items) == 3
+    stiff = [i for i in items if i["source_ref"] == "第1页 表1 第1行"][0]
+    assert stiff["extracted_by"] == "ai" and stiff["needs_clarification"]
+    assert "1.0" in stiff["clarification_hint"] and "2.0" in stiff["clarification_hint"]
+    # 待澄清计入统计口径
+    assert out["summary"]["needsClarification"] >= 1
+
+    fallback = [i for i in items if i["extracted_by"] == "rule"]
+    assert len(fallback) == 1 and fallback[0]["source_ref"] == "第2页"
+    assert fallback[0]["load_points"] == 2
+
+
+def test_rule_writeback_and_unparseable_docs_skip_cross_check(client, project, tmp_path):
+    """规则回写不自我核对;pdf 这类规则抽不了的格式,AI 回写照常落库、只是没有 merge。"""
+    doc = _upload_pptx(client, project, tmp_path)
+    r = client.put(f"/sim/requirements/{doc['id']}/items",
+                   json={"extractor": "manual",
+                         "items": [{"category": "subject", "title": "人工登记项"}]},
+                   headers=hdr())
+    assert r.status_code == 200 and "merge" not in r.json()["summary"]
+
+    pdf = upload_req(client, project, name="spec.pdf", data=b"%PDF-1.4").json()
+    r2 = client.put(f"/sim/requirements/{pdf['id']}/items",
+                    json={"extractor": "ai",
+                          "items": [{"category": "subject", "title": "AI 抽的"}]},
+                    headers=hdr())
+    assert r2.status_code == 200 and "merge" not in r2.json()["summary"]
+    assert len(r2.json()["items"]) == 1
+
+
 # --- 质量卡导入与在线编辑 -----------------------------------------------
 
 def _builtin_bytes():
@@ -464,6 +624,127 @@ def test_import_rejects_garbage_and_duplicate_id(client):
                      files={"qual_file": ("a.ansa_qual", io.BytesIO(qual), "text/plain")},
                      data={"template_id": "dup", "name": "A2"}, headers=hdr())
     assert r2.status_code == 409
+
+
+def _import_tpl(client, tid="cust-m", user="u"):
+    qual, _ = _builtin_bytes()
+    return client.post(
+        "/sim/quality-templates/import",
+        files={"qual_file": ("a.ansa_qual", io.BytesIO(qual), "text/plain")},
+        data={"template_id": tid, "name": "客户卡"},
+        headers=hdr(user),
+    )
+
+
+def test_template_management_only_by_importer_or_admin(client):
+    """模板是全局共享资产:内置不可动;用户模板只有导入者或管理员能删改。"""
+    assert _import_tpl(client, user="u").status_code == 201
+
+    # 内置模板:改/删一律 403
+    assert client.patch("/sim/quality-templates/generic-crash-5mm",
+                        json={"name": "偷改"}, headers=hdr("root")).status_code == 403
+    assert client.delete("/sim/quality-templates/generic-crash-5mm",
+                         headers=hdr("root")).status_code == 403
+
+    # 他人不可删改,导入者可以
+    assert client.patch("/sim/quality-templates/cust-m", json={"name": "x"},
+                        headers=hdr("other")).status_code == 403
+    assert client.delete("/sim/quality-templates/cust-m",
+                         headers=hdr("other")).status_code == 403
+    r = client.patch("/sim/quality-templates/cust-m",
+                     json={"name": "客户卡 v2", "scope": "碰撞"}, headers=hdr("u"))
+    assert r.status_code == 200 and r.json()["name"] == "客户卡 v2"
+    assert client.delete("/sim/quality-templates/cust-m", headers=hdr("u")).status_code == 204
+    assert client.get("/sim/quality-templates/cust-m", headers=hdr("u")).status_code == 404
+
+    # 管理员可删他人的模板
+    _import_tpl(client, tid="cust-n", user="u")
+    assert client.delete("/sim/quality-templates/cust-n", headers=hdr("root")).status_code == 204
+    assert client.delete("/sim/quality-templates/nope", headers=hdr("u")).status_code == 404
+
+
+def test_edit_template_content_online(client):
+    """用户模板内容可在线改:每项必须带依据,留痕追加,权限同删改元数据。"""
+    _import_tpl(client, tid="cust-edit", user="u")
+    ov = {"target": "criteria:warping [shells]:failed", "new_value": "12"}
+
+    # 无依据 → 400;他人 → 403;内置 → 403
+    r = client.patch("/sim/quality-templates/cust-edit/content",
+                     json={"overrides": [ov]}, headers=hdr("u"))
+    assert r.status_code == 400 and "依据" in r.json()["detail"]
+    assert client.patch("/sim/quality-templates/cust-edit/content",
+                        json={"overrides": [{**ov, "source": "评审"}]},
+                        headers=hdr("other")).status_code == 403
+    assert client.patch("/sim/quality-templates/generic-crash-5mm/content",
+                        json={"overrides": [{**ov, "source": "评审"}]},
+                        headers=hdr("root")).status_code == 403
+
+    # 导入者可改;返回刷新后的卡与全部留痕
+    r = client.patch("/sim/quality-templates/cust-edit/content",
+                     json={"overrides": [{**ov, "source": "评审结论"},
+                                         {"target": "mesh:target_element_length",
+                                          "new_value": "4", "source": "评审结论"}]},
+                     headers=hdr("u"))
+    assert r.status_code == 200, r.text
+    warping = next(c for c in r.json()["criteria"] if c["name"] == "warping")
+    assert warping["thresholds"]["failed"] == 12.0
+    assert r.json()["meshParams"]["targetElementLength"] == 4.0
+    assert [o["old_value"] for o in r.json()["overrides"]] == ["15.0", "5."]
+
+    # 无效目标 → 400,且不会写半张卡
+    assert client.patch("/sim/quality-templates/cust-edit/content",
+                        json={"overrides": [{"target": "mesh:no_such", "new_value": "1",
+                                             "source": "x"}]},
+                        headers=hdr("u")).status_code == 400
+    d = client.get("/sim/quality-templates/cust-edit", headers=hdr("u")).json()
+    assert d["meshParams"]["targetElementLength"] == 4.0
+
+
+def test_derive_template_makes_builtin_editable(client):
+    """内置模板只读,但可以以它为底座派生一张用户模板来"改"它。"""
+    r = client.post("/sim/quality-templates/generic-crash-5mm/derive",
+                    json={"new_id": "my-crash-4mm", "name": "我们的 4mm 碰撞卡",
+                          "overrides": [{"target": "mesh:target_element_length",
+                                         "new_value": "4", "source": "内部评审"}]},
+                    headers=hdr("u"))
+    assert r.status_code == 201, r.text
+    assert r.json()["based_on"] == "generic-crash-5mm"
+    assert r.json()["created_by"] == "u"
+    assert r.json()["overrides"][0]["old_value"] == "5."
+
+    # 派生出的是普通用户模板:导入者可继续在线改内容
+    assert client.patch("/sim/quality-templates/my-crash-4mm/content",
+                        json={"overrides": [{"target": "mesh:general_min_target_len",
+                                             "new_value": "2.5", "source": "评审"}]},
+                        headers=hdr("u")).status_code == 200
+
+    # 重复 id → 409;坏 id → 400;底座不存在 → 404
+    assert client.post("/sim/quality-templates/generic-crash-5mm/derive",
+                       json={"new_id": "my-crash-4mm", "name": "x"},
+                       headers=hdr("u")).status_code == 409
+    assert client.post("/sim/quality-templates/generic-crash-5mm/derive",
+                       json={"new_id": "非法id", "name": "x"},
+                       headers=hdr("u")).status_code == 400
+    assert client.post("/sim/quality-templates/nope/derive",
+                       json={"new_id": "whatever", "name": "x"},
+                       headers=hdr("u")).status_code == 404
+
+
+def test_template_list_reports_usage_and_deletion_keeps_instances(client, project):
+    """used_by 只提示影响面:实例文件派生时已拷走,删模板不碰既有实例。"""
+    _import_tpl(client, tid="cust-used")
+    card = client.post(f"/sim/projects/{project}/quality-cards",
+                       json={"name": "实例", "template_id": "cust-used"},
+                       headers=hdr()).json()
+
+    rows = {t["id"]: t for t in client.get("/sim/quality-templates", headers=hdr()).json()}
+    assert rows["cust-used"]["used_by"] == 1
+    assert rows["cust-used"]["created_by"] == "u"
+    assert rows["generic-crash-5mm"]["used_by"] == 0
+
+    assert client.delete("/sim/quality-templates/cust-used", headers=hdr()).status_code == 204
+    detail = client.get(f"/sim/quality-cards/{card['id']}", headers=hdr()).json()
+    assert detail["card"]["criteria"], "模板删了,实例的卡文件必须还在"
 
 
 def test_edit_card_online_writes_into_ansa_files(client, project):

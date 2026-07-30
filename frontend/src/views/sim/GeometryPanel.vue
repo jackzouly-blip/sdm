@@ -19,15 +19,24 @@ import {
   Download,
   Eye,
   FolderInput,
+  Grid3x3,
   Loader2,
   Plug,
   Settings2,
   Upload,
   Wand2,
 } from "lucide-vue-next";
+import MeshPanel from "./MeshPanel.vue";
 
 const props = defineProps<{ targetId: string; targetName: string }>();
-const emit = defineEmits<{ (e: "preview", g: SimGeometry): void }>();
+const emit = defineEmits<{
+  (e: "preview", g: SimGeometry): void;
+  /** 网格预览：复用同一个查看器，但加载的是网格 GLB（带真实单元边线） */
+  (e: "previewMesh", payload: { src: string; title: string; geometry: SimGeometry }): void;
+}>();
+
+/** 展开网格面板的几何版本 id */
+const openMesh = ref<string | null>(null);
 
 const geometries = ref<SimGeometry[]>([]);
 const loading = ref(true);
@@ -400,7 +409,8 @@ defineExpose({ reload: load });
         </tr>
       </thead>
       <tbody>
-        <tr v-for="g in geometries" :key="g.id" class="border-b border-slate-100">
+        <template v-for="g in geometries" :key="g.id">
+        <tr class="border-b border-slate-100">
           <td class="py-2 text-slate-500">v{{ g.version_no }}</td>
           <td class="py-2 text-slate-800 truncate max-w-xs">
             {{ g.source_file?.name ?? "—" }}
@@ -456,6 +466,20 @@ defineExpose({ reload: load });
                 <Wand2 v-else :size="12" />
                 {{ converting === g.id ? "转换中" : "轻量化" }}
               </button>
+              <!-- 网格:属于几何版本,故就近展开而不另设顶级 tab -->
+              <button
+                class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs hover:bg-slate-50"
+                :class="openMesh === g.id ? 'text-sky-700 bg-sky-50' : 'text-slate-500'"
+                :disabled="!vkUsable()"
+                :title="
+                  vkUsable()
+                    ? '分析零件形态、生成网格、在 ANSA 中微调'
+                    : 'vektor3d 未连接或本页面未被授权，先在上方「连接设置」处理'
+                "
+                @click="openMesh = openMesh === g.id ? null : g.id"
+              >
+                <Grid3x3 :size="12" /> 网格
+              </button>
               <a
                 :href="simApi.sourceDownloadUrl(g.id)"
                 class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs text-slate-500 hover:bg-slate-50"
@@ -466,6 +490,16 @@ defineExpose({ reload: load });
             </div>
           </td>
         </tr>
+        <tr v-if="openMesh === g.id">
+          <td colspan="6" class="bg-slate-50/60 px-3 py-3">
+            <MeshPanel
+              :geometry="g"
+              @preview="(p) => emit('previewMesh', { ...p, geometry: g })"
+              @refresh="load"
+            />
+          </td>
+        </tr>
+        </template>
       </tbody>
     </table>
 

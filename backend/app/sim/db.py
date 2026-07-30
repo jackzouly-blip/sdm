@@ -101,6 +101,8 @@ CREATE TABLE IF NOT EXISTS sim_geometry_version (
     step_file         TEXT,
     brep_file         TEXT,
     lightweight_file  TEXT,
+    part_inventory_json TEXT,           -- mesh.inventory 产出：ANSA 产品树的零件清单
+    mesh_strategy_json  TEXT,           -- mesh.classify 产出：逐零件/逐体的网格策略建议
     topo_summary_json TEXT,
     status            TEXT NOT NULL DEFAULT 'ready',
     created_at        REAL NOT NULL,
@@ -109,18 +111,36 @@ CREATE TABLE IF NOT EXISTS sim_geometry_version (
 CREATE INDEX IF NOT EXISTS idx_sim_geom_target ON sim_geometry_version(sim_target_id);
 
 -- 网格版本。mesh_engine 记录由谁产出：manual（人工上传）或某个能力 ID
--- （如 vektor3d:mesh.generate）——一期用 manual，vektor3d 能力就绪后切换。
+-- （如 vektor3d:mesh.generate）。
+--
+-- **.ansa 是网格的正本**：几何+网格+属性+厚度全量保留，手工微调、装配合并、
+-- 按需导出求解器格式都以它为源；solver_file 只是派生产物（见能力契约 2.3）。
+-- 因此这里不是"一个 mesh_file 走天下"，而是按角色分槽：正本 / 求解器 / 预览 / 报告。
+--
+-- part_filter 非空 = 这是"合并 STEP 里某个零件"的网格（逐零件生成，保持装配全局坐标）；
+-- source_mesh_ids_json 非空 = 这是 mesh.merge 回装出来的装配网格。二者互斥。
 CREATE TABLE IF NOT EXISTS sim_mesh_version (
     id                     TEXT PRIMARY KEY,
     sim_geometry_version_id TEXT NOT NULL REFERENCES sim_geometry_version(id) ON DELETE CASCADE,
     version_no             INTEGER NOT NULL,
-    mesh_type              TEXT NOT NULL,
+    mesh_type              TEXT NOT NULL,     -- surface/volume/midsurface
     mesh_engine            TEXT NOT NULL,
     mesh_params_json       TEXT,
-    mesh_file              TEXT,
-    quality_json           TEXT,         -- 网格检查产出
-    status                 TEXT NOT NULL DEFAULT 'ready',
+    mesh_file              TEXT,              -- 历史字段：人工上传的网格文件
+    ansa_file              TEXT,              -- .ansa 正本
+    solver_file            TEXT,              -- 求解器派生文件（.nas/.k/.inp/...）
+    solver_format          TEXT,              -- nastran/lsdyna/abaqus/ansys/optistruct
+    preview_file           TEXT,              -- 预览 GLB（带真实单元边线）
+    report_file            TEXT,              -- 质量统计报告（HTML）
+    part_filter            TEXT,              -- 逐零件生成时的零件名（取自 mesh.inventory）
+    source_mesh_ids_json   TEXT,              -- 合并来源的网格版本 id 列表
+    checkout_id            TEXT,              -- vektor3d 检出标识（人工微调回路）
+    checkout_by            TEXT,
+    checkout_at            REAL,
+    quality_json           TEXT,              -- 网格检查产出
+    status                 TEXT NOT NULL DEFAULT 'ready',  -- generating/ready/failed/checked-out
     created_at             REAL NOT NULL,
+    updated_at             REAL,
     UNIQUE(sim_geometry_version_id, version_no)
 );
 CREATE INDEX IF NOT EXISTS idx_sim_mesh_geom ON sim_mesh_version(sim_geometry_version_id);
@@ -246,6 +266,108 @@ CREATE TABLE IF NOT EXISTS sim_result (
 );
 CREATE INDEX IF NOT EXISTS idx_sim_result_job ON sim_result(sim_job_id);
 CREATE INDEX IF NOT EXISTS idx_sim_result_type ON sim_result(result_type);
+
+-- AI 会话：用户与 AI 在项目内的往来是主数据（要跨设备可见、要审计），落库；
+-- 推理过程（工具调用轨迹、中间试错）留在 vektor3d 侧 workspace，可丢。
+-- 见 docs/vektor3d-ai-session-contract.md 第 5.3 节。
+CREATE TABLE IF NOT EXISTS sim_ai_session (
+    id             TEXT PRIMARY KEY,
+    sim_project_id TEXT NOT NULL REFERENCES sim_project(id) ON DELETE CASCADE,
+    title          TEXT NOT NULL DEFAULT '',
+    created_by     TEXT NOT NULL DEFAULT '',
+    status         TEXT NOT NULL DEFAULT 'active',   -- active/archived
+    created_at     REAL NOT NULL,
+    updated_at     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sim_ai_session_project ON sim_ai_session(sim_project_id);
+
+-- 消息按 seq 严格排序。proposals_json 是 assistant 消息附带的结构化提案
+-- [{action, targetId, patch, reason, evidence, status, decided_by, decided_at}]：
+-- status 由 pending → confirmed/rejected，是**提案卡片的 UI 状态**；真正的数据
+-- 变更留痕在被改对象自己的机制里（条目的 PATCH、质量卡的 overrides），不在这里。
+CREATE TABLE IF NOT EXISTS sim_ai_message (
+    id             TEXT PRIMARY KEY,
+    session_id     TEXT NOT NULL REFERENCES sim_ai_session(id) ON DELETE CASCADE,
+    seq            INTEGER NOT NULL,
+    role           TEXT NOT NULL,               -- user/assistant/system
+    content        TEXT NOT NULL DEFAULT '',
+    proposals_json TEXT,
+    citations_json TEXT,
+    meta_json      TEXT,                        -- workspaceRun 等诊断信息
+    created_at     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sim_ai_message_session ON sim_ai_message(session_id, seq);
+
+-- ── 材料库（全局资产，与工况模板/质量卡模板库同级） ──────────────────────
+-- 设计见 docs/sdm-material-library.md：物理材料与模型变体分两层；数值按导入时
+-- 的单位制存储不强转 SI；求解器卡保留自包含关键字原文，导出以原文为准。
+CREATE TABLE IF NOT EXISTS sim_material (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL UNIQUE,  -- 归一后的物理材料名（牌号）
+    category      TEXT NOT NULL DEFAULT 'other',  -- steel/aluminum/plastic/rubber/glass/adhesive/foam/other
+    standard_code TEXT,
+    description   TEXT,
+    source        TEXT,                  -- 数据来源（手册/试验报告/导入文件）
+    revision      INTEGER NOT NULL DEFAULT 1,  -- 内容变更时 +1；引用侧（二期零件匹配）钉住它
+    status        TEXT NOT NULL DEFAULT 'active',   -- active/deprecated
+    created_by    TEXT NOT NULL DEFAULT '',
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sim_material_category ON sim_material(category);
+CREATE INDEX IF NOT EXISTS idx_sim_material_status ON sim_material(status);
+
+-- 标量性能：展示与检索用，导出以求解器卡为准（卡里已有同名参数，不做双写一致）。
+CREATE TABLE IF NOT EXISTS sim_material_property (
+    id             TEXT PRIMARY KEY,
+    material_id    TEXT NOT NULL REFERENCES sim_material(id) ON DELETE CASCADE,
+    name           TEXT NOT NULL,        -- density/youngs_modulus/poisson_ratio/yield_strength…
+    value          REAL NOT NULL,
+    unit           TEXT NOT NULL DEFAULT '',
+    condition_json TEXT,                 -- 适用条件，如 {"temperature_c": 23}
+    created_at     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sim_mat_prop ON sim_material_property(material_id);
+
+-- 曲线。family_key 承载"同一物理量按应变率分组"的曲线族——LS-DYNA 的
+-- *DEFINE_TABLE 正是这个结构；condition_json 存这条曲线的适用条件。
+-- points_json 存文件原始数值；真实值 = SFA*(a+OFFA) / SFO*(o+OFFO)，因子在
+-- scale_json，展示侧套用——不落地"已缩放"的点，避免与原文块两处真相。
+CREATE TABLE IF NOT EXISTS sim_material_curve (
+    id             TEXT PRIMARY KEY,
+    material_id    TEXT NOT NULL REFERENCES sim_material(id) ON DELETE CASCADE,
+    curve_type     TEXT NOT NULL DEFAULT 'generic',  -- stress_strain/strain_rate_scale/…
+    title          TEXT NOT NULL DEFAULT '',
+    family_key     TEXT NOT NULL DEFAULT '',
+    condition_json TEXT,
+    x_quantity     TEXT NOT NULL DEFAULT '',
+    x_unit         TEXT NOT NULL DEFAULT '',
+    y_quantity     TEXT NOT NULL DEFAULT '',
+    y_unit         TEXT NOT NULL DEFAULT '',
+    points_json    TEXT NOT NULL,        -- [[x,y],…]
+    scale_json     TEXT,                 -- {sfa,sfo,offa,offo}
+    source_lcid    INTEGER,
+    created_at     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sim_mat_curve ON sim_material_curve(material_id);
+
+-- 求解器卡：物理材料在某求解器下的一个模型变体（主卡/伴生 NULL 卡）。
+-- keyword_text 是**自包含**关键字块（MAT + 其引用的 DEFINE_TABLE/DEFINE_CURVE
+-- 原文），经过工程验证，导出直接用它，不重新生成。
+CREATE TABLE IF NOT EXISTS sim_material_card (
+    id           TEXT PRIMARY KEY,
+    material_id  TEXT NOT NULL REFERENCES sim_material(id) ON DELETE CASCADE,
+    solver_type  TEXT NOT NULL DEFAULT 'lsdyna',
+    mat_type     TEXT NOT NULL,               -- 如 PIECEWISE_LINEAR_PLASTICITY
+    title        TEXT NOT NULL DEFAULT '',    -- 原卡标题（含变体后缀，溯源用）
+    variant      TEXT NOT NULL DEFAULT 'primary',  -- primary/null/alt
+    unit_system  TEXT NOT NULL DEFAULT 't-mm-s',
+    source_mid   INTEGER,
+    params_json  TEXT,
+    keyword_text TEXT NOT NULL,
+    created_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sim_mat_card ON sim_material_card(material_id);
 """
 
 
@@ -270,10 +392,50 @@ class SimDB(PipelineStoreMixin):
         with self._lock:
             self.conn.executescript(_SCHEMA)
             self.conn.executescript(PIPELINE_SCHEMA)
+            self._migrate()
             self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
+
+    def _migrate(self) -> None:
+        """对历史库做增量迁移（新增列）。
+
+        `CREATE TABLE IF NOT EXISTS` 只对**新库**生效：已经建过表的库不会因为
+        _SCHEMA 里加了一列就自动长出来，读写新列会直接 OperationalError。
+        故与 jobs_db._migrate 同法逐列补齐。**加列时两处都要改**：_SCHEMA（新库）
+        与这里（老库）。约束：ALTER TABLE ADD COLUMN 不能加 NOT NULL 无默认值的列。
+        """
+        def ensure(table: str, columns: Dict[str, str]) -> None:
+            have = {
+                r["name"]
+                for r in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if not have:  # 表还不存在（executescript 已建过，理论上不会走到）
+                return
+            for col, decl in columns.items():
+                if col not in have:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
+        # 网格版本：.ansa 正本 + 派生产物分槽 + 逐零件/合并溯源 + 检出状态
+        ensure("sim_mesh_version", {
+            "ansa_file": "TEXT",
+            "solver_file": "TEXT",
+            "solver_format": "TEXT",
+            "preview_file": "TEXT",
+            "report_file": "TEXT",
+            "part_filter": "TEXT",
+            "source_mesh_ids_json": "TEXT",
+            "checkout_id": "TEXT",
+            "checkout_by": "TEXT",
+            "checkout_at": "REAL",
+            "updated_at": "REAL",
+        })
+        # 几何版本：零件清单与网格策略建议
+        ensure("sim_geometry_version", {
+            "part_inventory_json": "TEXT",
+            "mesh_strategy_json": "TEXT",
+        })
 
     # --- 内部工具 -------------------------------------------------------
 
@@ -451,6 +613,24 @@ class SimDB(PipelineStoreMixin):
              gid),
         )
 
+    def set_geometry_analysis(
+        self, gid: str, part_inventory: Optional[List] = None,
+        mesh_strategy: Optional[Dict] = None,
+    ) -> None:
+        """写入 mesh.inventory（零件清单）与 mesh.classify（网格策略建议）的产出。
+
+        两者都是"对同一份几何的分析结论"，故落在几何版本上而不是网格版本上：
+        网格还没生成时它们就该可见——正是它们决定了每个零件该用哪种网格策略。
+        """
+        self._write(
+            "UPDATE sim_geometry_version SET"
+            " part_inventory_json=COALESCE(?, part_inventory_json),"
+            " mesh_strategy_json=COALESCE(?, mesh_strategy_json) WHERE id=?",
+            (json.dumps(part_inventory, ensure_ascii=False) if part_inventory is not None else None,
+             json.dumps(mesh_strategy, ensure_ascii=False) if mesh_strategy is not None else None,
+             gid),
+        )
+
     def list_geometries(self, sim_target_id: str) -> List[sqlite3.Row]:
         return self._all(
             "SELECT * FROM sim_geometry_version WHERE sim_target_id=? ORDER BY version_no",
@@ -467,13 +647,19 @@ class SimDB(PipelineStoreMixin):
         mesh_params: Optional[Dict] = None,
         mesh_file: Optional[str] = None,
         quality: Optional[Dict] = None,
+        status: str = "ready",
+        part_filter: Optional[str] = None,
+        source_mesh_ids: Optional[List[str]] = None,
     ) -> str:
         """追加一个网格版本，version_no 自动递增。
 
-        mesh_engine 一期通常是 'manual'（人工上传）；vektor3d 网格能力就绪后
-        改为能力 ID，此处无需变更。
+        mesh_engine：'manual'（人工上传）或能力 ID（如 'vektor3d:mesh.generate'）。
+        status 传 'generating' 表示"已登记、产物还没回来"——vektor3d 的网格作业
+        动辄几分钟到几十分钟，必须先落一行让页面能展示进度，产物回传时再补齐。
+        part_filter / source_mesh_ids 见表注释（逐零件 / 合并回装,二者互斥）。
         """
         mid = _uid()
+        now = time.time()
         with self._lock:
             row = self.conn.execute(
                 "SELECT COALESCE(MAX(version_no),0)+1 AS n FROM sim_mesh_version"
@@ -483,16 +669,85 @@ class SimDB(PipelineStoreMixin):
             self.conn.execute(
                 """INSERT INTO sim_mesh_version
                    (id, sim_geometry_version_id, version_no, mesh_type, mesh_engine,
-                    mesh_params_json, mesh_file, quality_json, status, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    mesh_params_json, mesh_file, quality_json, part_filter,
+                    source_mesh_ids_json, status, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (mid, sim_geometry_version_id, row["n"], mesh_type, mesh_engine,
                  json.dumps(mesh_params, ensure_ascii=False) if mesh_params else None,
                  mesh_file,
                  json.dumps(quality, ensure_ascii=False) if quality else None,
-                 "ready", time.time()),
+                 part_filter,
+                 json.dumps(source_mesh_ids, ensure_ascii=False) if source_mesh_ids else None,
+                 status, now, now),
             )
             self.conn.commit()
         return mid
+
+    def set_mesh_artifact(self, mid: str, kind: str, rel_path: str,
+                          solver_format: Optional[str] = None) -> None:
+        """写入网格产物文件句柄。kind ∈ ansa/solver/preview/report。
+
+        分槽而不是一个 mesh_file：.ansa 是正本，求解器文件是派生物，
+        预览与报告是给人看的——混在一列里就分不清"能不能再导出别的格式"。
+        """
+        column = {
+            "ansa": "ansa_file",
+            "solver": "solver_file",
+            "preview": "preview_file",
+            "report": "report_file",
+        }.get(kind)
+        if not column:
+            raise ValueError(f"未知的网格产物类型: {kind}")
+        if column == "solver_file" and solver_format:
+            self._write(
+                "UPDATE sim_mesh_version SET solver_file=?, solver_format=?, updated_at=?"
+                " WHERE id=?",
+                (rel_path, solver_format, time.time(), mid),
+            )
+            return
+        self._write(
+            f"UPDATE sim_mesh_version SET {column}=?, updated_at=? WHERE id=?",
+            (rel_path, time.time(), mid),
+        )
+
+    def set_mesh_status(self, mid: str, status: str,
+                        quality: Optional[Dict] = None) -> None:
+        """更新网格版本状态（generating/ready/failed/checked-out）。
+
+        失败原因写进 quality_json.summary——页面本来就在读它，
+        不必为"失败信息"再开一列。
+        """
+        if quality is not None:
+            self._write(
+                "UPDATE sim_mesh_version SET status=?, quality_json=?, updated_at=?"
+                " WHERE id=?",
+                (status, json.dumps(quality, ensure_ascii=False), time.time(), mid),
+            )
+            return
+        self._write(
+            "UPDATE sim_mesh_version SET status=?, updated_at=? WHERE id=?",
+            (status, time.time(), mid),
+        )
+
+    def set_mesh_checkout(self, mid: str, checkout_id: Optional[str],
+                          by: Optional[str] = None) -> None:
+        """登记/清除检出状态。checkout_id=None 表示检入完成，释放占用。
+
+        检出是人工微调回路的取出端：工作副本在工程师本机，SDM 这边只记
+        "谁在改、凭据是什么",据此在页面上显示占用并允许其检入。
+        """
+        if checkout_id:
+            self._write(
+                "UPDATE sim_mesh_version SET checkout_id=?, checkout_by=?,"
+                " checkout_at=?, status='checked-out', updated_at=? WHERE id=?",
+                (checkout_id, by, time.time(), time.time(), mid),
+            )
+        else:
+            self._write(
+                "UPDATE sim_mesh_version SET checkout_id=NULL, checkout_by=NULL,"
+                " checkout_at=NULL, status='ready', updated_at=? WHERE id=?",
+                (time.time(), mid),
+            )
 
     def get_mesh(self, mid: str) -> Optional[sqlite3.Row]:
         return self._one("SELECT * FROM sim_mesh_version WHERE id=?", (mid,))
@@ -639,6 +894,14 @@ class SimDB(PipelineStoreMixin):
 
     def delete_quality_card(self, qid: str) -> bool:
         return self._write("DELETE FROM sim_quality_card WHERE id=?", (qid,)) > 0
+
+    def count_cards_by_template(self) -> Dict[str, int]:
+        """各模板被多少个项目实例引用。实例文件是派生时拷走的,删模板不影响
+        既有实例——这个数只用来在删除前提示影响面。"""
+        rows = self._all(
+            "SELECT template_id, COUNT(*) AS n FROM sim_quality_card GROUP BY template_id"
+        )
+        return {r["template_id"]: r["n"] for r in rows}
 
     # --- 工况模板 -------------------------------------------------------
 
@@ -844,3 +1107,240 @@ class SimDB(PipelineStoreMixin):
                WHERE s.sim_project_id=? ORDER BY r.created_at DESC""",
             (sim_project_id,),
         )
+
+    # --- AI 会话 ---------------------------------------------------------
+
+    def create_ai_session(self, sim_project_id: str, title: str, created_by: str) -> str:
+        sid = _uid()
+        now = time.time()
+        self._write(
+            """INSERT INTO sim_ai_session
+               (id, sim_project_id, title, created_by, status, created_at, updated_at)
+               VALUES (?,?,?,?, 'active', ?, ?)""",
+            (sid, sim_project_id, title, created_by, now, now),
+        )
+        return sid
+
+    def get_ai_session(self, sid: str) -> Optional[sqlite3.Row]:
+        return self._one("SELECT * FROM sim_ai_session WHERE id=?", (sid,))
+
+    def list_ai_sessions(self, sim_project_id: str) -> List[sqlite3.Row]:
+        return self._all(
+            "SELECT * FROM sim_ai_session WHERE sim_project_id=? ORDER BY updated_at DESC",
+            (sim_project_id,),
+        )
+
+    def update_ai_session(self, sid: str, **fields) -> None:
+        allowed = {"title", "status"}
+        self._update("sim_ai_session", sid,
+                     {k: v for k, v in fields.items() if k in allowed})
+
+    def delete_ai_session(self, sid: str) -> bool:
+        return self._write("DELETE FROM sim_ai_session WHERE id=?", (sid,)) > 0
+
+    def add_ai_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        proposals: Optional[List[Dict]] = None,
+        citations: Optional[List[Dict]] = None,
+        meta: Optional[Dict] = None,
+    ) -> str:
+        """追加一条消息。seq 在同一把锁里取 MAX+1，与插入构成事务，并发追加不重号。"""
+        mid = _uid()
+        now = time.time()
+        with self._lock:
+            seq = self.conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM sim_ai_message WHERE session_id=?",
+                (session_id,),
+            ).fetchone()[0]
+            self.conn.execute(
+                """INSERT INTO sim_ai_message
+                   (id, session_id, seq, role, content,
+                    proposals_json, citations_json, meta_json, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (mid, session_id, seq, role, content,
+                 json.dumps(proposals, ensure_ascii=False) if proposals else None,
+                 json.dumps(citations, ensure_ascii=False) if citations else None,
+                 json.dumps(meta, ensure_ascii=False) if meta else None, now),
+            )
+            self.conn.execute(
+                "UPDATE sim_ai_session SET updated_at=? WHERE id=?", (now, session_id)
+            )
+            self.conn.commit()
+        return mid
+
+    def get_ai_message(self, mid: str) -> Optional[sqlite3.Row]:
+        return self._one("SELECT * FROM sim_ai_message WHERE id=?", (mid,))
+
+    def list_ai_messages(self, session_id: str) -> List[sqlite3.Row]:
+        return self._all(
+            "SELECT * FROM sim_ai_message WHERE session_id=? ORDER BY seq",
+            (session_id,),
+        )
+
+    def set_ai_message_proposals(self, mid: str, proposals: List[Dict]) -> None:
+        """整体回写某条消息的提案数组——只用于翻提案的 UI 状态
+        （pending → confirmed/rejected），消息内容与其余字段不可改。"""
+        self._write(
+            "UPDATE sim_ai_message SET proposals_json=? WHERE id=?",
+            (json.dumps(proposals, ensure_ascii=False), mid),
+        )
+
+    # --- 材料库 -----------------------------------------------------------
+
+    def create_material(
+        self,
+        name: str,
+        category: str = "other",
+        standard_code: Optional[str] = None,
+        description: Optional[str] = None,
+        source: Optional[str] = None,
+        created_by: str = "",
+    ) -> str:
+        mid = _uid()
+        now = time.time()
+        self._write(
+            """INSERT INTO sim_material
+               (id, name, category, standard_code, description, source,
+                revision, status, created_by, created_at, updated_at)
+               VALUES (?,?,?,?,?,?, 1, 'active', ?, ?, ?)""",
+            (mid, name, category, standard_code, description, source,
+             created_by, now, now),
+        )
+        return mid
+
+    def get_material(self, mid: str) -> Optional[sqlite3.Row]:
+        return self._one("SELECT * FROM sim_material WHERE id=?", (mid,))
+
+    def get_material_by_name(self, name: str) -> Optional[sqlite3.Row]:
+        return self._one("SELECT * FROM sim_material WHERE name=?", (name,))
+
+    def list_materials(
+        self,
+        category: Optional[str] = None,
+        q: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[sqlite3.Row]:
+        """列表带卡/曲线计数——列表页要展示"这材料有多少可用资产"，
+        不值得为它发 2N 个查询。"""
+        sql = """SELECT m.*,
+                   (SELECT COUNT(*) FROM sim_material_card c
+                     WHERE c.material_id=m.id) AS card_count,
+                   (SELECT COUNT(*) FROM sim_material_curve v
+                     WHERE v.material_id=m.id) AS curve_count
+                 FROM sim_material m WHERE 1=1"""
+        args: List = []
+        if category:
+            sql += " AND m.category=?"
+            args.append(category)
+        if status:
+            sql += " AND m.status=?"
+            args.append(status)
+        if q:
+            sql += " AND m.name LIKE ?"
+            args.append(f"%{q}%")
+        sql += " ORDER BY m.category, m.name"
+        return self._all(sql, tuple(args))
+
+    def update_material(self, mid: str, **fields) -> None:
+        allowed = {"name", "category", "standard_code", "description",
+                   "source", "status"}
+        self._update("sim_material", mid,
+                     {k: v for k, v in fields.items() if k in allowed})
+
+    def delete_material(self, mid: str) -> bool:
+        return self._write("DELETE FROM sim_material WHERE id=?", (mid,)) > 0
+
+    def material_properties(self, mid: str) -> List[sqlite3.Row]:
+        return self._all(
+            "SELECT * FROM sim_material_property WHERE material_id=? ORDER BY name",
+            (mid,),
+        )
+
+    def material_curves(self, mid: str) -> List[sqlite3.Row]:
+        return self._all(
+            """SELECT * FROM sim_material_curve WHERE material_id=?
+               ORDER BY family_key, source_lcid""",
+            (mid,),
+        )
+
+    def material_cards(self, mid: str) -> List[sqlite3.Row]:
+        # primary 排最前：详情页第一眼看到的应是主卡而非伴生 NULL 卡
+        return self._all(
+            """SELECT * FROM sim_material_card WHERE material_id=?
+               ORDER BY variant='primary' DESC, title""",
+            (mid,),
+        )
+
+    def replace_material_content(
+        self,
+        mid: str,
+        properties: List[Dict],
+        curves: List[Dict],
+        cards: List[Dict],
+        bump_revision: bool = False,
+    ) -> None:
+        """整体替换一个材料的性能/曲线/卡，单事务。
+
+        导入是"新修订整体替换"语义而非逐条 diff——半新半旧的材料比过时的
+        材料更危险：它看起来是新的。"""
+        now = time.time()
+        with self._lock:
+            try:
+                for t in ("sim_material_property", "sim_material_curve",
+                          "sim_material_card"):
+                    self.conn.execute(f"DELETE FROM {t} WHERE material_id=?", (mid,))
+                for p in properties:
+                    self.conn.execute(
+                        """INSERT INTO sim_material_property
+                           (id, material_id, name, value, unit, condition_json, created_at)
+                           VALUES (?,?,?,?,?,?,?)""",
+                        (_uid(), mid, p["name"], p["value"], p.get("unit", ""),
+                         json.dumps(p["condition"], ensure_ascii=False)
+                         if p.get("condition") else None, now),
+                    )
+                for c in curves:
+                    self.conn.execute(
+                        """INSERT INTO sim_material_curve
+                           (id, material_id, curve_type, title, family_key,
+                            condition_json, x_quantity, x_unit, y_quantity, y_unit,
+                            points_json, scale_json, source_lcid, created_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (_uid(), mid, c.get("curve_type", "generic"),
+                         c.get("title", ""), c.get("family_key", ""),
+                         json.dumps(c["condition"], ensure_ascii=False)
+                         if c.get("condition") else None,
+                         c.get("x_quantity", ""), c.get("x_unit", ""),
+                         c.get("y_quantity", ""), c.get("y_unit", ""),
+                         json.dumps(c["points"]),
+                         json.dumps(c["scale"]) if c.get("scale") else None,
+                         c.get("source_lcid"), now),
+                    )
+                for k in cards:
+                    self.conn.execute(
+                        """INSERT INTO sim_material_card
+                           (id, material_id, solver_type, mat_type, title, variant,
+                            unit_system, source_mid, params_json, keyword_text, created_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                        (_uid(), mid, k.get("solver_type", "lsdyna"), k["mat_type"],
+                         k.get("title", ""), k.get("variant", "primary"),
+                         k.get("unit_system", "t-mm-s"), k.get("source_mid"),
+                         json.dumps(k["params"], ensure_ascii=False)
+                         if k.get("params") else None,
+                         k["keyword_text"], now),
+                    )
+                if bump_revision:
+                    self.conn.execute(
+                        "UPDATE sim_material SET revision=revision+1, updated_at=? WHERE id=?",
+                        (now, mid),
+                    )
+                else:
+                    self.conn.execute(
+                        "UPDATE sim_material SET updated_at=? WHERE id=?", (now, mid)
+                    )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise

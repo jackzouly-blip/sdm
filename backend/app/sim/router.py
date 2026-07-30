@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -34,6 +35,7 @@ from ..auth.session import (
     is_admin_request,
     issue_scoped_token,
     principal_is_admin,
+    resolve_multi_scoped_principal,
     resolve_scoped_principal,
 )
 from ..config import get_settings
@@ -68,8 +70,9 @@ def _row(r: sqlite3.Row, json_fields: tuple = ()) -> Dict:
 
 PROJECT_JSON: tuple = ()
 TARGET_JSON = ("source_ref_json",)
-GEOM_JSON = ("source_file_json", "topo_summary_json")
-MESH_JSON = ("mesh_params_json", "quality_json")
+GEOM_JSON = ("source_file_json", "topo_summary_json",
+             "part_inventory_json", "mesh_strategy_json")
+MESH_JSON = ("mesh_params_json", "quality_json", "source_mesh_ids_json")
 TEMPLATE_JSON = ("schema_json", "default_values_json",
                  "validation_rules_json", "export_mapping_json")
 SUBJECT_JSON = ("config_json",)
@@ -125,6 +128,14 @@ def _owned_geometry(db: SimDB, gid: str, user: str, is_admin: bool) -> sqlite3.R
     return row
 
 
+def _owned_mesh(db: SimDB, mid: str, user: str, is_admin: bool) -> sqlite3.Row:
+    row = db.get_mesh(mid)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "网格版本不存在")
+    _owned_geometry(db, row["sim_geometry_version_id"], user, is_admin)
+    return row
+
+
 def _owned_requirement(db: SimDB, rid: str, user: str, is_admin: bool) -> sqlite3.Row:
     row = db.get_requirement_doc(rid)
     if row is None:
@@ -141,36 +152,54 @@ def _owned_quality_card(db: SimDB, qid: str, user: str, is_admin: bool) -> sqlit
     return row
 
 
-def _quality_library(request: Request):
-    """模板库句柄。用户模板落数据目录,内置模板随代码走。
+def _quality_templates_root() -> str:
+    """全局用户模板目录。放在 scratch 之外的固定位置:模板是长期资产,
+    不能跟着临时目录被清掉。"""
+    return os.path.join(os.path.dirname(get_settings().db_path), "quality-templates")
 
-    用户目录放在 scratch 之外的固定位置:模板是长期资产,不能跟着临时目录被清掉。
-    """
+
+def _quality_library(request: Request):
+    """模板库句柄。用户模板落数据目录,内置模板随代码走。"""
     from .quality import QualityCardLibrary
 
-    root = os.path.join(os.path.dirname(get_settings().db_path), "quality-templates")
-    return QualityCardLibrary(user_dir=root)
+    return QualityCardLibrary(user_dir=_quality_templates_root())
 
 
 def _quality_card_detail(card) -> Dict:
     """把一张卡摊平成前端能直接渲染的结构。
 
-    只回启用的判据:那张 5mm 卡 28 条 shells 判据里只开了 11 条,把关掉的一起
-    铺给用户看,等于让他以为那些也在管。
+    criteria 只含启用的 shells 判据——它是"这张卡在管什么"的答案,别把关掉的
+    混进去让人以为那些也在管。但整份卡远不止这 11 行:allCriteria 铺出全部判据
+    (含停用与 solids 域),meshGroups 铺出生成侧全部参数(按 .ansa_mpar 的分节
+    分组)——否则用户会以为这张卡就只有一屏,而其余内容其实都会交给 ANSA。
     """
     from .quality import estimate_time_step
 
-    criteria = [
-        {
+    def _criterion(c) -> Dict:
+        return {
             "name": c.name,
             "domain": c.domain,
+            "enabled": c.enabled,
             "calculation": c.calculation,       # 算法族:同一指标不同算法数值不同
             "weight": c.weight,
             "higherIsBetter": c.higher_is_better,
             "thresholds": c.thresholds,
         }
-        for c in card.criteria.enabled_criteria("shells")
-    ]
+
+    criteria = [_criterion(c) for c in card.criteria.enabled_criteria("shells")]
+    all_criteria = [_criterion(c) for c in card.criteria.criteria]
+
+    # 生成侧参数按文件里的分节分组,保持文件顺序——这些段正是网格生成侧的
+    # 旋钮分类。值保留原始字符串(数字/布尔/枚举/表达式混杂,解析了就毁了)。
+    mesh_groups: List[Dict] = []
+    by_title: Dict[str, Dict] = {}
+    for key, value in card.mesh_params.values.items():
+        title = card.mesh_params.sections.get(key, "")
+        grp = by_title.get(title)
+        if grp is None:
+            grp = by_title[title] = {"title": title, "params": []}
+            mesh_groups.append(grp)
+        grp["params"].append({"key": key, "value": value})
     min_len = card.criteria.get("min length")
     failed_len = (min_len.thresholds.get("failed") if min_len else None) or 0.0
     return {
@@ -183,6 +212,8 @@ def _quality_card_detail(card) -> Dict:
         "builtin": card.builtin,
         "ansaVersion": card.criteria.ansa_version,
         "criteria": criteria,
+        "allCriteria": all_criteria,
+        "meshGroups": mesh_groups,
         "meshParams": {
             "targetElementLength": card.target_element_length,
             "minTargetLength": card.mesh_params.get_float("general_min_target_len"),
@@ -193,6 +224,30 @@ def _quality_card_detail(card) -> Dict:
         # 判废线上的最小单元长度对应的显式时间步——碰撞里这才是机时的总闸
         "timeStepAtFailedMinLength": estimate_time_step(failed_len),
     }
+
+
+def _overrides_from_request(raw_overrides: List[Dict], user: str):
+    """把请求体里的覆盖项转成 Override,并强制每项都带依据(source)。
+
+    old_value 留空:真实旧值由引擎在落盘时回填,不信调用方给的。
+    """
+    from .quality import Override
+
+    out = []
+    for raw in raw_overrides:
+        if not str(raw.get("source") or "").strip():
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"覆盖项 {raw.get('target')} 缺少依据(source)——无出处的阈值会一路流进网格验收",
+            )
+        out.append(Override(
+            target=str(raw.get("target") or ""),
+            old_value="",
+            new_value=str(raw.get("new_value") or ""),
+            source=str(raw.get("source") or ""),
+            by=str(raw.get("by") or user),
+        ))
+    return out
 
 
 # --- 请求体 -------------------------------------------------------------
@@ -231,12 +286,30 @@ class GeometryCreate(BaseModel):
 
 
 class MeshCreate(BaseModel):
-    mesh_type: str
-    # 一期通常是 manual（人工上传）；vektor3d 网格能力就绪后填能力 ID
+    mesh_type: str                          # surface/volume/midsurface
+    # manual（人工上传）或能力 ID（如 vektor3d:mesh.generate）
     mesh_engine: str = "manual"
     mesh_params: Optional[Dict] = None
     mesh_file: Optional[str] = None
     quality: Optional[Dict] = None
+    # generating = 已登记、产物还没回来（能力作业动辄几十分钟，页面要能显示进度）
+    status: str = "ready"
+    part_filter: Optional[str] = None       # 逐零件生成时的零件名
+    source_mesh_ids: Optional[List[str]] = None  # 合并回装的来源网格
+
+
+class MeshUpdate(BaseModel):
+    status: Optional[str] = None            # generating/ready/failed/checked-out
+    quality: Optional[Dict] = None
+
+
+class MeshCheckout(BaseModel):
+    checkout_id: str = Field(min_length=1, description="vektor3d mesh.checkout 返回的检出标识")
+
+
+class GeometryAnalysis(BaseModel):
+    part_inventory: Optional[List] = None   # mesh.inventory 的 parts[]
+    mesh_strategy: Optional[Dict] = None    # mesh.classify 的完整产出
 
 
 class TemplateCreate(BaseModel):
@@ -603,6 +676,15 @@ GEOMETRY_CONVERT_SCOPE = "geometry.convert"
 # 需求文档分析票据。与几何票据同一套机制,但绑的是 rid ——一张票据只能读一份文档,
 # 换个 rid 就 403。不共用一个 scope 是刻意的:几何票据能写产物,这张只能读。
 DOC_ANALYZE_SCOPE = "doc.analyze"
+# AI 会话只读票据:绑单个项目,只在枚举的只读接口上有效(见会话契约第 3 节)。
+# 它会长期、高频地出现在桌面进程里,泄露半径必须一开始就钉死为
+# "这一个项目的只读视图"——写永远只有提案-确认一条路。
+AI_READ_SCOPE = "ai.read"
+# 网格作业票据。绑单个网格版本 mid,可读该网格的输入(几何源文件 / .ansa 正本)
+# 与写它的产物。网格链比几何链多两个特点,故单独一个 scope 而不复用几何票据:
+# ① 产物有四类(.ansa 正本 / 求解器文件 / 预览 GLB / 质量报告),几何票据只认 glb;
+# ② mesh.merge 要同时拉多个零件的 .ansa —— 用 mid 列表绑定(见 bindings.mids)。
+MESH_JOB_SCOPE = "mesh.job"
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -621,6 +703,48 @@ def _geometry_principal(
     return resolve_scoped_principal(
         raw, act_as, scope=GEOMETRY_CONVERT_SCOPE, bindings={"gid": gid}
     )
+
+
+def _geometry_or_mesh_principal(
+    gid: str,
+    token: Optional[str] = Query(None),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    act_as: Optional[str] = Header(None, alias="X-Act-As-User"),
+) -> str:
+    """几何源文件端点的调用者(比 _geometry_principal 多接受网格作业票据)。
+
+    网格能力同样要拉这份源文件(mesh.generate 的输入就是 CAD 原件),
+    不该逼 SDM 为一次网格作业再签一张几何票据——那会把两条链的过期时间
+    绑在一起,网格作业动辄几十分钟,几何票据 30 分钟根本不够。
+    """
+    raw = token or (creds.credentials if creds else None)
+    return resolve_multi_scoped_principal(raw, act_as, allow_scopes={
+        GEOMETRY_CONVERT_SCOPE: {"gid": gid},
+        MESH_JOB_SCOPE: {"gid": gid},
+    })
+
+
+def _mesh_principal(
+    gid: str,
+    token: Optional[str] = Query(None),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    act_as: Optional[str] = Header(None, alias="X-Act-As-User"),
+) -> str:
+    """网格产物端点的调用者:常规用户令牌,或本 gid 的网格作业票据。"""
+    raw = token or (creds.credentials if creds else None)
+    return resolve_scoped_principal(
+        raw, act_as, scope=MESH_JOB_SCOPE, bindings={"gid": gid}
+    )
+
+
+def _mesh_is_admin(
+    user: str = Depends(_mesh_principal),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    portal_admin: Optional[str] = Header(None, alias="X-Hpc-Portal-Admin"),
+) -> bool:
+    """同 _geometry_is_admin,但主体由 _mesh_principal 解析(理由同前:
+    is_admin_request 依赖 current_user,而 current_user 拒绝一切受限票据)。"""
+    return principal_is_admin(user, creds.credentials if creds else None, portal_admin)
 
 
 def _geometry_is_admin(
@@ -683,12 +807,20 @@ def create_convert_ticket(
     )
 
 
+def _geometry_or_mesh_is_admin(
+    user: str = Depends(_geometry_or_mesh_principal),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    portal_admin: Optional[str] = Header(None, alias="X-Hpc-Portal-Admin"),
+) -> bool:
+    return principal_is_admin(user, creds.credentials if creds else None, portal_admin)
+
+
 @router.get("/geometries/{gid}/download")
 def download_geometry(
     request: Request,
     gid: str,
-    user: str = Depends(_geometry_principal),
-    is_admin: bool = Depends(_geometry_is_admin),
+    user: str = Depends(_geometry_or_mesh_principal),
+    is_admin: bool = Depends(_geometry_or_mesh_is_admin),
 ):
     """下载几何源文件。
 
@@ -787,6 +919,19 @@ def download_lightweight(
                         media_type="model/gltf-binary")
 
 
+@router.get("/geometries/{gid}")
+def get_geometry(
+    request: Request,
+    gid: str,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """取单个几何版本。前端在网格作业进行中要反复刷它读分析结果与产物状态,
+    不必为此拉整个列表。"""
+    db = _db(request)
+    return _row(_owned_geometry(db, gid, user, is_admin), GEOM_JSON)
+
+
 @router.get("/geometries/{gid}/meshes")
 def list_meshes(
     request: Request,
@@ -809,16 +954,265 @@ def add_mesh(
 ) -> Dict:
     """登记一个网格版本。
 
-    一期 mesh_engine=manual（人工上传网格文件）；vektor3d 的 mesh.generate
-    能力就绪后由编排节点调用同一接口写入，此处无需改动。
+    两种用法:mesh_engine=manual 是人工上传;由 vektor3d 网格能力产出时,
+    前端先带 status='generating' 登记(能力作业动辄几十分钟,得先有一行让页面
+    能展示进度),产物回传与状态回写走后面的 artifact / PATCH 两个端点。
     """
     db = _db(request)
     _owned_geometry(db, gid, user, is_admin)
     mid = db.add_mesh(
         gid, body.mesh_type, body.mesh_engine, body.mesh_params,
         body.mesh_file, body.quality,
+        status=body.status, part_filter=body.part_filter,
+        source_mesh_ids=body.source_mesh_ids,
     )
     return _row(db.get_mesh(mid), MESH_JSON)
+
+
+@router.patch("/geometries/{gid}/meshes/{mid}")
+def update_mesh(
+    request: Request,
+    gid: str,
+    mid: str,
+    body: MeshUpdate,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """回写网格作业的状态与质量结论(浏览器代理拿到能力结果后调用)。
+
+    失败时把原因放进 quality.summary —— 页面本就在读它,不必另开一列。
+    """
+    db = _db(request)
+    _owned_mesh(db, mid, user, is_admin)
+    if body.status:
+        db.set_mesh_status(mid, body.status, body.quality)
+    elif body.quality is not None:
+        db.set_mesh_quality(mid, body.quality)
+    return _row(db.get_mesh(mid), MESH_JSON)
+
+
+# --- 网格能力的文件通道 --------------------------------------------------
+#
+# 与几何链同构(票据 → vektor3d 直连拉取/回传),但网格产物有四类角色:
+#   ansa    .ansa 原生库 —— **正本**,手工微调/装配合并/换格式导出都以它为源
+#   solver  求解器文件   —— 派生物(.nas/.k/.inp/...),交给求解器算的就是它
+#   preview 预览 GLB     —— 带真实单元边线,复用几何那套 three.js 查看器
+#   report  质量报告     —— ANSA 出的 HTML 统计
+# 分角色而不是"一个 mesh_file 走天下":混在一列里就分不清能不能再导出别的格式。
+
+MESH_ARTIFACT_KINDS = {
+    "ansa": (".ansa", "application/octet-stream"),
+    "solver": (None, "application/octet-stream"),   # 扩展名由 solver_format 决定
+    "preview": ((".glb", ".gltf"), "model/gltf-binary"),
+    "report": ((".html", ".htm"), "text/html; charset=utf-8"),
+}
+
+
+class MeshTicket(BaseModel):
+    """网格作业票据。URL 由前端用 window.location.origin 拼(理由同 ConvertTicket)。"""
+    gid: str
+    token: str
+    expires_in: int
+    source_name: str
+    source_path_suffix: str = Field(description="几何源文件下载路径（相对 /api）")
+    mesh_path_prefix: str = Field(description="网格产物路径前缀（相对 /api），后接 /{mid}/artifact/{kind}")
+
+
+@router.post("/geometries/{gid}/mesh-ticket")
+def create_mesh_ticket(
+    request: Request,
+    gid: str,
+    ttl_seconds: int = Query(7200, ge=60, le=28800),
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> MeshTicket:
+    """为网格作业签发受限令牌(绑本 gid)。
+
+    默认 2 小时:网格作业比几何转换慢一个量级(大件几十分钟,还可能排队),
+    票据在作业跑完前过期会让回传阶段功亏一篑。上限 8 小时。
+    只有常规用户令牌能调它——票据不能自我续签。
+    """
+    db = _db(request)
+    row = _owned_geometry(db, gid, user, is_admin)
+    src = _json_or_none(row["source_file_json"]) or {}
+    if not src.get("path"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "该几何版本没有源文件，无法生成网格")
+
+    token = issue_scoped_token(user, MESH_JOB_SCOPE, ttl_seconds, gid=gid)
+    log.info("签发网格作业票据 gid=%s user=%s ttl=%ss", gid, user, ttl_seconds)
+    return MeshTicket(
+        gid=gid,
+        token=token,
+        expires_in=ttl_seconds,
+        source_name=src.get("name") or os.path.basename(src["path"]),
+        source_path_suffix=f"/sim/geometries/{gid}/download",
+        mesh_path_prefix=f"/sim/geometries/{gid}/meshes",
+    )
+
+
+@router.post("/geometries/{gid}/meshes/{mid}/artifact/{kind}")
+async def upload_mesh_artifact(
+    request: Request,
+    gid: str,
+    mid: str,
+    kind: str,
+    file: UploadFile = File(...),
+    meta: Optional[str] = Form(None, description="能力回传的元数据 JSON（单元数/违例等）"),
+    user: str = Depends(_mesh_principal),
+    is_admin: bool = Depends(_mesh_is_admin),
+) -> Dict:
+    """接收 vektor3d 回传的网格产物(multipart，字段 file + 可选 meta)。
+
+    kind ∈ ansa/solver/preview/report。产物落在几何源文件同一目录下的 mesh/ 子目录,
+    以项目属主身份写盘(与轻量化产物同例)。
+    """
+    from ..fs.browser import FsError, write_file
+
+    spec = MESH_ARTIFACT_KINDS.get(kind)
+    if not spec:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"未知的网格产物类型 {kind}（可选 {'/'.join(MESH_ARTIFACT_KINDS)}）",
+        )
+    db = _db(request)
+    mesh_row = _owned_mesh(db, mid, user, is_admin)
+    if mesh_row["sim_geometry_version_id"] != gid:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "该网格版本不属于此几何版本")
+    geom = db.get_geometry(gid)
+    target = db.get_target(geom["sim_target_id"])
+    proj = db.get_project(target["sim_project_id"])
+
+    src = _json_or_none(geom["source_file_json"]) or {}
+    if not src.get("path"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "该几何版本没有源文件，无法关联产物")
+    parent = os.path.join(os.path.dirname(src["path"]), "mesh")
+
+    name = os.path.basename((file.filename or "").replace("\\", "/")) or f"mesh-{kind}"
+    allowed_ext = spec[0]
+    if allowed_ext and not name.lower().endswith(allowed_ext):
+        want = allowed_ext if isinstance(allowed_ext, str) else "/".join(allowed_ext)
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"{kind} 产物的扩展名必须是 {want}（收到 {name}）",
+        )
+    # 同一网格版本的同类产物固定文件名，避免反复检入检出堆出一堆同名变体
+    name = f"m{mesh_row['version_no']:02d}-{kind}{os.path.splitext(name)[1]}"
+
+    data = await file.read()
+    try:
+        written = write_file(proj["owner"], parent, name, data,
+                             get_settings().fs_root_list)
+    except FsError as e:
+        raise HTTPException(e.status, f"写入网格产物失败: {e.message}")
+
+    info = {}
+    if meta:
+        try:
+            info = json.loads(meta) or {}
+        except ValueError:
+            log.warning("网格产物元数据不是合法 JSON，已忽略 mid=%s kind=%s", mid, kind)
+    db.set_mesh_artifact(mid, kind, written["path"],
+                         solver_format=info.get("solverFormat"))
+    # 主产物(正本/求解器)到位即视为可用;质量结论随 meta 一并落库供页面展示
+    if kind in ("ansa", "solver"):
+        quality = _json_or_none(mesh_row["quality_json"]) or {}
+        quality.update({k: v for k, v in info.items() if k != "uploaded"})
+        db.set_mesh_status(mid, "ready", quality)
+    log.info("回传网格产物 mid=%s kind=%s file=%s (%d 字节)", mid, kind, name, len(data))
+    return _row(db.get_mesh(mid), MESH_JSON)
+
+
+@router.get("/geometries/{gid}/meshes/{mid}/artifact/{kind}")
+def download_mesh_artifact(
+    request: Request,
+    gid: str,
+    mid: str,
+    kind: str,
+    user: str = Depends(_mesh_principal),
+    is_admin: bool = Depends(_mesh_is_admin),
+):
+    """取网格产物。
+
+    三类消费方共用它:浏览器 three.js 加载 preview(GLTFLoader 设不了 header,
+    故令牌走 query)、vektor3d 拉 .ansa 做导出/检查/合并/检出、用户直接下载求解器文件。
+    """
+    from fastapi.responses import FileResponse
+
+    spec = MESH_ARTIFACT_KINDS.get(kind)
+    if not spec:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"未知的网格产物类型 {kind}")
+    db = _db(request)
+    row = _owned_mesh(db, mid, user, is_admin)
+    if row["sim_geometry_version_id"] != gid:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "该网格版本不属于此几何版本")
+    path = row[{"ansa": "ansa_file", "solver": "solver_file",
+                "preview": "preview_file", "report": "report_file"}[kind]]
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"尚无 {kind} 产物")
+    return FileResponse(path, filename=os.path.basename(path), media_type=spec[1])
+
+
+@router.post("/geometries/{gid}/meshes/{mid}/checkout")
+def checkout_mesh(
+    request: Request,
+    gid: str,
+    mid: str,
+    body: MeshCheckout,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """登记检出(工程师把 .ansa 取到本机 ANSA 里改)。
+
+    SDM 这边只记"谁在改、凭据是什么":工作副本在对方机器上,正本仍在这里。
+    已被别人检出时拒绝——两个人各改各的,谁后检入谁覆盖,静默丢工作。
+    """
+    db = _db(request)
+    row = _owned_mesh(db, mid, user, is_admin)
+    if row["checkout_id"] and row["checkout_by"] and row["checkout_by"] != user:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"该网格已被 {row['checkout_by']} 检出，请等待其提交或联系其释放",
+        )
+    if not row["ansa_file"]:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "该网格版本没有 .ansa 正本，无法检出")
+    db.set_mesh_checkout(mid, body.checkout_id, user)
+    log.info("网格检出 mid=%s by=%s checkout=%s", mid, user, body.checkout_id)
+    return _row(db.get_mesh(mid), MESH_JSON)
+
+
+@router.post("/geometries/{gid}/meshes/{mid}/checkin")
+def checkin_mesh(
+    request: Request,
+    gid: str,
+    mid: str,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """释放检出占用。新版本文件本身经 artifact 端点回传，这里只翻状态。"""
+    db = _db(request)
+    _owned_mesh(db, mid, user, is_admin)
+    db.set_mesh_checkout(mid, None)
+    log.info("网格检入 mid=%s by=%s", mid, user)
+    return _row(db.get_mesh(mid), MESH_JSON)
+
+
+@router.put("/geometries/{gid}/analysis")
+def set_geometry_analysis(
+    request: Request,
+    gid: str,
+    body: GeometryAnalysis,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """回写 mesh.inventory(零件清单)与 mesh.classify(网格策略建议)的产出。
+
+    这两项是对几何的分析结论、网格生成之前就该可见——正是它们决定了
+    每个零件用哪种网格策略(见能力契约 2.7/2.8)。
+    """
+    db = _db(request)
+    _owned_geometry(db, gid, user, is_admin)
+    db.set_geometry_analysis(gid, body.part_inventory, body.mesh_strategy)
+    return _row(db.get_geometry(gid), GEOM_JSON)
 
 
 # --- 客户需求文档 -------------------------------------------------------
@@ -885,15 +1279,27 @@ async def upload_requirement_doc(
 
 
 def _requirement_principal(
+    request: Request,
     rid: str,
     token: Optional[str] = Query(None),
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
     act_as: Optional[str] = Header(None, alias="X-Act-As-User"),
 ) -> str:
-    """需求文档下载的调用者:常规用户令牌,或本 rid 的分析票据(vektor3d 用)。"""
+    """需求文档下载的调用者:常规用户令牌、本 rid 的分析票据,或本项目的
+    ai.read 只读票据(AI 会话中 vektor3d 深读原文档用,见会话契约第 3 节)。
+
+    ai.read 绑的是项目,先查文档属于哪个项目再核对——查库放在依赖里而不是
+    handler 里,绑定核对必须发生在主体解析这一步,不给"忘了核对"留机会。
+    """
     raw = token or (creds.credentials if creds else None)
-    return resolve_scoped_principal(
-        raw, act_as, scope=DOC_ANALYZE_SCOPE, bindings={"rid": rid}
+    row = _db(request).get_requirement_doc(rid)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "需求文档不存在")
+    return resolve_multi_scoped_principal(
+        raw, act_as, allow_scopes={
+            DOC_ANALYZE_SCOPE: {"rid": rid},
+            AI_READ_SCOPE: {"pid": row["sim_project_id"]},
+        },
     )
 
 
@@ -963,8 +1369,11 @@ def download_requirement_doc(
     path = src.get("path")
     if not path or not os.path.isfile(path):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "需求文档不存在或已被删除")
+    # ETag = 内容 sha256:vektor3d workspace 的 manifest 靠它判缓存是否过期
+    # (会话契约 2.2)。AI 拿三天前的文档回答今天的问题,比"不可用"危险得多。
     return FileResponse(path, filename=src.get("name") or os.path.basename(path),
-                        media_type="application/octet-stream")
+                        media_type="application/octet-stream",
+                        headers={"ETag": f'"{_file_sha256(path)}"'})
 
 
 @router.delete("/requirements/{rid}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1047,7 +1456,7 @@ def replace_requirement_items(
 ) -> Dict:
     """整体替换条目。与规则解析同一个入口语义——重解析不追加,避免新旧两版并存。"""
     db = _db(request)
-    _owned_requirement(db, rid, user, is_admin)
+    row = _owned_requirement(db, rid, user, is_admin)
 
     items = []
     for raw in body.items:
@@ -1057,7 +1466,34 @@ def replace_requirement_items(
     if not items:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "没有可写入的条目")
 
+    # AI 回写时服务端再独立跑一遍规则抽取做交叉核对:一致互为佐证、冲突转待澄清、
+    # 仅规则抽到的兜底保留(视觉失败页的表格内容规则侧本来就有)。规则结果不进 AI
+    # 的提示词——两条线独立才有交叉验证的价值,合并与裁决全在 merge.py 的纯代码里。
+    merge_stats = None
+    if body.extractor == "ai":
+        from .requirements import extract_from_file, items_to_json
+        from .requirements.merge import merge_rule_and_ai
+
+        src = _json_or_none(row["source_file_json"]) or {}
+        path = src.get("path")
+        if path and os.path.isfile(path):
+            try:
+                rule_items = items_to_json(extract_from_file(path))
+            except ValueError:
+                rule_items = None      # 格式规则抽不了(如 pdf),合并不适用
+            except Exception:
+                # 规则侧崩溃不能拖垮 AI 回写:AI 结果照常落库,只是少了交叉核对
+                log.exception("规则抽取失败,跳过交叉核对 rid=%s", rid)
+                rule_items = None
+            if rule_items is not None:
+                items, merge_stats = merge_rule_and_ai(rule_items, items)
+                log.info("规则/AI 交叉核对 rid=%s 一致 %d 冲突 %d 规则兜底 %d 仅AI %d",
+                         rid, merge_stats["agreed"], merge_stats["conflicts"],
+                         merge_stats["ruleOnly"], merge_stats["aiOnly"])
+
     count = db.replace_requirement_items(rid, items)
+    # body.summary 里的自由字段(如 AI 的 notes)原样保留,下面只覆盖统计口径——
+    # notes 记的是"AI 在哪里拿不准",丢了就等于把最该人工复核的线索扔了
     summary = dict(body.summary or {})
     summary.update({
         "itemCount": count,
@@ -1070,6 +1506,8 @@ def replace_requirement_items(
         "loadPointCoordsAvailable": False,
         "extractor": body.extractor,
     })
+    if merge_stats is not None:
+        summary["merge"] = merge_stats
     db.set_requirement_analysis(rid, summary, "done")
     log.info("回写需求条目 rid=%s %d 条 extractor=%s", rid, count, body.extractor)
     return {"summary": summary, "items": [_row(r, ITEM_JSON) for r in db.list_requirement_items(rid)]}
@@ -1125,6 +1563,314 @@ def update_requirement_item(
     return _row(db.get_requirement_item(iid), ITEM_JSON)
 
 
+# --- AI 会话:只读票据、项目快照、会话与消息 -----------------------------
+#
+# 契约见 docs/vektor3d-ai-session-contract.md。要点:
+#   - SDM 持主数据与消息流;推理过程留在 vektor3d 侧 workspace,可丢;
+#   - ai.read 票据绑单项目、只在枚举的只读接口上有效;
+#   - AI 只能"提案",确认后由浏览器带**用户自己的凭据**调既有接口执行——
+#     本节没有、也不应该有任何新的写主数据接口。
+
+# 提案动作枚举(契约 5.2)。不在枚举里的 action 一律 400——新场景通过修订
+# 契约加入,不通过"先发了再说"加入。
+AI_PROPOSAL_ACTIONS = {
+    "requirement_item.update",
+    "requirement_item.resolve_clarification",
+    "quality_template.edit_content",
+    "quality_template.derive",
+}
+
+_file_hash_cache: Dict[str, tuple] = {}   # path -> (size, mtime, sha256)
+
+
+def _file_sha256(path: str) -> str:
+    """文件内容 sha256,按 (size, mtime) 缓存——需求文档是 MB 级、请求是高频的。"""
+    import hashlib
+
+    st = os.stat(path)
+    cached = _file_hash_cache.get(path)
+    if cached and cached[0] == st.st_size and cached[1] == st.st_mtime:
+        return cached[2]
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    _file_hash_cache[path] = (st.st_size, st.st_mtime, digest)
+    return digest
+
+
+def _json_sha256(obj) -> str:
+    import hashlib
+
+    return hashlib.sha256(
+        json.dumps(obj, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _ai_read_principal(
+    pid: str,
+    token: Optional[str] = Query(None),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    act_as: Optional[str] = Header(None, alias="X-Act-As-User"),
+) -> str:
+    """项目级只读端点的调用者:常规用户令牌,或本项目的 ai.read 票据。"""
+    raw = token or (creds.credentials if creds else None)
+    return resolve_scoped_principal(raw, act_as, scope=AI_READ_SCOPE, bindings={"pid": pid})
+
+
+def _ai_read_is_admin(
+    user: str = Depends(_ai_read_principal),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    portal_admin: Optional[str] = Header(None, alias="X-Hpc-Portal-Admin"),
+) -> bool:
+    """同 is_admin_request,但主体由 _ai_read_principal 解析(后者接受受限票据)。"""
+    return principal_is_admin(user, creds.credentials if creds else None, portal_admin)
+
+
+class AiReadTicket(BaseModel):
+    """交给浏览器、再转交 vektor3d 的项目级只读票据(会话契约第 3 节)。"""
+    pid: str
+    token: str
+    expires_in: int
+    context_path_suffix: str = Field(description="项目快照路径(相对 /api)")
+
+
+@router.post("/projects/{pid}/ai-read-ticket")
+def create_ai_read_ticket(
+    request: Request,
+    pid: str,
+    ttl_seconds: int = Query(1800, ge=60, le=7200),
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> AiReadTicket:
+    """签发 AI 会话只读票据。只有常规用户令牌能调——票据不能自我续签。"""
+    db = _db(request)
+    _owned_project(db, pid, user, is_admin)
+    token = issue_scoped_token(user, AI_READ_SCOPE, ttl_seconds, pid=pid)
+    log.info("签发 AI 只读票据 pid=%s user=%s ttl=%ss", pid, user, ttl_seconds)
+    return AiReadTicket(
+        pid=pid, token=token, expires_in=ttl_seconds,
+        context_path_suffix=f"/sim/projects/{pid}/ai-context",
+    )
+
+
+@router.get("/projects/{pid}/ai-context")
+def get_ai_context(
+    request: Request,
+    pid: str,
+    user: str = Depends(_ai_read_principal),
+    is_admin: bool = Depends(_ai_read_is_admin),
+) -> Dict:
+    """项目上下文快照:AI 会话推理的推荐起点(契约 4.1)。
+
+    每节带内容 hash,供 vektor3d workspace 的 manifest 判缓存过期。它是推荐
+    起点而非强制边界——vektor3d 也可以凭票据走枚举的只读接口深读原件。
+    """
+    db = _db(request)
+    proj = _owned_project(db, pid, user, is_admin)
+
+    docs = []
+    items = []
+    for d in db.list_requirement_docs(pid):
+        src = _json_or_none(d["source_file_json"]) or {}
+        path = src.get("path")
+        docs.append({
+            "id": d["id"], "name": d["name"], "docType": d["doc_type"],
+            "analysisStatus": d["analysis_status"],
+            "hash": _file_sha256(path) if path and os.path.isfile(path) else None,
+            "downloadPathSuffix": f"/sim/requirements/{d['id']}/download",
+        })
+        items.extend(
+            {**_row(r, ITEM_JSON), "doc_name": d["name"]}
+            for r in db.list_requirement_items(d["id"])
+        )
+
+    cards = []
+    for r in db.list_quality_cards(pid):
+        card = _row(r, QUALITY_CARD_JSON)
+        card_dir = r["card_dir"]
+        if card_dir and os.path.isdir(card_dir):
+            from .quality import QualityCardLibrary
+
+            lib = QualityCardLibrary(user_dir=os.path.dirname(card_dir))
+            try:
+                card["card"] = _quality_card_detail(lib.load(os.path.basename(card_dir)))
+            except Exception:
+                log.exception("ai-context 载入质量卡失败 qid=%s", r["id"])
+        cards.append(card)
+
+    subjects = [_row(r, SUBJECT_JSON) for r in db.list_subjects(pid, None)]
+
+    return {
+        "project": {
+            "id": proj["id"], "name": proj["name"],
+            "description": proj["description"],
+            "unitSystem": proj["unit_system"],
+        },
+        "requirementDocs": docs,
+        "requirementItems": {"hash": _json_sha256(items), "items": items},
+        "qualityCards": {"hash": _json_sha256(cards), "cards": cards},
+        "subjects": {"hash": _json_sha256(subjects), "subjects": subjects},
+        "generatedAt": time.time(),
+    }
+
+
+def _owned_ai_session(db: SimDB, sid: str, user: str, is_admin: bool):
+    row = db.get_ai_session(sid)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "会话不存在")
+    _owned_project(db, row["sim_project_id"], user, is_admin)
+    return row
+
+
+AI_MESSAGE_JSON = ("proposals_json", "citations_json", "meta_json")
+
+
+class AiSessionCreate(BaseModel):
+    title: str = Field("", max_length=200)
+
+
+@router.post("/projects/{pid}/ai-sessions", status_code=status.HTTP_201_CREATED)
+def create_ai_session(
+    request: Request,
+    pid: str,
+    body: AiSessionCreate,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    db = _db(request)
+    _owned_project(db, pid, user, is_admin)
+    sid = db.create_ai_session(pid, body.title.strip() or "新会话", user)
+    return _row(db.get_ai_session(sid))
+
+
+@router.get("/projects/{pid}/ai-sessions")
+def list_ai_sessions(
+    request: Request,
+    pid: str,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> List[Dict]:
+    db = _db(request)
+    _owned_project(db, pid, user, is_admin)
+    return [_row(r) for r in db.list_ai_sessions(pid)]
+
+
+@router.get("/ai-sessions/{sid}")
+def get_ai_session(
+    request: Request,
+    sid: str,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    db = _db(request)
+    row = _owned_ai_session(db, sid, user, is_admin)
+    return {
+        **_row(row),
+        "messages": [_row(m, AI_MESSAGE_JSON) for m in db.list_ai_messages(sid)],
+    }
+
+
+@router.delete("/ai-sessions/{sid}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_ai_session(
+    request: Request,
+    sid: str,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> None:
+    db = _db(request)
+    _owned_ai_session(db, sid, user, is_admin)
+    db.delete_ai_session(sid)
+
+
+class AiMessageIn(BaseModel):
+    """一条会话消息。user 消息由用户输入;assistant 消息是浏览器从 vektor3d
+    `llm.chat` 取回后落库(消息流是主数据,契约 5.3);system 消息记提案执行
+    结果等注记。"""
+    role: str = Field(pattern="^(user|assistant|system)$")
+    content: str = ""
+    proposals: Optional[List[Dict]] = None
+    citations: Optional[List[Dict]] = None
+    meta: Optional[Dict] = None
+
+
+@router.post("/ai-sessions/{sid}/messages", status_code=status.HTTP_201_CREATED)
+def add_ai_message(
+    request: Request,
+    sid: str,
+    body: AiMessageIn,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    db = _db(request)
+    _owned_ai_session(db, sid, user, is_admin)
+
+    proposals = None
+    if body.proposals:
+        proposals = []
+        for raw in body.proposals:
+            action = str(raw.get("action") or "")
+            if action not in AI_PROPOSAL_ACTIONS:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    f"未知的提案动作 {action}(允许:{sorted(AI_PROPOSAL_ACTIONS)})。"
+                    "新动作通过修订会话契约加入,不通过先发了再说加入",
+                )
+            if not str(raw.get("reason") or "").strip():
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    f"提案 {action} 缺少 reason——没有出处的改动就是编的",
+                )
+            # status 由服务端置 pending,不信调用方——提案的裁决只能来自确认接口
+            proposals.append({**raw, "status": "pending",
+                              "decided_by": "", "decided_at": None})
+
+    if not body.content.strip() and not proposals:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "消息为空")
+    mid = db.add_ai_message(sid, body.role, body.content,
+                            proposals=proposals, citations=body.citations,
+                            meta=body.meta)
+    return _row(db.get_ai_message(mid), AI_MESSAGE_JSON)
+
+
+class ProposalDecision(BaseModel):
+    """对一条提案的裁决。**只翻 UI 状态**:真正的数据变更由前端带用户凭据调
+    对应的既有接口完成(那里有属主校验与留痕),这里只记"谁在何时决定了什么"。"""
+    index: int = Field(ge=0)
+    decision: str = Field(pattern="^(confirmed|rejected)$")
+    note: str = ""
+
+
+@router.post("/ai-sessions/{sid}/messages/{mid}/proposal-decision")
+def decide_ai_proposal(
+    request: Request,
+    sid: str,
+    mid: str,
+    body: ProposalDecision,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    db = _db(request)
+    _owned_ai_session(db, sid, user, is_admin)
+    msg = db.get_ai_message(mid)
+    if msg is None or msg["session_id"] != sid:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "消息不存在")
+    proposals = _json_or_none(msg["proposals_json"]) or []
+    if body.index >= len(proposals):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "提案不存在")
+    if proposals[body.index].get("status") != "pending":
+        raise HTTPException(status.HTTP_409_CONFLICT, "该提案已裁决,不能重复裁决")
+    proposals[body.index].update(
+        status=body.decision, decided_by=user, decided_at=time.time(),
+        note=body.note,
+    )
+    db.set_ai_message_proposals(mid, proposals)
+    log.info("AI 提案裁决 sid=%s mid=%s #%d %s by=%s",
+             sid, mid, body.index, body.decision, user)
+    return _row(db.get_ai_message(mid), AI_MESSAGE_JSON)
+
+
 # --- 质量卡模板库与项目实例 ---------------------------------------------
 
 @router.get("/quality-templates")
@@ -1132,10 +1878,18 @@ def list_quality_templates(
     request: Request,
     user: str = Depends(current_user),
 ) -> List[Dict]:
-    """模板库:内置只读 + 用户自建。内置那张是所有项目的缺省底座。"""
+    """模板库:内置只读 + 用户自建。内置那张是所有项目的缺省底座。
+
+    used_by 是被项目实例引用的次数。实例文件派生时已拷走,删模板不破坏既有
+    实例——这个数只用来让删除者知道影响面。
+    """
     from dataclasses import asdict
 
-    return [asdict(t) for t in _quality_library(request).list_templates()]
+    counts = _db(request).count_cards_by_template()
+    return [
+        {**asdict(t), "used_by": counts.get(t.id, 0)}
+        for t in _quality_library(request).list_templates()
+    ]
 
 
 @router.get("/quality-templates/{template_id}")
@@ -1186,27 +1940,15 @@ def create_project_quality_card(
     """派生实例。产物是**合法的 ANSA 卡**,可直接交回 ANSA 跑批处理。"""
     from dataclasses import asdict
 
-    from .quality import Override, QualityCardLibrary
+    from .quality import QualityCardLibrary
 
     db = _db(request)
     proj = _owned_project(db, pid, user, is_admin)
     card_root = os.path.join(_project_workdir(db, proj), "sdm_quality_cards")
-    lib = QualityCardLibrary(user_dir=card_root)
+    # 底座可以来自全局模板库(含导入的客户模板),产物落项目目录
+    lib = QualityCardLibrary(user_dir=card_root, extra_dirs=[_quality_templates_root()])
 
-    overrides = []
-    for raw in body.overrides:
-        if not str(raw.get("source") or "").strip():
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST,
-                f"覆盖项 {raw.get('target')} 缺少依据(source)——无出处的阈值会一路流进网格验收",
-            )
-        overrides.append(Override(
-            target=str(raw.get("target") or ""),
-            old_value="",
-            new_value=str(raw.get("new_value") or ""),
-            source=str(raw.get("source") or ""),
-            by=str(raw.get("by") or user),
-        ))
+    overrides = _overrides_from_request(body.overrides, user)
 
     instance_id = f"{pid[:8]}-{uuid.uuid4().hex[:6]}"
     try:
@@ -1316,7 +2058,7 @@ async def import_quality_template(
             json.dump({
                 "id": template_id, "name": name, "source": source, "revision": revision,
                 "scope": scope, "description": note, "builtin": False,
-                "based_on": "", "overrides": [],
+                "based_on": "", "created_by": user, "overrides": [],
             }, f, ensure_ascii=False, indent=2)
     except Exception:
         shutil.rmtree(dest, ignore_errors=True)
@@ -1326,6 +2068,149 @@ async def import_quality_template(
              template_id, user, len(parsed.data.criteria),
              "继承内置" if inherited else "随包上传")
     return _quality_card_detail(lib.load(template_id))
+
+
+def _manageable_template(request: Request, template_id: str, user: str, is_admin: bool):
+    """删/改模板前的权限闸:内置不可动;用户模板只有导入者或管理员可动。
+
+    老模板 created_by 为空(加字段前导入的),视为仅管理员可管——宁可收紧,
+    模板是全局共享资产,谁都能删等于谁都不敢用。
+    """
+    lib = _quality_library(request)
+    try:
+        meta = lib.get_meta(template_id)
+    except KeyError as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e))
+    if meta.builtin:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "内置模板不可修改或删除")
+    if not is_admin and (not meta.created_by or meta.created_by != user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "只有导入者或管理员可以管理此模板")
+    return lib, meta
+
+
+class QualityTemplateMetaUpdate(BaseModel):
+    """只改元数据,不碰阈值——阈值改动必须走派生留痕,这里不能成为绕过口子。"""
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    source: Optional[str] = None
+    revision: Optional[str] = None
+    scope: Optional[str] = None
+    description: Optional[str] = None
+
+
+@router.patch("/quality-templates/{template_id}")
+def update_quality_template(
+    request: Request,
+    template_id: str,
+    body: QualityTemplateMetaUpdate,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    from dataclasses import asdict
+
+    lib, _ = _manageable_template(request, template_id, user, is_admin)
+    try:
+        meta = lib.update_meta(template_id, **body.model_dump(exclude_unset=True))
+    except PermissionError as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(e))
+    log.info("更新质量卡模板元数据 %s by=%s", template_id, user)
+    return asdict(meta)
+
+
+@router.delete("/quality-templates/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_quality_template(
+    request: Request,
+    template_id: str,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> None:
+    """删用户模板。既有项目实例不受影响——实例文件在派生时已拷进项目目录。"""
+    lib, _ = _manageable_template(request, template_id, user, is_admin)
+    try:
+        lib.delete(template_id)
+    except PermissionError as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(e))
+    log.info("删除质量卡模板 %s by=%s", template_id, user)
+
+
+class QualityTemplateContentEdit(BaseModel):
+    """在线修改用户模板的内容(阈值/网格参数)。
+
+    与实例编辑同一条规矩:每项改动必须带依据(source)。改动追加进模板的
+    overrides 留痕,原样落进 .ansa_qual/.ansa_mpar——模板改完仍是可直接交回
+    ANSA 的合法卡。只影响之后从它派生的实例;既有实例的文件早已拷走。
+    """
+    overrides: List[Dict] = Field(min_length=1)
+
+
+@router.patch("/quality-templates/{template_id}/content")
+def edit_quality_template_content(
+    request: Request,
+    template_id: str,
+    body: QualityTemplateContentEdit,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    from dataclasses import asdict
+
+    lib, _ = _manageable_template(request, template_id, user, is_admin)
+    overrides = _overrides_from_request(body.overrides, user)
+    try:
+        meta = lib.edit_content(template_id, overrides)
+    except PermissionError as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(e))
+    except (KeyError, ValueError) as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+    log.info("在线编辑质量卡模板 %s 新增 %d 项覆盖 by=%s", template_id, len(overrides), user)
+    out = _quality_card_detail(lib.load(template_id))
+    out["overrides"] = [asdict(o) for o in meta.overrides]
+    return out
+
+
+class QualityTemplateDerive(BaseModel):
+    """从既有模板派生一张新的用户模板。
+
+    内置模板的内容不可直接改——想改它,就以它为底座派生一张自己的,改动逐项
+    留痕。这也是"从零填一张"之外唯一的建卡方式:从零填必然漏项,漏掉的项会
+    静默变成"不检查"。
+    """
+    new_id: str
+    name: str = Field(min_length=1, max_length=200)
+    overrides: List[Dict] = Field(default_factory=list)
+    source: str = ""
+    revision: str = ""
+    scope: str = ""
+    description: str = ""
+
+
+@router.post("/quality-templates/{template_id}/derive", status_code=status.HTTP_201_CREATED)
+def derive_quality_template(
+    request: Request,
+    template_id: str,
+    body: QualityTemplateDerive,
+    user: str = Depends(current_user),
+) -> Dict:
+    from dataclasses import asdict
+
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{1,63}", body.new_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "模板 id 只能用字母数字与 - _,长度 2~64")
+    lib = _quality_library(request)
+    try:
+        lib.get_meta(template_id)
+    except KeyError as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e))
+    overrides = _overrides_from_request(body.overrides, user)
+    try:
+        meta = lib.derive(template_id, body.new_id, body.name, overrides,
+                          source=body.source, revision=body.revision, scope=body.scope,
+                          description=body.description, created_by=user)
+    except FileExistsError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e))
+    except (KeyError, ValueError) as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+    log.info("派生质量卡模板 %s ← %s 覆盖 %d 项 by=%s",
+             body.new_id, template_id, len(meta.overrides), user)
+    return asdict(meta)
 
 
 class QualityCardEdit(BaseModel):
@@ -1348,7 +2233,6 @@ def edit_quality_card(
     """在线改阈值/网格参数。改动累加进 overrides,原样落进 ANSA 卡文件。"""
     from dataclasses import asdict
 
-    from .quality import Override
     from .quality.library import _apply_override
     from .quality import ansa_mpar, ansa_qual
     from .quality.library import CRITERIA_FILE, MESH_FILE
@@ -1362,15 +2246,7 @@ def edit_quality_card(
     qual = ansa_qual.load(os.path.join(card_dir, CRITERIA_FILE))
     mpar = ansa_mpar.load(os.path.join(card_dir, MESH_FILE))
     applied = []
-    for raw in body.overrides:
-        if not str(raw.get("source") or "").strip():
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST,
-                f"覆盖项 {raw.get('target')} 缺少依据(source)——无出处的阈值会一路流进网格验收",
-            )
-        ov = Override(target=str(raw.get("target") or ""), old_value="",
-                      new_value=str(raw.get("new_value") or ""),
-                      source=str(raw.get("source") or ""), by=str(raw.get("by") or user))
+    for ov in _overrides_from_request(body.overrides, user):
         try:
             applied.append(_apply_override(qual, mpar, ov))
         except (KeyError, ValueError) as e:
@@ -1429,6 +2305,134 @@ def delete_project_quality_card(
     if row["card_dir"] and os.path.isdir(row["card_dir"]):
         shutil.rmtree(row["card_dir"], ignore_errors=True)
     db.delete_quality_card(qid)
+
+
+# --- 材料库 ---------------------------------------------------------------
+# 全局资产：读对所有登录用户开放，写仅管理员——错误的材料数据会污染其后
+# 所有引用它的计算。设计见 docs/sdm-material-library.md。
+
+MATERIAL_CURVE_JSON = ("condition_json", "points_json", "scale_json")
+MATERIAL_CARD_JSON = ("params_json",)
+
+# 关键字文本上限。种子库 76 张卡才 400KB，50MB 足够容纳任何真实材料库；
+# 再大的多半是整车 deck 传错了文件。
+_MATERIAL_FILE_MAX = 50 * 1024 * 1024
+
+
+def _require_admin(is_admin: bool) -> None:
+    if not is_admin:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "材料库仅管理员可维护")
+
+
+@router.get("/materials")
+def list_materials(
+    request: Request,
+    category: Optional[str] = Query(None),
+    q: Optional[str] = Query(None, max_length=100),
+    status_filter: Optional[str] = Query(None, alias="status"),
+    user: str = Depends(current_user),
+) -> List[Dict]:
+    return [_row(r) for r in _db(request).list_materials(category, q, status_filter)]
+
+
+@router.get("/materials/{mid}")
+def get_material(
+    request: Request,
+    mid: str,
+    user: str = Depends(current_user),
+) -> Dict:
+    db = _db(request)
+    row = db.get_material(mid)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "材料不存在")
+    return {
+        **_row(row),
+        "properties": [_row(p, ("condition_json",)) for p in db.material_properties(mid)],
+        "curves": [_row(c, MATERIAL_CURVE_JSON) for c in db.material_curves(mid)],
+        "cards": [_row(k, MATERIAL_CARD_JSON) for k in db.material_cards(mid)],
+    }
+
+
+@router.post("/materials/import", status_code=status.HTTP_201_CREATED)
+async def import_materials(
+    request: Request,
+    file: UploadFile = File(..., description="LS-DYNA 关键字文件（.k/.key）"),
+    unit_system: str = Form("t-mm-s"),
+    solver_type: str = Form("lsdyna"),
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """导入关键字文件里的材料段。幂等：内容未变的材料跳过，变了的整体替换
+    并 revision+1——半新半旧的材料比过时的更危险。"""
+    from .materials import import_material_text
+
+    _require_admin(is_admin)
+    data = await file.read()
+    if len(data) > _MATERIAL_FILE_MAX:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                            "文件过大，确认这是材料库而不是整车 deck")
+    report = import_material_text(
+        _db(request),
+        data.decode("utf-8", errors="replace"),
+        unit_system=unit_system,
+        solver_type=solver_type,
+        source=file.filename or "",
+        actor=user,
+    )
+    log.info("导入材料库 %s by=%s: +%d ~%d =%d",
+             file.filename, user, report["materials_created"],
+             report["materials_updated"], report["materials_unchanged"])
+    return report
+
+
+class MaterialUpdate(BaseModel):
+    """元数据编辑。性能/曲线/卡不在此列——那些只能整体走导入（新修订），
+    单点改数会让卡原文与结构化参数两处真相分叉。"""
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    category: Optional[str] = Field(None, max_length=40)
+    standard_code: Optional[str] = Field(None, max_length=100)
+    description: Optional[str] = Field(None, max_length=2000)
+    source: Optional[str] = Field(None, max_length=500)
+    status: Optional[str] = Field(None, pattern="^(active|deprecated)$")
+
+
+@router.patch("/materials/{mid}")
+def update_material(
+    request: Request,
+    mid: str,
+    body: MaterialUpdate,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    _require_admin(is_admin)
+    db = _db(request)
+    if db.get_material(mid) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "材料不存在")
+    fields = body.model_dump(exclude_unset=True)
+    if "name" in fields:
+        other = db.get_material_by_name(fields["name"])
+        if other is not None and other["id"] != mid:
+            raise HTTPException(status.HTTP_409_CONFLICT,
+                                f"已存在同名材料: {fields['name']}")
+    db.update_material(mid, **fields)
+    log.info("更新材料 %s by=%s: %s", mid, user, list(fields))
+    return _row(db.get_material(mid))
+
+
+@router.delete("/materials/{mid}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_material(
+    request: Request,
+    mid: str,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> None:
+    _require_admin(is_admin)
+    db = _db(request)
+    row = db.get_material(mid)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "材料不存在")
+    db.delete_material(mid)
+    log.info("删除材料 %s(%s) by=%s", row["name"], mid, user)
 
 
 # --- 工况模板 -----------------------------------------------------------

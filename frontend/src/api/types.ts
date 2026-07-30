@@ -554,6 +554,15 @@ export interface SimExtractSummary {
   extractor: string;
   /** AI 读不懂/有矛盾/缺失之处，逐条说明 */
   notes?: string[];
+  /** 规则/AI 交叉核对统计（AI 回写时服务端独立跑规则抽取合并的结果） */
+  merge?: {
+    ruleTotal: number;
+    aiTotal: number;
+    agreed: number;
+    conflicts: number;
+    ruleOnly: number;
+    aiOnly: number;
+  };
 }
 
 export interface SimQualityTemplate {
@@ -565,6 +574,10 @@ export interface SimQualityTemplate {
   description: string;
   builtin: boolean;
   based_on: string;
+  /** 导入者。老模板为空，视为仅管理员可管理 */
+  created_by: string;
+  /** 被项目实例引用的次数。实例文件已拷走，删模板不影响既有实例 */
+  used_by: number;
   overrides: SimQualityOverride[];
 }
 
@@ -581,6 +594,8 @@ export interface SimQualityOverride {
 export interface SimQualityCriterion {
   name: string;
   domain: string;
+  /** 停用的判据在这张卡里不检查 */
+  enabled: boolean;
   calculation: string;
   weight: number;
   higherIsBetter: boolean;
@@ -596,7 +611,12 @@ export interface SimQualityCardDetail {
   description: string;
   builtin: boolean;
   ansaVersion: string;
+  /** 启用的 shells 判据——"这张卡在管什么"的答案 */
   criteria: SimQualityCriterion[];
+  /** 全部判据，含停用的与 solids 域——整份 .ansa_qual 的完整内容 */
+  allCriteria: SimQualityCriterion[];
+  /** 生成侧 .ansa_mpar 全部参数，按文件分节分组。值为原始字符串（数字/布尔/枚举/表达式混杂） */
+  meshGroups: { title: string; params: { key: string; value: string }[] }[];
   meshParams: {
     targetElementLength: number;
     minTargetLength: number;
@@ -632,6 +652,210 @@ export interface SimGeometry {
   /** 轻量化产物（glTF/GLB）路径；未转换时为 null */
   lightweight_file: string | null;
   topo_summary: Record<string, unknown> | null;
+  /** mesh.inventory 的零件清单（ANSA 产品树口径） */
+  part_inventory: SimPartInventoryItem[] | null;
+  /** mesh.classify 的网格策略建议 */
+  mesh_strategy: SimMeshStrategy | null;
   status: string;
   created_at: number;
+}
+
+// --- 网格（契约：docs/vektor3d-geometry-capability-contract.md 2.3~2.11）---
+
+/** 一个零件（mesh.inventory）。name 可直接作为 mesh.generate 的 partFilter */
+export interface SimPartInventoryItem {
+  index: number;
+  id: number;
+  name: string;
+  moduleId?: string;
+  faceCount: number;
+  /** [minx,miny,minz,maxx,maxy,maxz]，全局坐标 */
+  bbox: number[] | null;
+}
+
+/** 逐零件/逐体的网格策略建议（mesh.classify） */
+export interface SimMeshStrategyPart {
+  partId: string;
+  meshType: "surface" | "volume" | "midsurface";
+  fallback: string | null;
+  confidence: number;
+  needsReview: boolean;
+  /** 二级复核（BREP 壁厚分布）给出的中面最小壁厚建议 */
+  recommendedMinThickness?: number;
+  refined?: boolean;
+  reasons: string[];
+  signals: Record<string, unknown>;
+}
+
+export interface SimMeshStrategy {
+  parts: SimMeshStrategyPart[];
+  summary: {
+    partCount: number;
+    counts: Record<string, number>;
+    needsReviewCount: number;
+  };
+  refineUsed?: boolean;
+  warnings?: string[];
+}
+
+/**
+ * 网格版本。**.ansa 是正本**（几何+网格+属性+厚度全量），solver_file 只是派生物：
+ * 手工微调、装配合并、换求解器格式导出都以 ansa_file 为源。
+ */
+export interface SimMesh {
+  id: string;
+  sim_geometry_version_id: string;
+  version_no: number;
+  mesh_type: string;
+  mesh_engine: string;
+  mesh_params: Record<string, unknown> | null;
+  mesh_file: string | null;
+  ansa_file: string | null;
+  solver_file: string | null;
+  solver_format: string | null;
+  preview_file: string | null;
+  report_file: string | null;
+  /** 逐零件生成时的零件名 */
+  part_filter: string | null;
+  /** 合并回装的来源网格 id */
+  source_mesh_ids: string[] | null;
+  checkout_id: string | null;
+  checkout_by: string | null;
+  checkout_at: number | null;
+  quality: Record<string, unknown> | null;
+  /** generating / ready / failed / checked-out */
+  status: string;
+  created_at: number;
+  updated_at: number | null;
+}
+
+/** 网格作业票据（绑单个 gid，默认 2 小时——网格作业比几何转换慢一个量级） */
+export interface SimMeshTicket {
+  gid: string;
+  token: string;
+  expiresIn: number;
+  sourceName: string;
+  sourceUrl: string;
+  /** 产物地址前缀，后接 /{mid}/artifact/{kind} */
+  meshUrlPrefix: string;
+}
+
+// --- AI 会话（契约：docs/vektor3d-ai-session-contract.md）---
+
+/** 一条结构化提案。AI 只能"提案"，确认后由前端带用户凭据调既有接口执行 */
+export interface SimAiProposal {
+  /** 动作类型，服务端按契约 5.2 的枚举校验 */
+  action: string;
+  targetId?: string;
+  /** 与对应 SDM 接口的请求体字段一致 */
+  patch?: Record<string, unknown>;
+  /** 为什么改——强制，落目标对象的留痕 */
+  reason: string;
+  evidence?: { ref: string; text?: string }[];
+  /** UI 状态：真正的数据变更留痕在目标对象自己的机制里 */
+  status: "pending" | "confirmed" | "rejected";
+  decided_by?: string;
+  decided_at?: number | null;
+  note?: string;
+}
+
+export interface SimAiMessage {
+  id: string;
+  session_id: string;
+  seq: number;
+  role: "user" | "assistant" | "system";
+  content: string;
+  proposals: SimAiProposal[] | null;
+  citations: { text?: string; ref: string }[] | null;
+  meta: Record<string, unknown> | null;
+  created_at: number;
+}
+
+export interface SimAiSession {
+  id: string;
+  sim_project_id: string;
+  title: string;
+  created_by: string;
+  status: string;
+  created_at: number;
+  updated_at: number;
+  /** 详情接口才带 */
+  messages?: SimAiMessage[];
+}
+
+// --- 材料库（全局资产；设计：docs/sdm-material-library.md）---
+
+/** 物理材料（求解器无关）。模型变体在 cards 层 */
+export interface SimMaterial {
+  id: string;
+  name: string;
+  category: string;
+  standard_code: string | null;
+  description: string | null;
+  source: string | null;
+  /** 内容变更时 +1；二期零件匹配钉住它保证可复现 */
+  revision: number;
+  status: "active" | "deprecated";
+  created_by: string;
+  created_at: number;
+  updated_at: number;
+  /** 列表接口带的资产计数 */
+  card_count?: number;
+  curve_count?: number;
+}
+
+export interface SimMaterialProperty {
+  id: string;
+  material_id: string;
+  name: string;
+  value: number;
+  unit: string;
+  condition: Record<string, unknown> | null;
+}
+
+/** 曲线。points 是文件原始数值，真实值 = sfa*(x+offa) / sfo*(y+offo) */
+export interface SimMaterialCurve {
+  id: string;
+  material_id: string;
+  curve_type: string;
+  title: string;
+  /** 同族曲线（如同一张应变率表展开的一组）共享 family_key */
+  family_key: string;
+  condition: { strain_rate?: number; unit?: string } | null;
+  x_quantity: string;
+  x_unit: string;
+  y_quantity: string;
+  y_unit: string;
+  points: [number, number][];
+  scale: { sfa: number; sfo: number; offa: number; offo: number } | null;
+  source_lcid: number | null;
+}
+
+/** 求解器卡：keyword_text 是自包含关键字原文块，导出以它为准 */
+export interface SimMaterialCard {
+  id: string;
+  material_id: string;
+  solver_type: string;
+  mat_type: string;
+  title: string;
+  variant: "primary" | "null" | "alt";
+  unit_system: string;
+  source_mid: number | null;
+  params: Record<string, number> | null;
+  keyword_text: string;
+}
+
+export interface SimMaterialDetail extends SimMaterial {
+  properties: SimMaterialProperty[];
+  curves: SimMaterialCurve[];
+  cards: SimMaterialCard[];
+}
+
+export interface SimMaterialImportReport {
+  materials_created: number;
+  materials_updated: number;
+  materials_unchanged: number;
+  cards: number;
+  curves: number;
+  warnings: string[];
 }

@@ -38,9 +38,12 @@ onMounted(async () => {
   try {
     // 插件必须显式注册——不传 plugins 的话组件能挂上但什么都渲染不出来。
     // 只注册需求文档用得到的三类，顺带把 mermaid/leaflet/hls 这些无关依赖挡在包外。
+    // style.css 必须显式引入：库不会随 JS 自动注入样式，缺了它工具栏图标和
+    // loading 圆环会以裸 HTML 原始尺寸撑满整页，看起来像文档多了一页乱码。
     const [vueMod, core] = await Promise.all([
       import("@open-file-viewer/vue"),
       import("@open-file-viewer/core"),
+      import("@open-file-viewer/core/style.css"),
     ]);
     plugins.value = [
       core.officePlugin(),   // .pptx/.docx/.xlsx —— 技术协议基本都是这几种

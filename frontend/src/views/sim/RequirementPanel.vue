@@ -33,6 +33,10 @@ const cards = ref<SimQualityCard[]>([]);
 const templates = ref<SimQualityTemplate[]>([]);
 const loading = ref(true);
 const error = ref("");
+// 与 error 分开:AI 回落不是"操作失败",是"成功了但降级了"。
+// 更要紧的是 load() 开头会清空 error —— 回落后紧接着刷新列表,
+// 消息刚显示就被自己抹掉,表现为"报错闪一下就没了"。notice 不参与那次清空。
+const notice = ref("");
 const uploading = ref(false);
 const progress = ref(0);
 const fileInput = ref<HTMLInputElement | null>(null);
@@ -136,7 +140,19 @@ async function toggleDoc(d: SimRequirementDoc) {
 }
 
 const extractStep = ref("");
-const aiNotes = ref<Record<string, string[]>>({});
+/** AI 的疑点从落库的 analysis 里取,不再靠前端内存——刷新后仍在 */
+function docNotes(d: SimRequirementDoc): string[] {
+  const raw = (d.analysis as { notes?: unknown } | null)?.notes;
+  return Array.isArray(raw) ? raw.map(String) : [];
+}
+
+/** 规则/AI 交叉核对统计。AI 回写时服务端独立跑规则抽取合并的结果,见后端 merge.py */
+function docMerge(d: SimRequirementDoc) {
+  const m = (d.analysis as { merge?: unknown } | null)?.merge;
+  return m && typeof m === "object"
+    ? (m as { agreed: number; conflicts: number; ruleOnly: number; aiOnly: number })
+    : null;
+}
 
 /**
  * 解析需求文档 → 需求条目。
@@ -152,16 +168,18 @@ async function extract(d: SimRequirementDoc, { preferAi = true } = {}) {
   extracting.value = d.id;
   extractStep.value = "";
   error.value = "";
+  notice.value = "";
   try {
     if (preferAi && vkUsable()) {
       try {
         await extractByAi(d);
         return;
       } catch (e) {
-        // AI 这条路断了就回落，但要把原因说出来——静默降级会让人以为 AI 跑过了
-        error.value = `AI 解析失败，已回落到规则抽取：${
-          e instanceof Vektor3dError ? e.message : errMsg(e)
-        }`;
+        // AI 这条路断了就回落，但必须把原因留在页面上——静默降级会让人以为 AI 跑过了。
+        // 细节同时打进控制台:能力返回的原始错误往往比这一行更能定位问题。
+        const detail = e instanceof Vektor3dError ? e.message : errMsg(e);
+        console.error("[需求解析] AI 解析失败，回落规则抽取：", e);
+        notice.value = `AI 解析失败，已回落到规则抽取：${detail}`;
       }
     }
     extractStep.value = "规则抽取…";
@@ -213,9 +231,11 @@ async function extractByAi(d: SimRequirementDoc) {
     projectCode: result.projectCode,
     parserType: result.parserType,
     loadPointCoordsAvailable: result.loadPointCoordsAvailable,
+    // notes 必须随 summary 落库:它记的是"AI 在哪里拿不准、为什么这么判",
+    // 只留在前端内存里,刷新一次就没了——而这些恰恰是要拿去和客户对的东西。
+    notes: result.notes ?? [],
   });
   items.value = { ...items.value, [d.id]: out.items };
-  aiNotes.value = { ...aiNotes.value, [d.id]: result.notes ?? [] };
   openDoc.value = d.id;
   await load();
 }
@@ -538,6 +558,15 @@ onMounted(async () => {
     <div v-if="error" class="mb-3 px-3 py-2 rounded-md bg-rose-50 text-rose-700 text-sm">
       {{ error }}
     </div>
+    <div
+      v-if="notice"
+      class="mb-3 px-3 py-2 rounded-md bg-amber-50 text-amber-800 text-sm flex items-start gap-2"
+    >
+      <span class="flex-1">{{ notice }}</span>
+      <button class="p-0.5 rounded hover:bg-amber-100 shrink-0" title="知道了" @click="notice = ''">
+        <X :size="14" />
+      </button>
+    </div>
     <div v-if="loading" class="flex items-center gap-2 text-slate-500 text-sm py-8 justify-center">
       <Loader2 :size="18" class="animate-spin" /> 加载中…
     </div>
@@ -758,11 +787,32 @@ onMounted(async () => {
                   </div>
                 </div>
                 <div
-                  v-if="(aiNotes[d.id] ?? []).length"
+                  v-if="docMerge(d)"
+                  class="text-xs rounded px-2 py-1.5"
+                  :class="docMerge(d)!.conflicts
+                    ? 'bg-amber-50/70 text-amber-800'
+                    : 'bg-emerald-50/70 text-emerald-800'"
+                  title="AI 回写时服务端独立跑了一遍规则抽取做交叉核对：两边独立阅读、代码比对。冲突条目已标为待澄清，两个读数都在条目的澄清提示里；规则兜底是 AI 未覆盖（如视觉解析失败页）、由规则从文字层补上的条目"
+                >
+                  规则/AI 交叉核对：一致 {{ docMerge(d)!.agreed }} 条
+                  <template v-if="docMerge(d)!.conflicts">
+                    · <b>读数冲突 {{ docMerge(d)!.conflicts }} 条（已转待澄清）</b>
+                  </template>
+                  <template v-if="docMerge(d)!.ruleOnly">
+                    · 规则兜底 {{ docMerge(d)!.ruleOnly }} 条
+                  </template>
+                  <template v-if="docMerge(d)!.aiOnly">
+                    · 仅 AI 抽到 {{ docMerge(d)!.aiOnly }} 条
+                  </template>
+                </div>
+                <div
+                  v-if="docNotes(d).length"
                   class="text-xs bg-amber-50/70 text-amber-800 rounded px-2 py-1.5 space-y-0.5"
                 >
-                  <div class="font-medium">AI 提出的疑点</div>
-                  <div v-for="(n, ni) in aiNotes[d.id]" :key="ni">· {{ n }}</div>
+                  <div class="font-medium">
+                    AI 提出的疑点（{{ docNotes(d).length }} 条，已随分析结果留档）
+                  </div>
+                  <div v-for="(n, ni) in docNotes(d)" :key="ni">· {{ n }}</div>
                 </div>
                 <table class="w-full text-xs">
                   <thead class="text-slate-400">

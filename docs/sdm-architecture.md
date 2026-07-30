@@ -60,10 +60,22 @@ vektor3d，只保存前端拿回来的交付物"。SDM 沿用同一模式：
 capability server 本质是 Electron 内的一个 HTTP server，做无头形态是"换宿主"而非重写，
 **协议零改动**。因此二期是可选的扩容路径，不是一期负债。
 
-> 现状提示：capability server 目前只注册了 5 个 AI/文档类能力
-> （`requirement.analyze`、`solution.design`、`plm.analyze`、`rd.chat`、`report.generate`），
-> **几何与网格能力尚未暴露**。`mesh.generate` / `mesh.check` / `geometry.prepare` /
-> `input.optimize` 由 vektor3d 后续迭代提供，一期先用 `manual` 节点占位。
+> **现状（权威口径是 `GET /v1/capabilities` 的实时返回，不是本文）**：
+> capability server 已注册 19 个能力，面向 SDM 的 14 个：
+>
+> | 域 | 能力 |
+> |---|---|
+> | 几何 | `geometry.convert`、`geometry.inspect` |
+> | 网格 | `mesh.inventory`、`mesh.classify`、`mesh.generate`、`mesh.check`、`mesh.merge`、`mesh.export`、`mesh.checkout`、`mesh.checkin`、`mesh.params.derive` |
+> | 文档/会话 | `context.ensure`、`doc.analyze`、`llm.chat` |
+>
+> 另有 5 个供 dbit 智能研发向导使用（`requirement.analyze`、`solution.design`、
+> `plm.analyze`、`rd.chat`、`report.generate`）。
+>
+> 能力清单随 vektor3d 迭代变化，**任何时候都应打 `/v1/capabilities` 现场确认**
+> ——它带每个能力的 `ready` 状态与完整输入输出 schema，比读文档可靠（这段提示
+> 本身就曾脱节两个迭代）。`context.ensure` / `doc.analyze` / `mesh.params.derive`
+> 依赖 AI 引擎，目录里看不到它们通常意味着对方 AI 引擎没起来，而非版本不对。
 
 ---
 
@@ -84,6 +96,9 @@ sim_project              仿真项目（求解器、单位制）
       └─ sim_result      结果（类型、路径、元数据）
 
 sim_template             工况模板：schema_json / validation_rules_json / export_mapping_json
+
+sim_material             材料库（全局资产，与模板同级）：物理材料 → 性能/曲线/求解器卡
+                         详见 docs/sdm-material-library.md
 ```
 
 ### 关键设计
@@ -258,8 +273,14 @@ LS-DYNA 碰撞。抽象为按 `sim_result.result_type` 注册的 viewer 插件�
 第 5 条那条 pipeline 已端到端可用：**配置校验 → 输入卡生成 → 提交 → 求解 →
 结果收集 → 查看产物 → 在线查看**。1、2、3、4、7 均已完成。
 
-剩余：第 6 条对 dbit 的能力服务契约；浏览器代理客户端（等 vektor3d 几何/网格
-能力就绪）；网格节点由 `manual` 占位替换为 `capability`。
+剩余：第 6 条对 dbit 的能力服务契约；`capability.invoke` 的**浏览器代理循环**
+（服务端的待办/claim/complete 三个 API 已备齐，但前端 `pendingCapabilityNodes()`
+至今零调用——能力节点编进 DAG 会永久挂起，这是接入 mesh.* 编排前的最后一块）。
+
+**网格链已按"页面按钮直调"落地**（`MeshPanel.vue`：分析零件形态 → 逐零件生成 →
+合并回装 → 检查/导出 → 在 ANSA 中微调再提交），与几何链同一模式、绕开编排引擎。
+这是刻意的:那条路已被几何链验证过一遍,不必等代理循环就能端到端跑通;
+代理循环补上后,这些动作可以再编进 DAG 做无人值守批量。
 
 **刻意未做**：提取节点。作业完成时轮询器已自动派发提取规则
 （poller → dispatcher.dispatch_many），再加编排节点只会重复执行同一批命令。

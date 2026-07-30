@@ -215,6 +215,76 @@ def test_derive_rejects_unknown_targets(tmp_path):
                    overrides=[Override("mesh:no_such_key", "", "1")])
 
 
+def test_update_meta_edits_metadata_but_never_thresholds(tmp_path):
+    """元数据可改;卡文件一个字节都不能动——阈值改动必须走派生留痕。"""
+    lib = QualityCardLibrary(user_dir=str(tmp_path))
+    lib.derive(DEFAULT_TEMPLATE_ID, "cust-b", "客户B 卡",
+               overrides=[Override("mesh:target_element_length", "", "4.", source="协议")])
+    qual_before = open(os.path.join(tmp_path, "cust-b", CRITERIA_FILE),
+                       encoding="utf-8", newline="").read()
+
+    meta = lib.update_meta("cust-b", name="客户B 卡 v2", scope="碰撞",
+                           id="hijack", builtin=True)  # 非白名单字段必须被忽略
+    assert (meta.name, meta.scope) == ("客户B 卡 v2", "碰撞")
+    assert meta.id == "cust-b" and meta.builtin is False
+    # 覆盖留痕不丢
+    assert lib.get_meta("cust-b").overrides[0].source == "协议"
+    assert open(os.path.join(tmp_path, "cust-b", CRITERIA_FILE),
+                encoding="utf-8", newline="").read() == qual_before
+
+    with pytest.raises(PermissionError):
+        lib.update_meta(DEFAULT_TEMPLATE_ID, name="偷改内置")
+
+
+def test_edit_content_appends_tracked_overrides(tmp_path):
+    """用户模板内容可改,但每项改动都追加进 overrides 留痕,旧值由引擎回填。"""
+    lib = QualityCardLibrary(user_dir=str(tmp_path))
+    lib.derive(DEFAULT_TEMPLATE_ID, "cust-e", "客户E 卡",
+               overrides=[Override("mesh:target_element_length", "", "4.", source="协议")])
+
+    meta = lib.edit_content("cust-e", [
+        Override("criteria:warping [shells]:failed", "", "12.0", source="评审结论", by="u"),
+        Override("mesh:general_min_target_len", "", "2.5", source="评审结论", by="u"),
+    ])
+    # 原有留痕不丢,新改动追加在后
+    assert [o.source for o in meta.overrides] == ["协议", "评审结论", "评审结论"]
+    assert meta.overrides[1].old_value == "15.0"
+
+    card = lib.load("cust-e")
+    assert card.criteria.get("warping").thresholds["failed"] == 12.0
+    assert card.mesh_params.get_float("general_min_target_len") == 2.5
+    # 留痕落盘,不只在返回值里
+    saved = json.load(open(os.path.join(tmp_path, "cust-e", "template.json"), encoding="utf-8"))
+    assert len(saved["overrides"]) == 3
+
+
+def test_edit_content_rejects_builtin_and_bad_targets(tmp_path):
+    """内置模板不可改;改动有一条无效就一个字节都不落盘。"""
+    lib = QualityCardLibrary(user_dir=str(tmp_path))
+    with pytest.raises(PermissionError):
+        lib.edit_content(DEFAULT_TEMPLATE_ID,
+                         [Override("mesh:target_element_length", "", "4.", source="x")])
+
+    lib.derive(DEFAULT_TEMPLATE_ID, "cust-f", "客户F 卡")
+    before = open(os.path.join(tmp_path, "cust-f", CRITERIA_FILE),
+                  encoding="utf-8", newline="").read()
+    with pytest.raises(KeyError):
+        lib.edit_content("cust-f", [
+            Override("criteria:warping [shells]:failed", "", "12.0", source="x"),
+            Override("mesh:no_such_key", "", "1", source="x"),
+        ])
+    assert open(os.path.join(tmp_path, "cust-f", CRITERIA_FILE),
+                encoding="utf-8", newline="").read() == before
+    assert lib.get_meta("cust-f").overrides == []
+
+
+def test_derive_records_creator(tmp_path):
+    lib = QualityCardLibrary(user_dir=str(tmp_path))
+    meta = lib.derive(DEFAULT_TEMPLATE_ID, "cust-g", "客户G 卡", created_by="u")
+    assert meta.created_by == "u"
+    assert lib.get_meta("cust-g").created_by == "u"
+
+
 def test_failed_derive_leaves_nothing_behind(tmp_path):
     """半张卡比没有卡更危险:它看着完整,还会占住 id 让重试直接失败。"""
     lib = QualityCardLibrary(user_dir=str(tmp_path))
