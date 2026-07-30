@@ -592,31 +592,49 @@ Node ≥19 的 `http.globalAgent` 默认 keepAlive，下载完成后 socket 留�
 （一次性大文件收发，连接复用本无收益）。同一文件重跑：阻塞 75 秒后回传成功。
 小文件之前一直正常，正是因为转换快于对端的 keepalive 超时。
 
-### ⚠ 待 vektor3d 侧落实：转换期不能整体静默
+### 转换期的进度（已落实）
 
-进度回报机制本身是通的：`downloadToFile` 按 5% 一档回报，`转换` / `生成 glTF` /
-`回传产物` 各有一条，`job.progress` 也确实落库并随 `GET /v1/jobs/{id}` 返回。
-真正的问题是那 75 秒里主线程被 WASM 占死，**这期间既发不出进度，也应答不了
-门户的轮询**——用户看到的"卡住"就是这个。这不是加几条 `report()` 能解决的，
-需要把 WASM 转换移出主线程（`worker_threads` / `utilityProcess`）。
+原先那 75 秒里主线程被 WASM 占死，**既发不出进度，也应答不了门户的轮询**
+——用户看到的"卡住"就是这个；严重时门户在飞的轮询请求会直接被 ECONNRESET。
+现已把 OCCT WASM 转换搬进 `worker_threads`（`convertStepTo3dixAndBrepInWorker`），
+同一 25.5MB 文件复测：转换 74.8 秒，主线程最大空档 178ms（改前实测 0 次定时器触发）。
 
-搬走之后，建议至少按下列节点回报（`step` 用固定英文枚举便于判定）：
+现在能拿到的阶段（`GET /v1/jobs/{id}` 的 `progress`，门户按此渲染时间线）：
 
-| `step` | 何时追加 | `detail` 建议 |
+| `step` | 何时 | `detail` |
 |---|---|---|
-| `accepted` | 作业进入队列/开始执行 | 队列位置 |
-| `downloading` | 拉取 `sourceUrl` 期间 | 已收 / 总字节（现已有，5% 一档） |
-| `downloaded` | 源文件落地 | 实际字节数 |
-| `parsing` | 解析 CAD | 格式、零件数 |
-| `converting` | 生成 glTF/GLB | **阶段内进度**（当前缺口所在） |
-| `uploading` | POST `uploadUrl` | 产物字节数 |
+| 下载源文件 | 拉取 `sourceUrl` | 5% 一档的百分比 |
+| 初始化 WASM / 解析 STEP | 进 OCCT 前后 | 源文件体积 |
+| 网格化 | 逐几何体推进 | `i/N 个几何体(百分比)`，5% 一档 |
+| 提取 BREP 拓扑 / 写出中间产物 | 转换尾段 | 几何体数 / 三角面数 |
+| 生成 glTF / 回传产物 | 装配导出与回传 | 网格数 / 产物体积 |
 
-另一条要求：**失败时 `error` 要带上失败阶段与底层原因**。`socket hang up` 这类
-Node 原文若不指明是"拉源文件时"还是"回传产物时"，在跨三方链路里只能靠排除法
-推断——这次就多花了不少时间。
+**仍存在的静默**：单个重几何体的一次 OCCT 网格化调用无法再细分。上述文件 22 个
+几何体里有 1 个独占 50 秒（`21/22` → `22/22` 之间静默）。此时时间线会停在
+"网格化 21/22"，至少能看出卡在哪一步、卡了多久，而不是整段无声。
 
-门户侧已按上述格式展示：阶段时间线（含每阶段耗时、区分 sdm 本地阶段与 vk 回报）
-实时刷新，失败时保留现场并标出断点；`step` 名未在上表中也会原样展示。
+另一条仍待改进：**失败时 `error` 要带上失败阶段与底层原因**。`socket hang up`
+这类 Node 原文若不指明是"拉源文件时"还是"回传产物时"，在跨三方链路里只能靠
+排除法推断——这次就多花了不少时间。
+
+### STEP 走 WASM 时装配会被拍平成单件
+
+`geometry.convert` 对 CAD 原生格式（CATIA/NX/SolidWorks，走 DbitConvert）会产出
+`manifest.json` + `bom.json` + 逐零件 `parts/<partKey>/model.3dix`，导出的 GLB 因此
+带真实装配树、每个 node 带 `partId`。
+
+但 **STEP/STP 走的是 chili3d WASM，不产 manifest/bom**，导出器按"单零件"兜底
+（见 `gltf-assembly-exporter.js` 的 stray .3dix 分支）：叶子 shape 会被全部收集并
+网格化（上述文件 22 个），但最终合成一个 .3dix、一个 mesh、`partCount=1`、
+`assemblyDepth=1`。也就是说 **STEP 源的 GLB 预览里点不出单个零件**。
+
+对 SDM 的影响与规避：
+
+- `mesh.classify` 已自行补偿：它对拍平的单件按**连通域拆体**，逐体分类并以
+  `<partId>#body-N` 命名，所以逐零件网格策略建议对 STEP 源仍然可用。
+- `mesh.inventory` 的零件清单走 ANSA 产品树（直接读源文件），不受此影响。
+- 需要按零件在 3D 里选取/着色时，源文件应走 CATIA/NX 原生格式或打包 zip，
+  而不是先在 CAE 前处理里导成一个合并 STEP。
 
 ### ⚠️ 联调前必看：浏览器的「私有网络访问」会拦截这条链
 

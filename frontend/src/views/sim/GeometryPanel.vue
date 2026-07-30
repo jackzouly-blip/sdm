@@ -104,6 +104,8 @@ function vkUsable(): boolean {
 // 已提交作业）：若 vektor3d 一条都没报，时间线停在"已提交作业"这件事本身
 // 就是结论——问题在桌面端，而不是在我们与它之间。
 interface ConvertStage {
+  /** 阶段名。同名阶段就地更新，不追加新行 */
+  step: string;
   text: string;
   ts: number;
   /** local=SDM 自己记的；remote=vektor3d 回报的 */
@@ -120,8 +122,16 @@ let elapsedTimer = 0;
 const lastStage = () => convertStages.value[convertStages.value.length - 1];
 const convertStep = () => lastStage()?.text ?? "";
 
-function stage(text: string, from: ConvertStage["from"] = "local") {
-  convertStages.value = [...convertStages.value, { text, ts: Date.now(), from }];
+function stage(step: string, text: string, from: ConvertStage["from"] = "local") {
+  const last = lastStage();
+  // 同名阶段就地更新：「网格化」按 5% 一档回报，逐条追加会把时间线冲成二十行，
+  // 而它们本是同一阶段在推进。ts 保留首次进入该阶段的时刻，这样时间线上读到的
+  // 是"这一阶段从第几秒开始"——相邻两行的差值就是上一阶段的实际耗时。
+  if (last && last.from === from && last.step === step) {
+    convertStages.value = [...convertStages.value.slice(0, -1), { ...last, text }];
+    return;
+  }
+  convertStages.value = [...convertStages.value, { step, text, ts: Date.now(), from }];
 }
 
 /** 阶段相对开始时刻的秒数——「卡住」是靠相邻阶段的时间差看出来的 */
@@ -146,11 +156,11 @@ async function lightweight(g: SimGeometry) {
     convertElapsed.value = Math.round((Date.now() - convertStartedAt.value) / 1000);
   }, 1000);
 
-  stage("申请转换票据");
+  stage("申请转换票据", "申请转换票据");
   try {
     // 票据只对这一个 gid、这两个端点有效，半小时过期——不把会话 JWT 交出去
     const ticket = await simApi.convertTicket(g.id);
-    stage(`已交付 vektor3d：${ticket.sourceName}（源文件与产物由它直连收发）`);
+    stage("已交付 vektor3d", `已交付 vektor3d：${ticket.sourceName}（源文件与产物由它直连收发）`);
     const result = await vektor3d.runJob<ConvertResult>(
       "geometry.convert",
       {
@@ -164,17 +174,21 @@ async function lightweight(g: SimGeometry) {
         // 幂等键带上 gid：页面刷新后重复点不会真的转两遍
         idempotencyKey: `sdm-geometry-${g.id}`,
         onProgress: (p, job) => {
+          const step = p
+            ? p.step
+            : job.queuePosition != null
+              ? "排队中"
+              : "转换中";
           const text = p
             ? `${p.step}${p.detail ? ` · ${p.detail}` : ""}`
             : job.queuePosition != null
               ? `排队中（第 ${job.queuePosition + 1} 位）`
               : "转换中";
-          // 同一状态重复回报不刷屏（排队/转换中会持续命中）
-          if (lastStage()?.text !== text) stage(text, "remote");
+          if (lastStage()?.text !== text) stage(step, text, "remote");
         },
       }
     );
-    stage(`产物已回传：${(result.bytes / 1048576).toFixed(1)} MB / ${result.triangleCount} 三角面`);
+    stage("产物已回传", `产物已回传：${(result.bytes / 1048576).toFixed(1)} MB / ${result.triangleCount} 三角面`);
     convertResult.value = { ...convertResult.value, [g.id]: result };
     if (result.warnings?.length) {
       error.value = `转换完成，但有提示：${result.warnings.join("；")}`;

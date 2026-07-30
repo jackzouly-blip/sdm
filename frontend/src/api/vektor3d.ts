@@ -188,8 +188,13 @@ export async function runJob<T>(
     await new Promise((r) => setTimeout(r, interval));
     const job = await getJob<T>(jobId);
     if (job.progress.length > seen) {
+      // 逐条上报新增的进度，而不是只报最后一条：两次轮询之间能力侧可能已经推进
+      // 好几个阶段（网格化按 5% 一档回报，一个 2 秒窗口里就有十几条），只取末条
+      // 会把中间阶段悄悄丢掉——而时间线的价值正在于"哪一步花了多久"。
+      for (let i = seen; i < job.progress.length; i += 1) {
+        opts.onProgress?.(job.progress[i], job);
+      }
       seen = job.progress.length;
-      opts.onProgress?.(job.progress[seen - 1] ?? null, job);
     } else if (job.status === "queued") {
       opts.onProgress?.(null, job);
     }
