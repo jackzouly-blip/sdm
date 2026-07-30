@@ -23,6 +23,7 @@ import {
   Loader2,
   Plug,
   Settings2,
+  Trash2,
   Upload,
   Wand2,
 } from "lucide-vue-next";
@@ -196,6 +197,23 @@ async function load() {
     error.value = errMsg(e);
   } finally {
     loading.value = false;
+  }
+}
+
+async function delGeometry(g: SimGeometry) {
+  // upload 与 from-path 的后果不同：前者会清掉上传的源文件，后者只解除登记
+  const fileHint =
+    g.source_type === "upload"
+      ? "上传的源文件与网格、轻量化产物将一并清理。"
+      : "集群上的源文件不受影响，仅解除登记并清理网格、轻量化产物。";
+  if (!confirm(`删除几何版本 v${g.version_no}（${g.source_file?.name ?? "无源文件"}）？${fileHint}`)) return;
+  error.value = "";
+  try {
+    await simApi.deleteGeometry(g.id);
+    if (openMesh.value === g.id) openMesh.value = null;
+    await load();
+  } catch (e) {
+    error.value = errMsg(e);
   }
 }
 
@@ -487,6 +505,13 @@ defineExpose({ reload: load });
               >
                 <Download :size="12" /> 源文件
               </a>
+              <button
+                class="p-1 rounded hover:bg-rose-50 text-slate-400 hover:text-rose-600"
+                title="删除该几何版本（网格与产物一并清理）"
+                @click="delGeometry(g)"
+              >
+                <Trash2 :size="13" />
+              </button>
             </div>
           </td>
         </tr>

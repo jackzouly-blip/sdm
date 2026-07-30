@@ -559,6 +559,20 @@ class SimDB(PipelineStoreMixin):
     def delete_target(self, tid: str) -> bool:
         return self._write("DELETE FROM sim_analysis_target WHERE id=?", (tid,)) > 0
 
+    def subjects_using_target(self, tid: str) -> List[sqlite3.Row]:
+        """引用了该分析对象名下网格版本的工况。
+
+        sim_subject → sim_mesh_version 的外键没带级联（工况绑定是业务决策，
+        不该因几何侧的删除而被悄悄清空），所以删除前必须先查引用：
+        有引用时直接删会撞外键约束、以 500 收场。"""
+        return self._all(
+            """SELECT DISTINCT s.* FROM sim_subject s
+               JOIN sim_mesh_version m ON m.id = s.sim_mesh_version_id
+               JOIN sim_geometry_version g ON g.id = m.sim_geometry_version_id
+               WHERE g.sim_target_id=?""",
+            (tid,),
+        )
+
     # --- 几何版本 -------------------------------------------------------
 
     def add_geometry(
@@ -596,6 +610,19 @@ class SimDB(PipelineStoreMixin):
 
     def get_geometry(self, gid: str) -> Optional[sqlite3.Row]:
         return self._one("SELECT * FROM sim_geometry_version WHERE id=?", (gid,))
+
+    def delete_geometry(self, gid: str) -> bool:
+        """删除一个几何版本，网格版本随外键级联删除。"""
+        return self._write("DELETE FROM sim_geometry_version WHERE id=?", (gid,)) > 0
+
+    def subjects_using_geometry(self, gid: str) -> List[sqlite3.Row]:
+        """引用了该几何版本名下网格版本的工况。理由见 subjects_using_target。"""
+        return self._all(
+            """SELECT DISTINCT s.* FROM sim_subject s
+               JOIN sim_mesh_version m ON m.id = s.sim_mesh_version_id
+               WHERE m.sim_geometry_version_id=?""",
+            (gid,),
+        )
 
     def set_geometry_lightweight(
         self, gid: str, lightweight_file: str, topo_summary: Optional[Dict] = None
@@ -1004,6 +1031,16 @@ class SimDB(PipelineStoreMixin):
         allowed = {"name", "template_id", "sim_mesh_version_id",
                    "config_json", "status"}
         self._update("sim_subject", sid, {k: v for k, v in fields.items() if k in allowed})
+
+    def clear_subject_mesh(self, sid: str) -> None:
+        """解除工况的网格绑定。
+
+        单独一个方法而不走 update_subject：_update 会滤掉 None（部分更新的
+        约定），"置空"这个语义在那条路上表达不出来。"""
+        self._write(
+            "UPDATE sim_subject SET sim_mesh_version_id=NULL, updated_at=? WHERE id=?",
+            (time.time(), sid),
+        )
 
     def delete_subject(self, sid: str) -> bool:
         return self._write("DELETE FROM sim_subject WHERE id=?", (sid,)) > 0

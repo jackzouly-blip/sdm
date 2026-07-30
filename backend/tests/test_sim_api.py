@@ -152,3 +152,80 @@ def test_builtin_template_delete_is_rejected(client, tmp_path):
     db = client.app.state.sim_db
     builtin = db.create_template("内置", "crash", "ls-dyna", is_builtin=True)
     assert client.delete(f"/sim/templates/{builtin}", headers=hdr("u")).status_code == 400
+
+
+def test_delete_geometry_version_cascades_and_cleans_managed_files(client, tmp_path, monkeypatch):
+    """删几何版本：网格级联删除；托管目录内的产物被清理，目录外的集群源文件不动。"""
+    from app.sim import router as sim_router_mod
+
+    pid = client.post("/sim/projects", json={"name": "P"}, headers=hdr("u")).json()["id"]
+    tid = client.post(f"/sim/projects/{pid}/targets",
+                      json={"name": "座椅", "target_type": "part"},
+                      headers=hdr("u")).json()["id"]
+
+    db = client.app.state.sim_db
+    # 把项目工作目录钉到 tmp，让托管目录可控
+    workdir = tmp_path / "wd"
+    db.update_project(pid, workdir=str(workdir))
+
+    managed = workdir / "sdm_geometry" / tid / "slot1"
+    managed.mkdir(parents=True)
+    uploaded = managed / "seat.CATPart"
+    uploaded.write_bytes(b"cad")
+    glb = managed / "seat.glb"
+    glb.write_bytes(b"glb")
+    external = tmp_path / "cluster" / "000_Master.key"
+    external.parent.mkdir(parents=True)
+    external.write_bytes(b"deck")
+
+    g1 = client.post(f"/sim/targets/{tid}/geometries",
+                     json={"source_type": "upload",
+                           "source_file": {"name": "seat.CATPart", "size": 3,
+                                           "path": str(uploaded)},
+                           "lightweight_file": str(glb)},
+                     headers=hdr("u")).json()["id"]
+    g2 = client.post(f"/sim/targets/{tid}/geometries",
+                     json={"source_type": "cluster",
+                           "source_file": {"name": "000_Master.key", "size": 4,
+                                           "path": str(external)}},
+                     headers=hdr("u")).json()["id"]
+    mid = db.add_mesh(g1, "surface", "manual")
+
+    assert client.delete(f"/sim/geometries/{g1}", headers=hdr("u")).status_code == 204
+    left = client.get(f"/sim/targets/{tid}/geometries", headers=hdr("u")).json()
+    assert [g["id"] for g in left] == [g2]
+    assert db.get_mesh(mid) is None            # 级联
+    assert not uploaded.exists() and not glb.exists()  # 托管产物清掉
+    assert not managed.exists()                # 空 slot 目录移除
+
+    # from-path 版本：删除后集群源文件原样保留
+    assert client.delete(f"/sim/geometries/{g2}", headers=hdr("u")).status_code == 204
+    assert external.exists()
+
+
+def test_delete_geometry_or_target_rejected_while_subject_bound(client, tmp_path):
+    """工况绑定网格版本时，几何版本与分析对象都拒删（409 点名工况），解绑后放行。"""
+    pid = client.post("/sim/projects", json={"name": "P"}, headers=hdr("u")).json()["id"]
+    tid = client.post(f"/sim/projects/{pid}/targets",
+                      json={"name": "座椅", "target_type": "part"},
+                      headers=hdr("u")).json()["id"]
+    db = client.app.state.sim_db
+    db.update_project(pid, workdir=str(tmp_path / "wd"))
+    gid = client.post(f"/sim/targets/{tid}/geometries",
+                      json={"source_type": "cluster"}, headers=hdr("u")).json()["id"]
+    mid = db.add_mesh(gid, "surface", "manual")
+    sid = client.post(f"/sim/projects/{pid}/subjects",
+                      json={"name": "正碰", "subject_type": "crash",
+                            "solver_type": "ls-dyna", "sim_mesh_version_id": mid},
+                      headers=hdr("u")).json()["id"]
+
+    r = client.delete(f"/sim/geometries/{gid}", headers=hdr("u"))
+    assert r.status_code == 409 and "正碰" in r.json()["detail"]
+    r = client.delete(f"/sim/targets/{tid}", headers=hdr("u"))
+    assert r.status_code == 409 and "正碰" in r.json()["detail"]
+
+    client.patch(f"/sim/subjects/{sid}", json={"sim_mesh_version_id": None},
+                 headers=hdr("u"))
+    # 解绑即放行；连同分析对象一起删，几何行应随之消失
+    assert client.delete(f"/sim/targets/{tid}", headers=hdr("u")).status_code == 204
+    assert db.get_geometry(gid) is None

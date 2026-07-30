@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
 import time
 import uuid
@@ -472,8 +473,71 @@ def delete_target(
     is_admin: bool = Depends(is_admin_request),
 ) -> None:
     db = _db(request)
-    _owned_target(db, tid, user, is_admin)
+    target = _owned_target(db, tid, user, is_admin)
+    _reject_if_bound_subjects(db.subjects_using_target(tid), "分析对象")
+    # 托管目录先于删行取路径：行删了就查不到项目/工作目录了
+    managed = _geometry_dir(db, target)
     db.delete_target(tid)
+    _cleanup_managed_dir(managed)
+    log.info("删除分析对象 tid=%s name=%s by=%s", tid, target["name"], user)
+
+
+def _reject_if_bound_subjects(rows: List[sqlite3.Row], what: str) -> None:
+    """有工况绑定网格版本时拒删，把该解绑的工况点名给用户。
+
+    不做静默解绑：工况绑哪个网格是业务决策，删几何不该顺手改工况；
+    也不放任直删——sim_subject 的外键会拦下它，但用户只会看到一句
+    'FOREIGN KEY constraint failed'。"""
+    if rows:
+        names = "、".join(sorted({str(r["name"]) for r in rows}))
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"工况「{names}」正在引用该{what}下的网格版本，"
+            f"请先在工况里解除网格绑定（或删除该工况）后再删。",
+        )
+
+
+def _cleanup_managed_dir(path: str) -> None:
+    """尽力清掉一个托管几何目录（<workdir>/sdm_geometry/<tid>）。
+
+    行已删、文件残留可由巡检兜底，所以文件系统故障不该让请求以 500 收场；
+    但路径必须落在 sdm_geometry 下——这是"只删自家托管产物"的最后一道保险。"""
+    if "sdm_geometry" not in os.path.normpath(path).split(os.sep):
+        log.warning("拒绝清理非托管目录: %s", path)
+        return
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+    except OSError as e:
+        log.warning("清理托管几何目录失败（不影响删除本身）: %s (%s)", path, e)
+
+
+def _cleanup_managed_files(base: str, paths: List[str]) -> None:
+    """删除登记在案、且位于托管目录 base 之内的产物文件。
+
+    from-path 登记的集群源文件在 base 之外，天然被这条边界排除——
+    它们是用户的数据，登记只是引用，删除版本绝不能反过来删数据。
+    删完顺手移走空掉的上传子目录（upload 的 <slot>/ 隔离层）。"""
+    base_abs = os.path.abspath(base)
+    for p in paths:
+        if not p:
+            continue
+        ap = os.path.abspath(p)
+        if not ap.startswith(base_abs + os.sep):
+            continue
+        try:
+            if os.path.isfile(ap):
+                os.remove(ap)
+        except OSError as e:
+            log.warning("清理几何产物失败（不影响删除本身）: %s (%s)", ap, e)
+    try:
+        if os.path.isdir(base_abs):
+            for d in os.listdir(base_abs):
+                full = os.path.join(base_abs, d)
+                if os.path.isdir(full) and not os.listdir(full):
+                    os.rmdir(full)
+    except OSError:
+        pass
 
 
 @router.get("/targets/{tid}/geometries")
@@ -917,6 +981,38 @@ def download_lightweight(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "尚无轻量化产物")
     return FileResponse(path, filename=os.path.basename(path),
                         media_type="model/gltf-binary")
+
+
+@router.delete("/geometries/{gid}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_geometry(
+    request: Request,
+    gid: str,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> None:
+    """删除一个几何版本（导错了数模/版本作废）。
+
+    网格版本随外键级联删除；上传的源文件与轻量化/网格产物一并清理，
+    但 from-path 登记的集群源文件不动（那是引用，不是拷贝）。
+    已有工况绑定其网格版本时拒删（409），见 _reject_if_bound_subjects。
+    """
+    db = _db(request)
+    row = _owned_geometry(db, gid, user, is_admin)
+    _reject_if_bound_subjects(db.subjects_using_geometry(gid), "几何版本")
+
+    target = db.get_target(row["sim_target_id"])
+    base = _geometry_dir(db, target)
+    src = _json_or_none(row["source_file_json"]) or {}
+    candidates = [src.get("path"), row["step_file"], row["brep_file"],
+                  row["lightweight_file"]]
+    for m in db.list_meshes(gid):
+        candidates += [m["mesh_file"], m["ansa_file"], m["solver_file"],
+                       m["preview_file"], m["report_file"]]
+
+    db.delete_geometry(gid)
+    _cleanup_managed_files(base, candidates)
+    log.info("删除几何版本 gid=%s v%s target=%s by=%s",
+             gid, row["version_no"], row["sim_target_id"], user)
 
 
 @router.get("/geometries/{gid}")
@@ -2546,6 +2642,10 @@ def update_subject(
     if "config" in fields:
         fields["config_json"] = json.dumps(fields.pop("config"), ensure_ascii=False)
     db.update_subject(sid, **fields)
+    # 显式传 null = 解除网格绑定。exclude_none 的部分更新约定表达不了这个
+    # 语义，单独识别：没有它，删几何时 409 里"先解绑"的指引就是一句空话。
+    if "sim_mesh_version_id" in body.model_fields_set and body.sim_mesh_version_id is None:
+        db.clear_subject_mesh(sid)
     return _row(db.get_subject(sid), SUBJECT_JSON)
 
 

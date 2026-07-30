@@ -637,6 +637,10 @@ export const simApi = {
     const { data } = await http.get<SimGeometry[]>(`/sim/targets/${tid}/geometries`);
     return data;
   },
+  /** 删除几何版本。有工况绑定其网格时后端拒删（409），错误信息里点名工况 */
+  async deleteGeometry(gid: string): Promise<void> {
+    await http.delete(`/sim/geometries/${gid}`);
+  },
   /** 上传 CAD 数模，建立一个几何版本。onProgress 用于大文件进度显示。 */
   async uploadGeometry(
     tid: string,
