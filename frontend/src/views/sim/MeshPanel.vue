@@ -54,13 +54,64 @@ const inventory = computed<SimPartInventoryItem[]>(() => props.geometry.part_inv
 const strategy = computed(() => props.geometry.mesh_strategy);
 const analyzed = computed(() => inventory.value.length > 0 || !!strategy.value);
 
-/** 按零件名取策略建议：inventory 是零件粒度，classify 是体粒度，按名字前缀对上 */
-function strategyOf(partName: string): SimMeshStrategyPart | undefined {
+function bbox6(v: unknown): number[] | null {
+  return Array.isArray(v) && v.length === 6 && v.every((n) => typeof n === "number")
+    ? (v as number[])
+    : null;
+}
+
+/** 两个轴对齐包围盒的交并比。两侧都是装配全局坐标，同一零件的盒子应当高度重合 */
+function bboxIoU(a: number[], b: number[]): number {
+  let inter = 1;
+  let volA = 1;
+  let volB = 1;
+  for (let i = 0; i < 3; i += 1) {
+    const lo = Math.max(a[i], b[i]);
+    const hi = Math.min(a[i + 3], b[i + 3]);
+    inter *= Math.max(0, hi - lo);
+    volA *= Math.max(0, a[i + 3] - a[i]);
+    volB *= Math.max(0, b[i + 3] - b[i]);
+  }
+  const union = volA + volB - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+/**
+ * 取某个零件的策略建议。两条口径不同，必须显式对齐：
+ * inventory 是 ANSA 产品树的**零件**粒度，classify 是连通域拆出的**体**粒度。
+ *
+ * 名字优先——走 DbitConvert 的原生格式（CATIA/NX）会产出逐零件 .3dix，
+ * classify 的 partId 就是真实零件号，名字能直接对上。
+ *
+ * 但合并 STEP 会被轻量转换拍平成单件（见几何能力契约），classify 的 partId
+ * 退化成「<STEP 文件基名>#body-N」，与 ANSA 的零件名根本对不上。这种情况下
+ * 按包围盒对齐——两侧都给了全局坐标下的 [minx..maxz]，这也是 vektor3d 侧
+ * 记在 ansa_list_parts.py 里的设计意图。
+ */
+function strategyOf(part: SimPartInventoryItem): SimMeshStrategyPart | undefined {
   const parts = strategy.value?.parts ?? [];
-  return (
-    parts.find((p) => p.partId === partName) ||
-    parts.find((p) => p.partId.startsWith(partName))
-  );
+  const byName =
+    parts.find((p) => p.partId === part.name) ||
+    parts.find((p) => p.partId.startsWith(part.name));
+  if (byName) return byName;
+
+  const target = bbox6(part.bbox);
+  if (!target) return undefined;
+  let best: SimMeshStrategyPart | undefined;
+  let bestIoU = 0;
+  for (const p of parts) {
+    const box = bbox6((p.signals as { bbox?: unknown } | undefined)?.bbox);
+    if (!box) continue;
+    const iou = bboxIoU(target, box);
+    if (iou > bestIoU) {
+      bestIoU = iou;
+      best = p;
+    }
+  }
+  // 阈值不能松：相互接触/焊接的零件会被连通域并成**一个**体，那个体的包围盒
+  // 横跨好几个零件。宁可不给建议（界面留空、生成时退回面网格），也不能把
+  // "体网格"安到一个薄壁钣金件上——那会直接把机时和网格质量都做废。
+  return bestIoU >= 0.5 ? best : undefined;
 }
 
 const MESH_TYPE_TEXT: Record<string, string> = {
@@ -145,9 +196,10 @@ async function analyze() {
   }
 }
 
-/** 生成一个零件的网格。partName 为空 = 整份几何一把梭（未分析时的兜底路径） */
-async function generate(partName?: string) {
-  const sug = partName ? strategyOf(partName) : undefined;
+/** 生成一个零件的网格。part 为空 = 整份几何一把梭（未分析时的兜底路径） */
+async function generate(part?: SimPartInventoryItem) {
+  const partName = part?.name;
+  const sug = part ? strategyOf(part) : undefined;
   const meshType = sug?.meshType ?? "surface";
   busy.value = partName ? `gen:${partName}` : "gen:all";
   error.value = "";
@@ -216,9 +268,9 @@ async function generate(partName?: string) {
 /** 逐零件全跑一遍。串行：本机只有一个 ANSA 许可席位，并发只会互相排队 */
 async function generateAll() {
   for (const part of inventory.value) {
-    const sug = strategyOf(part.name);
+    const sug = strategyOf(part);
     if (sug?.needsReview) continue;   // 待人工的零件不自动跑
-    await generate(part.name);
+    await generate(part);
     if (error.value) break;           // 出错就停，不要连环失败刷屏
   }
 }
@@ -475,24 +527,26 @@ function elementsOf(m: SimMesh): string {
             <td class="py-1 pr-2 text-slate-700">{{ p.name }}</td>
             <td class="py-1 pr-2 text-slate-400">{{ p.faceCount }} 面</td>
             <td class="py-1 pr-2">
-              <span v-if="strategyOf(p.name)" class="text-slate-600">
-                {{ MESH_TYPE_TEXT[strategyOf(p.name)!.meshType] ?? strategyOf(p.name)!.meshType }}
+              <span v-if="strategyOf(p)" class="text-slate-600">
+                {{ MESH_TYPE_TEXT[strategyOf(p)!.meshType] ?? strategyOf(p)!.meshType }}
                 <span
-                  v-if="strategyOf(p.name)!.needsReview"
+                  v-if="strategyOf(p)!.needsReview"
                   class="ml-1 px-1 rounded bg-amber-50 text-amber-700"
-                  :title="strategyOf(p.name)!.reasons.join('；')"
+                  :title="strategyOf(p)!.reasons.join('；')"
                 >待人工</span>
-                <span v-if="strategyOf(p.name)!.recommendedMinThickness" class="ml-1 text-slate-400">
-                  壁厚 {{ strategyOf(p.name)!.recommendedMinThickness }}mm
+                <span v-if="strategyOf(p)!.recommendedMinThickness" class="ml-1 text-slate-400">
+                  壁厚 {{ strategyOf(p)!.recommendedMinThickness }}mm
                 </span>
               </span>
-              <span v-else class="text-slate-300">—</span>
+              <!-- 对不上体就不给建议：生成时退回面网格，而不是拿一个可能张冠李戴
+                   的体网格建议去糊弄——接触零件会被连通域并成一个体 -->
+              <span v-else class="text-slate-300" title="未能与拆出的体对齐，生成时按面网格处理">—</span>
             </td>
             <td class="py-1 text-right">
               <button
                 class="text-sky-600 hover:underline disabled:opacity-40"
                 :disabled="!!busy"
-                @click="generate(p.name)"
+                @click="generate(p)"
               >
                 {{ busy === `gen:${p.name}` ? "生成中…" : "生成" }}
               </button>
