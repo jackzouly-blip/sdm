@@ -94,16 +94,63 @@ function vkUsable(): boolean {
 }
 
 // ── 轻量化：把转换派给桌面端 vektor3d ─────────────────────────────────────────
-const convertStep = ref("");
+//
+// 阶段时间线而非"一行最新状态"：这条链跨三方（页面派活、vektor3d 拉源文件、
+// vektor3d 回传产物），失败时最要紧的信息是"死在哪一段"。曾经只留最新一行、
+// 且在 finally 里清空，于是一句 "socket hang up" 落下来完全无从定位——
+// 到底是没拉到源文件，还是转完了没传回来，看不出来。
+//
+// 时间线里既有 vektor3d 回报的阶段，也有 SDM 自己记的本地阶段（申请票据、
+// 已提交作业）：若 vektor3d 一条都没报，时间线停在"已提交作业"这件事本身
+// 就是结论——问题在桌面端，而不是在我们与它之间。
+interface ConvertStage {
+  text: string;
+  ts: number;
+  /** local=SDM 自己记的；remote=vektor3d 回报的 */
+  from: "local" | "remote";
+}
+
+const convertStages = ref<ConvertStage[]>([]);
+const convertStartedAt = ref(0);
+const convertElapsed = ref(0);
+const convertFailedAt = ref("");
 const convertResult = ref<Record<string, ConvertResult>>({});
+let elapsedTimer = 0;
+
+const lastStage = () => convertStages.value[convertStages.value.length - 1];
+const convertStep = () => lastStage()?.text ?? "";
+
+function stage(text: string, from: ConvertStage["from"] = "local") {
+  convertStages.value = [...convertStages.value, { text, ts: Date.now(), from }];
+}
+
+/** 阶段相对开始时刻的秒数——「卡住」是靠相邻阶段的时间差看出来的 */
+function stageAt(s: ConvertStage) {
+  return `${Math.max(0, Math.round((s.ts - convertStartedAt.value) / 1000))}s`;
+}
+
+function fmtElapsed(sec: number) {
+  return sec < 60 ? `${sec} 秒` : `${Math.floor(sec / 60)} 分 ${sec % 60} 秒`;
+}
 
 async function lightweight(g: SimGeometry) {
   converting.value = g.id;
-  convertStep.value = "申请转换票据…";
   error.value = "";
+  convertStages.value = [];
+  convertFailedAt.value = "";
+  convertStartedAt.value = Date.now();
+  convertElapsed.value = 0;
+  window.clearInterval(elapsedTimer);
+  // 计时是"卡住"的唯一客观依据：vektor3d 静默时页面至少能说出静默了多久
+  elapsedTimer = window.setInterval(() => {
+    convertElapsed.value = Math.round((Date.now() - convertStartedAt.value) / 1000);
+  }, 1000);
+
+  stage("申请转换票据");
   try {
     // 票据只对这一个 gid、这两个端点有效，半小时过期——不把会话 JWT 交出去
     const ticket = await simApi.convertTicket(g.id);
+    stage(`已交付 vektor3d：${ticket.sourceName}（源文件与产物由它直连收发）`);
     const result = await vektor3d.runJob<ConvertResult>(
       "geometry.convert",
       {
@@ -117,27 +164,33 @@ async function lightweight(g: SimGeometry) {
         // 幂等键带上 gid：页面刷新后重复点不会真的转两遍
         idempotencyKey: `sdm-geometry-${g.id}`,
         onProgress: (p, job) => {
-          convertStep.value = p
+          const text = p
             ? `${p.step}${p.detail ? ` · ${p.detail}` : ""}`
             : job.queuePosition != null
               ? `排队中（第 ${job.queuePosition + 1} 位）`
-              : "转换中…";
+              : "转换中";
+          // 同一状态重复回报不刷屏（排队/转换中会持续命中）
+          if (lastStage()?.text !== text) stage(text, "remote");
         },
       }
     );
+    stage(`产物已回传：${(result.bytes / 1048576).toFixed(1)} MB / ${result.triangleCount} 三角面`);
     convertResult.value = { ...convertResult.value, [g.id]: result };
     if (result.warnings?.length) {
       error.value = `转换完成，但有提示：${result.warnings.join("；")}`;
     }
     await load();
+    convertStages.value = [];
   } catch (e) {
+    // 保留时间线：错误本身往往只有一句网络层措辞，落在哪个阶段才是线索
+    convertFailedAt.value = convertStep();
     error.value =
       e instanceof Vektor3dError
         ? `vektor3d：${e.message}`
         : errMsg(e);
   } finally {
+    window.clearInterval(elapsedTimer);
     converting.value = null;
-    convertStep.value = "";
   }
 }
 
@@ -528,14 +581,43 @@ defineExpose({ reload: load });
       </tbody>
     </table>
 
-    <!-- 转换进度：vektor3d 逐步回报（下载 → 转换 → 生成 glTF → 回传） -->
+    <!-- 转换阶段时间线：vektor3d 回报的阶段（下载 → 解析 → 生成 glTF → 回传）
+         与 SDM 自己记的本地阶段并列，各带耗时。失败时保留，用于定位死在哪一段。 -->
     <div
-      v-if="converting && convertStep"
-      class="mt-3 flex items-center gap-2 px-3 py-2 rounded-md bg-indigo-50 text-indigo-800 text-xs"
+      v-if="convertStages.length"
+      class="mt-3 px-3 py-2 rounded-md text-xs"
+      :class="convertFailedAt ? 'bg-rose-50 text-rose-900' : 'bg-indigo-50 text-indigo-900'"
     >
-      <Loader2 :size="13" class="animate-spin shrink-0" />
-      <span class="truncate">{{ convertStep }}</span>
-      <span class="ml-auto text-indigo-500 shrink-0">源文件与产物由 vektor3d 直连收发</span>
+      <div class="flex items-center gap-2">
+        <Loader2 v-if="converting" :size="13" class="animate-spin shrink-0" />
+        <AlertTriangle v-else :size="13" class="shrink-0" />
+        <span class="font-medium">
+          {{ convertFailedAt ? `转换中断于「${convertFailedAt}」` : "轻量化进行中" }}
+        </span>
+        <span class="ml-auto shrink-0 tabular-nums opacity-70">
+          已用 {{ fmtElapsed(convertElapsed) }}
+        </span>
+      </div>
+      <ol class="mt-1.5 space-y-0.5">
+        <li
+          v-for="(s, i) in convertStages"
+          :key="i"
+          class="flex items-baseline gap-2"
+          :class="convertFailedAt && i === convertStages.length - 1 ? 'font-medium' : 'opacity-80'"
+        >
+          <span class="w-10 shrink-0 text-right tabular-nums opacity-60">{{ stageAt(s) }}</span>
+          <span
+            class="shrink-0 px-1 rounded text-[10px]"
+            :class="s.from === 'remote' ? 'bg-white/70' : 'bg-black/5'"
+            :title="s.from === 'remote' ? 'vektor3d 回报' : 'SDM 本地阶段'"
+          >{{ s.from === "remote" ? "vk" : "sdm" }}</span>
+          <span class="break-all">{{ s.text }}</span>
+        </li>
+      </ol>
+      <p v-if="convertFailedAt" class="mt-1.5 opacity-80">
+        时间线停在此处即为断点：若最后一条是 sdm 阶段，说明 vektor3d 未回报任何进度，
+        请查看桌面端 vektor3d 的日志。
+      </p>
     </div>
 
     <p
