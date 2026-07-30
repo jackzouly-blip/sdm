@@ -617,24 +617,39 @@ Node ≥19 的 `http.globalAgent` 默认 keepAlive，下载完成后 socket 留�
 这类 Node 原文若不指明是"拉源文件时"还是"回传产物时"，在跨三方链路里只能靠
 排除法推断——这次就多花了不少时间。
 
-### STEP 走 WASM 时装配会被拍平成单件
+### 合并 STEP 现在按实体（body）拆分（2026-07-30 落实）
 
 `geometry.convert` 对 CAD 原生格式（CATIA/NX/SolidWorks，走 DbitConvert）会产出
-`manifest.json` + `bom.json` + 逐零件 `parts/<partKey>/model.3dix`，导出的 GLB 因此
-带真实装配树、每个 node 带 `partId`。
+`manifest.json` + `bom.json` + 逐零件 `parts/<partKey>/model.3dix`，GLB 带真实装配树。
 
-但 **STEP/STP 走的是 chili3d WASM，不产 manifest/bom**，导出器按"单零件"兜底
-（见 `gltf-assembly-exporter.js` 的 stray .3dix 分支）：叶子 shape 会被全部收集并
-网格化（上述文件 22 个），但最终合成一个 .3dix、一个 mesh、`partCount=1`、
-`assemblyDepth=1`。也就是说 **STEP 源的 GLB 预览里点不出单个零件**。
+**STEP/STP 走 chili3d WASM，不产 manifest/bom**，原先导出器按"单零件"兜底：22 个
+叶子实体被合成一个 mesh，`partCount=1`，预览里点不开。现已改为**逐实体拆分**：
 
-对 SDM 的影响与规避：
+- `.3dix` 新增 `bodies` 表（`{id, name, parentPath}`），与每个 faceShape 已有的
+  `idpath[0]` 配对——实体身份本来就在产物里，只是从前没人用。
+- GLB 里每个实体一个 node，带 `extras.partId` / `extras.bodyId`，可逐件点选。
+  实测那份 25.5MB 合并 STEP：`partCount` 由 1 变 **22**。
+- `mesh.classify` 也改用同一套实体划分，`partId` 与 GLB node **逐字一致**
+  （实测 22/22 对齐），门户因此能把"预览里点中的实体"与"它的网格策略"对上。
 
-- `mesh.classify` 已自行补偿：它对拍平的单件按**连通域拆体**，逐体分类并以
-  `<partId>#body-N` 命名，所以逐零件网格策略建议对 STEP 源仍然可用。
-- `mesh.inventory` 的零件清单走 ANSA 产品树（直接读源文件），不受此影响。
-- 需要按零件在 3D 里选取/着色时，源文件应走 CATIA/NX 原生格式或打包 zip，
-  而不是先在 CAE 前处理里导成一个合并 STEP。
+顺带修掉一个真实误判：classify 原先按**连通域**拆体，相互接触的零件会被并成
+一个体——同一份文件连通域只拆出 **15** 个，而 CAD 实体是 22 个，即 7 个实体被
+粘到邻居身上，一条策略判定盖住了好几个零件。现在按 CAD 原始结构拆，不再猜。
+
+### ⚠ 仍未打通：匿名实体无法下逐件 ANSA 作业
+
+`mesh.generate` 的 `partFilter` 是按 **ANSA 产品树的零件名**匹配的（先精确、再子串、
+多义即报错，见 `ansa_batch_mesh.py`）。而合并 STEP 的实体在 CAD 里常常**没有名字**：
+实测那份 ANSA 导出件，22 个叶子里仅 1 个有名字，名字都挂在装配层
+（`相机支架260302` / `相机支架改3`）。
+
+因此对匿名实体：**能拆、能点选、能逐件给策略，但没有可喂给 `partFilter` 的名字**。
+`geometry.inspect` 会显式报 `BODY_NAME_MISSING` 警告，避免门户误以为"能点选就能
+逐件下作业"。当前唯一的桥是包围盒：门户按 `signals.bbox` ↔ `mesh.inventory` 的
+`bbox` 做交并比对齐（阈值 0.5，宁缺勿滥）。
+
+要真正打通，需要 `mesh.generate` 支持**按包围盒或实体序号**选择目标，而不是只能
+按名字——这条尚未实现。
 
 ### ⚠️ 联调前必看：浏览器的「私有网络访问」会拦截这条链
 
