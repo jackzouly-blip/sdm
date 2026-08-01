@@ -412,9 +412,14 @@ function renderState(g: SimGeometry): { can: boolean; text: string } {
 
 /** 是否是「需要 vektor3d 轻量化」的 CAD 原生格式（deck 走 SDM 自己的解析） */
 function needsLightweight(g: SimGeometry): boolean {
-  if (g.lightweight_file) return false;
   const name = g.source_file?.name ?? "";
-  return CAD_EXT.test(name) && !DECK_EXT.test(name);
+  if (!CAD_EXT.test(name) || DECK_EXT.test(name)) return false;
+  // 气囊平面图**始终允许重跑**：它出的不是一次性的几何转换，而是**分类结果**，
+  // 会随识别算法演进而变。原先"有产物就不再显示按钮"，导致算法改了却没有任何
+  // 途径重算——页面上看永远是旧分类，只能靠人去猜哪里没生效(真踩过)。
+  if (isAirbagFlat(g)) return true;
+  // 普通 CAD 件的轻量化是确定性转换，转一次就够
+  return !g.lightweight_file;
 }
 
 /** 摘要里的关键读数：include 缺失意味着模型不完整，必须显眼 */
@@ -661,7 +666,9 @@ defineExpose({ reload: load });
               >
                 <Loader2 v-if="converting === g.id" :size="12" class="animate-spin" />
                 <Wand2 v-else :size="12" />
-                {{ converting === g.id ? "转换中" : (isAirbagFlat(g) ? "预览平面图" : "轻量化") }}
+                {{ converting === g.id ? "转换中"
+               : isAirbagFlat(g) ? (g.lightweight_file ? "重新识别" : "预览平面图")
+               : "轻量化" }}
               </button>
               <!-- 网格:属于几何版本,故就近展开而不另设顶级 tab -->
               <button
