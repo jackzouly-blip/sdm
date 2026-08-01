@@ -755,6 +755,10 @@ MESH_JOB_SCOPE = "mesh.job"
 # 之所以仍要签票据而不把正文直接塞给能力:vektor3d 的 cae.template.parse 契约是
 # sourceUrl 自取(与 geometry/mesh 一致),让能力侧统一按 URL 拉,少一条特例路径。
 CAE_TEMPLATE_SCOPE = "cae.template"
+# 气囊网格化票据。绑单个几何版本 gid:可读该版本的 .igs 平面图,可回传生成的 deck。
+# 不复用 mesh.job 是因为落点完全不同 —— mesh.job 往某个网格版本挂产物,
+# 这条链产出的是**一个新的几何版本**,两者的权限边界不该混在一个 scope 里。
+AIRBAG_JOB_SCOPE = "airbag.job"
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -791,6 +795,8 @@ def _geometry_or_mesh_principal(
     return resolve_multi_scoped_principal(raw, act_as, allow_scopes={
         GEOMETRY_CONVERT_SCOPE: {"gid": gid},
         MESH_JOB_SCOPE: {"gid": gid},
+        # 气囊网格化同样要拉这份源文件(.igs 平面图就是它的输入)
+        AIRBAG_JOB_SCOPE: {"gid": gid},
     })
 
 
@@ -940,6 +946,146 @@ def download_geometry(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "几何源文件不存在或已被删除")
     return FileResponse(path, filename=src.get("name") or os.path.basename(path),
                         media_type="application/octet-stream")
+
+
+class AirbagTicket(BaseModel):
+    gid: str
+    token: str
+    expires_in: int
+    source_name: str
+    source_path_suffix: str
+    deck_path_suffix: str
+
+
+@router.post("/geometries/{gid}/airbag-ticket")
+def create_airbag_ticket(
+    request: Request,
+    gid: str,
+    ttl_seconds: int = Query(3600, ge=60, le=28800),
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> AirbagTicket:
+    """为气囊网格化签票据（读本版本的 .igs，回传生成的 deck）。
+
+    1 小时：实测 5P-BAG 约 70 秒，但大图与排队都可能拖长，且票据过期会让
+    回传阶段功亏一篑。只有常规用户令牌能调它——票据不能自我续签。
+    """
+    db = _db(request)
+    row = _owned_geometry(db, gid, user, is_admin)
+    src = _json_or_none(row["source_file_json"]) or {}
+    if not src.get("path"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "该几何版本没有源文件")
+    name = src.get("name") or os.path.basename(src["path"])
+    if not name.lower().endswith((".igs", ".iges")):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            f"气囊网格化的输入必须是 IGES 平面展开图（当前 {name}）")
+
+    token = issue_scoped_token(user, AIRBAG_JOB_SCOPE, ttl_seconds, gid=gid)
+    log.info("签发气囊网格票据 gid=%s user=%s ttl=%ss", gid, user, ttl_seconds)
+    return AirbagTicket(
+        gid=gid, token=token, expires_in=ttl_seconds, source_name=name,
+        source_path_suffix=f"/sim/geometries/{gid}/download",
+        deck_path_suffix=f"/sim/geometries/{gid}/airbag-deck",
+    )
+
+
+def _airbag_principal(
+    gid: str,
+    token: Optional[str] = Query(None),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    act_as: Optional[str] = Header(None, alias="X-Act-As-User"),
+) -> str:
+    raw = token or (creds.credentials if creds else None)
+    return resolve_scoped_principal(raw, act_as, scope=AIRBAG_JOB_SCOPE,
+                                    bindings={"gid": gid})
+
+
+def _airbag_is_admin(
+    user: str = Depends(_airbag_principal),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    portal_admin: Optional[str] = Header(None, alias="X-Hpc-Portal-Admin"),
+) -> bool:
+    return principal_is_admin(user, creds.credentials if creds else None, portal_admin)
+
+
+@router.post("/geometries/{gid}/airbag-deck", status_code=status.HTTP_201_CREATED)
+async def upload_airbag_deck(
+    request: Request,
+    gid: str,
+    file: UploadFile = File(...),
+    meta: Optional[str] = Form(None, description="能力回传的元数据（节点/单元数、体积、非流形边）"),
+    convert: bool = Query(True, description="落库后顺带触发 deck→GLB 预览转换"),
+    user: str = Depends(_airbag_principal),
+    is_admin: bool = Depends(_airbag_is_admin),
+) -> Dict:
+    """接收 vektor3d 生成的 deck，**登记成一个新的几何版本**。
+
+    不挂在平面图那条记录下面：平面图与 deck 是两个不同的东西，各自有版本、
+    各自能被引用；而且登记成几何版本后，预览渲染直接复用现成的
+    deck→GLB 链路（sim_deck_convert），不必为气囊单独做一套。
+    """
+    from ..fs.browser import FsError, write_file
+
+    db = _db(request)
+    src_geom = _owned_geometry(db, gid, user, is_admin)
+    src = _json_or_none(src_geom["source_file_json"]) or {}
+    if not src.get("path"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "源几何版本没有文件，无法定位落盘目录")
+
+    target = db.get_target(src_geom["sim_target_id"])
+    proj = db.get_project(target["sim_project_id"])
+    parent = os.path.join(os.path.dirname(src["path"]), "airbag")
+
+    name = os.path.basename((file.filename or "").replace("\\", "/")) or "airbag.k"
+    if not name.lower().endswith((".k", ".key", ".dyn")):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            f"deck 的扩展名必须是 .k/.key/.dyn（收到 {name}）")
+    # 文件名带上源版本号，重复生成不会互相覆盖
+    name = f"airbag-v{src_geom['version_no']:02d}{os.path.splitext(name)[1]}"
+
+    data = await file.read()
+    try:
+        written = write_file(proj["owner"], parent, name, data, get_settings().fs_root_list)
+    except FsError as e:
+        raise HTTPException(e.status, f"写入 deck 失败: {e.message}")
+
+    info = {}
+    if meta:
+        try:
+            info = json.loads(meta) or {}
+        except ValueError:
+            log.warning("气囊 deck 元数据不是合法 JSON，已忽略 gid=%s", gid)
+
+    new_gid = db.add_geometry(
+        src_geom["sim_target_id"],
+        source_type="deck",
+        source_file={"name": name, "size": len(data), "path": written["path"]},
+        topo_summary=info or None,
+        derived_from_id=gid,
+        derived_by="vektor3d:mesh.airbag.generate",
+    )
+    log.info("气囊 deck 落库 源gid=%s 新gid=%s file=%s (%d 字节)",
+             gid, new_gid, name, len(data))
+
+    task_id = None
+    if convert:
+        tm = getattr(request.app.state, "task_manager", None)
+        if tm is None:
+            log.warning("任务管理器不可用，跳过 deck→GLB 预览转换 gid=%s", new_gid)
+        else:
+            out = os.path.join(
+                proj["workdir"] or os.path.dirname(written["path"]),
+                "sdm_geometry", src_geom["sim_target_id"], f"{new_gid}.glb",
+            ) if proj["workdir"] else os.path.join(
+                os.path.dirname(written["path"]), f".sdm_{new_gid}.glb")
+            task_id = tm.submit("sim_deck_convert", owner=user,
+                                params={"deck_path": written["path"], "out_path": out,
+                                        "gid": new_gid, "run_as": user})
+            log.info("派发气囊 deck 预览转换 gid=%s task=%s", new_gid, task_id)
+
+    out_row = _row(db.get_geometry(new_gid), GEOM_JSON)
+    out_row["convert_task_id"] = task_id
+    return out_row
 
 
 @router.get("/geometries/{gid}/deck-tree")

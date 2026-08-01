@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS sim_geometry_version (
     id                TEXT PRIMARY KEY,
     sim_target_id     TEXT NOT NULL REFERENCES sim_analysis_target(id) ON DELETE CASCADE,
     version_no        INTEGER NOT NULL,
-    source_type       TEXT NOT NULL,     -- upload/vektor3d/dbit
+    source_type       TEXT NOT NULL,     -- upload/vektor3d/dbit/airbag_flat/deck
     source_file_json  TEXT,
     step_file         TEXT,
     brep_file         TEXT,
@@ -104,6 +104,11 @@ CREATE TABLE IF NOT EXISTS sim_geometry_version (
     part_inventory_json TEXT,           -- mesh.inventory 产出：ANSA 产品树的零件清单
     mesh_strategy_json  TEXT,           -- mesh.classify 产出：逐零件/逐体的网格策略建议
     topo_summary_json TEXT,
+    -- 派生溯源：由哪个几何版本、经哪个能力生成。气囊平面图 → deck 就是这条链。
+    -- 生成物单独成一个版本而不是挂在源上：平面图与 deck 是两个不同的东西，
+    -- 各自有版本、各自能被引用；渲染也因此直接复用现成的 deck→GLB 链路。
+    derived_from_id   TEXT,
+    derived_by        TEXT,
     status            TEXT NOT NULL DEFAULT 'ready',
     created_at        REAL NOT NULL,
     UNIQUE(sim_target_id, version_no)
@@ -484,6 +489,9 @@ class SimDB(PipelineStoreMixin):
         ensure("sim_geometry_version", {
             "part_inventory_json": "TEXT",
             "mesh_strategy_json": "TEXT",
+            # 派生溯源（气囊平面图 → deck）
+            "derived_from_id": "TEXT",
+            "derived_by": "TEXT",
         })
 
         # 材料模板的 vektor3d 复核结果。控制卡建表时就带了 summary_json，材料模板
@@ -637,8 +645,14 @@ class SimDB(PipelineStoreMixin):
         brep_file: Optional[str] = None,
         lightweight_file: Optional[str] = None,
         topo_summary: Optional[Dict] = None,
+        derived_from_id: Optional[str] = None,
+        derived_by: Optional[str] = None,
     ) -> str:
-        """追加一个几何版本，version_no 自动递增。"""
+        """追加一个几何版本，version_no 自动递增。
+
+        derived_from_id/derived_by 记派生溯源（如气囊平面图经
+        vektor3d:mesh.airbag.generate 生成的 deck）。
+        """
         gid = _uid()
         with self._lock:
             row = self.conn.execute(
@@ -650,12 +664,13 @@ class SimDB(PipelineStoreMixin):
                 """INSERT INTO sim_geometry_version
                    (id, sim_target_id, version_no, source_type, source_file_json,
                     step_file, brep_file, lightweight_file, topo_summary_json,
-                    status, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    derived_from_id, derived_by, status, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (gid, sim_target_id, row["n"], source_type,
                  json.dumps(source_file, ensure_ascii=False) if source_file else None,
                  step_file, brep_file, lightweight_file,
                  json.dumps(topo_summary, ensure_ascii=False) if topo_summary else None,
+                 derived_from_id, derived_by,
                  "ready", time.time()),
             )
             self.conn.commit()

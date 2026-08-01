@@ -42,6 +42,7 @@ const openMesh = ref<string | null>(null);
 const geometries = ref<SimGeometry[]>([]);
 const loading = ref(true);
 const error = ref("");
+const notice = ref("");
 const uploading = ref(false);
 const progress = ref(0);
 const fileInput = ref<HTMLInputElement | null>(null);
@@ -267,6 +268,68 @@ async function load() {
   }
 }
 
+// —— 气囊平面图 → deck ——
+// profile 是**逐图拟合参数集**：算法通用，但"哪块是拉带、哪条曲线是窄条"依赖
+// 具体图纸。generic 只用层级等通用规则，认不出拉带是预期行为而非失败。
+const AIRBAG_PROFILES = [
+  { id: "generic", label: "通用（只认层级）" },
+  { id: "5p-bag", label: "5P-BAG" },
+];
+const airbagProfile = ref("5p-bag");
+const meshing = ref("");
+const meshStage = ref("");
+
+function isAirbagFlat(g: SimGeometry) {
+  return g.source_type === "airbag_flat"
+    || !!g.source_file?.name?.toLowerCase().match(/\.(igs|iges)$/);
+}
+
+async function airbagMesh(g: SimGeometry) {
+  meshing.value = g.id;
+  error.value = "";
+  meshStage.value = "申请票据";
+  try {
+    const t = await simApi.airbagTicket(g.id);
+    meshStage.value = "已交付 vektor3d";
+    const r = await vektor3d.runJob<{
+      ok: boolean;
+      mesh?: { nodes: number; elements: number };
+      check?: { volume_l: number | null; nonmanifold: number };
+      generic_only?: boolean;
+    }>(
+      "mesh.airbag.generate",
+      {
+        sourceUrl: t.sourceUrl,
+        authToken: t.token,
+        sourceName: t.sourceName,
+        uploadUrl: t.deckUploadUrl,
+        profile: airbagProfile.value,
+      },
+      {
+        // 幂等键带 gid + profile：换 profile 是一次新的作业，不该复用上次结果
+        idempotencyKey: `sdm-airbag-${g.id}-${airbagProfile.value}`,
+        // 只显示粗粒度阶段：能力侧的 detail 是 Python 日志原文（"边翻转: 0 次"
+        // 之类），对使用者是噪声。要排查时看 vektor3d 的作业进度时间线。
+        onProgress: (p) => { if (p?.step) meshStage.value = p.step; },
+      }
+    );
+    const nm = r.check?.nonmanifold ?? 0;
+    notice.value = nm === 0
+      ? `网格已生成并登记为新几何版本：${r.mesh?.nodes ?? 0} 节点 / ${r.mesh?.elements ?? 0} 单元`
+        + (r.check?.volume_l ? `，闭合体积 ${r.check.volume_l.toFixed(3)} L` : "")
+      : `网格已生成，但有 ${nm} 条非流形边 —— 缝合没接上，提交前需处理`;
+    if (r.generic_only) {
+      notice.value += "（通用规则：拉带等未识别）";
+    }
+    await load();
+  } catch (e) {
+    error.value = e instanceof Vektor3dError ? `vektor3d：${e.message}` : errMsg(e);
+  } finally {
+    meshing.value = "";
+    meshStage.value = "";
+  }
+}
+
 async function delGeometry(g: SimGeometry) {
   // upload 与 from-path 的后果不同：前者会清掉上传的源文件，后者只解除登记
   const fileHint =
@@ -468,6 +531,9 @@ defineExpose({ reload: load });
     <div v-if="error" class="mb-3 px-3 py-2 rounded-md bg-rose-50 text-rose-700 text-sm">
       {{ error }}
     </div>
+    <div v-else-if="notice" class="mb-3 px-3 py-2 rounded-md bg-emerald-50 text-emerald-800 text-sm">
+      {{ notice }}
+    </div>
 
     <div v-if="loading" class="flex items-center gap-2 text-slate-500 text-sm py-6 justify-center">
       <Loader2 :size="16" class="animate-spin" /> 加载中…
@@ -551,6 +617,34 @@ defineExpose({ reload: load });
                 <Wand2 v-else :size="12" />
                 {{ converting === g.id ? "转换中" : "轻量化" }}
               </button>
+              <!-- 气囊平面图:直接生成 deck。产物登记为**新的几何版本**,
+                   故渲染预览复用现成的 deck→GLB 链路,不必另做一套 -->
+              <template v-if="isAirbagFlat(g)">
+                <select
+                  v-model="airbagProfile"
+                  class="rounded border px-1 py-0.5 text-xs"
+                  :disabled="!!meshing"
+                  title="逐图拟合参数集。算法通用,但拉带位置、按实体号点名的窄件依赖具体图纸"
+                >
+                  <option v-for="p in AIRBAG_PROFILES" :key="p.id" :value="p.id">
+                    {{ p.label }}
+                  </option>
+                </select>
+                <button
+                  class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs text-emerald-700 hover:bg-emerald-50 disabled:opacity-40 disabled:hover:bg-transparent"
+                  :disabled="!vkUsable() || !!meshing"
+                  :title="
+                    vkUsable()
+                      ? '经 vektor3d 把平面展开图直接网格化成 LS-DYNA deck；平面图与产物由它与本服务直连收发'
+                      : 'vektor3d 未连接或本页面未被授权，先在上方「连接设置」处理'
+                  "
+                  @click="airbagMesh(g)"
+                >
+                  <Loader2 v-if="meshing === g.id" :size="12" class="animate-spin" />
+                  <Wand2 v-else :size="12" />
+                  {{ meshing === g.id ? (meshStage || "生成中") : "生成网格" }}
+                </button>
+              </template>
               <!-- 网格:属于几何版本,故就近展开而不另设顶级 tab -->
               <button
                 class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs hover:bg-slate-50"

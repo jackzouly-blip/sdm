@@ -42,6 +42,7 @@ import type {
   SimControlTemplate,
   SimTemplateCheck,
   SimTemplateParseTicket,
+  SimAirbagTicket,
   SimQualityCardDetail,
   SimQualityTemplate,
   SimRequirementDoc,
@@ -826,6 +827,27 @@ export const simApi = {
     };
   },
   /** 网格产物地址。kind ∈ ansa/solver/preview/report；token 走 query 供 GLTFLoader 直载 */
+  /** 气囊网格化票据。与 meshTicket 同法把相对路径拼成绝对 URL —— 票据要交给
+   *  桌面上的 vektor3d，相对路径对它没有意义。 */
+  async airbagTicket(gid: string, ttlSeconds = 3600): Promise<SimAirbagTicket> {
+    const { data } = await http.post<{
+      gid: string;
+      token: string;
+      expires_in: number;
+      source_name: string;
+      source_path_suffix: string;
+      deck_path_suffix: string;
+    }>(`/sim/geometries/${gid}/airbag-ticket`, null, { params: { ttl_seconds: ttlSeconds } });
+    const origin = window.location.origin;
+    return {
+      gid: data.gid,
+      token: data.token,
+      expiresIn: data.expires_in,
+      sourceName: data.source_name,
+      sourceUrl: `${origin}/api${data.source_path_suffix}`,
+      deckUploadUrl: `${origin}/api${data.deck_path_suffix}`,
+    };
+  },
   meshArtifactUrl(gid: string, mid: string, kind: string): string {
     return `/api/sim/geometries/${gid}/meshes/${mid}/artifact/${kind}?token=${encodeURIComponent(
       getToken() ?? ""

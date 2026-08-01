@@ -656,8 +656,22 @@ export interface SimGeometry {
   part_inventory: SimPartInventoryItem[] | null;
   /** mesh.classify 的网格策略建议 */
   mesh_strategy: SimMeshStrategy | null;
+  /** 派生溯源：由哪个几何版本生成（气囊平面图 → deck 就是这条链） */
+  derived_from_id: string | null;
+  /** 生成它的能力 id，如 vektor3d:mesh.airbag.generate */
+  derived_by: string | null;
   status: string;
   created_at: number;
+}
+
+/** 气囊网格化票据：让桌面端 vektor3d 自取 .igs、自送 deck 回来 */
+export interface SimAirbagTicket {
+  gid: string;
+  token: string;
+  expiresIn: number;
+  sourceName: string;
+  sourceUrl: string;
+  deckUploadUrl: string;
 }
 
 // --- 网格（契约：docs/vektor3d-geometry-capability-contract.md 2.3~2.11）---
