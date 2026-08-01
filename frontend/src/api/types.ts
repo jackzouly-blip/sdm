@@ -851,6 +851,105 @@ export interface SimMaterialDetail extends SimMaterial {
   cards: SimMaterialCard[];
 }
 
+/** 材料模板文件：一组材料卡的具名选择，导出即一份可 *INCLUDE 的 MAT.K。
+ *  组装式——模板只记"选了哪几张卡"，材料库才是正本。 */
+export interface SimMaterialTemplate {
+  id: string;
+  name: string;
+  description: string;
+  solver_type: string;
+  unit_system: string;
+  /** vektor3d 带 KB 的复核结果（字段级闭包/ID 区段），由 cae.template.parse 回填 */
+  summary_json: string | null;
+  status: "active" | "deprecated";
+  /** 改成员列表即 +1 */
+  revision: number;
+  created_by: string;
+  created_at: number;
+  updated_at: number;
+  card_count?: number;
+}
+
+/** 交给桌面端 vektor3d 自取模板正文的短期票据（15 分钟，只读单份） */
+export interface SimTemplateParseTicket {
+  tid: string;
+  kind: "material" | "control";
+  token: string;
+  expiresIn: number;
+  sourceName: string;
+  sourceUrl: string;
+  unitSystem: string;
+  /** 变了即缓存失效，能力侧据此决定重拉重算 */
+  version: string;
+  expectedSha256: string;
+}
+
+/** cae.template.parse 的返回（vektor3d → 浏览器） */
+export interface SimTemplateParseResult {
+  cached: boolean;
+  sourceSha256: string;
+  unitSystem: string;
+  summary: Record<string, unknown>;
+  manifest?: Record<string, unknown>;
+  issues: { level: "ERR" | "WARN" | "INFO"; message: string; keyword?: string }[];
+}
+
+export interface SimMaterialTemplateItem {
+  template_id: string;
+  card_id: string;
+  seq: number;
+  title: string;
+  mat_type: string;
+  unit_system: string;
+  source_mid: number | null;
+  material_id: string;
+  material_name: string;
+}
+
+export interface SimMaterialTemplateDetail extends SimMaterialTemplate {
+  items: SimMaterialTemplateItem[];
+}
+
+/** 组装校验结果。REJECT=不可组装；CONFLICT=需重编号。
+ *  这两类进了 deck 求解器都不会报错，但结果是错的。 */
+export interface SimTemplateCheck {
+  ok: boolean;
+  unit_system: string | null;
+  problems: {
+    level: "REJECT" | "CONFLICT" | "WARN";
+    kind: string;
+    message: string;
+    mid?: number;
+    lcid?: number;
+    card_ids?: string[];
+    units?: string[];
+  }[];
+  cards: { id: string; title: string; mat_type: string; unit_system: string; source_mid: number | null }[];
+  id_ranges: { MID: number[]; LCID: number[] };
+}
+
+/** 控制卡模板：整份存档。控制卡无 ID、彼此无引用，
+ *  且 *CONTROL_* 之间是一套互相配合的策略，拆开反而丢了整体性。 */
+export interface SimControlTemplate {
+  id: string;
+  name: string;
+  description: string;
+  analysis_type: string;
+  solver_type: string;
+  unit_system: string;
+  /** 求解策略摘要，由 vektor3d cae.template.parse 回填 */
+  summary_json: string | null;
+  source_name: string;
+  source_sha256: string;
+  status: "active" | "deprecated";
+  revision: number;
+  created_by: string;
+  created_at: number;
+  updated_at: number;
+  /** 详情才带；列表接口不返回（几 KB 正文） */
+  keyword_text?: string;
+}
+
 export interface SimMaterialImportReport {
   materials_created: number;
   materials_updated: number;

@@ -308,6 +308,113 @@ def _parse_one(
     return includes
 
 
+# --- 只枚举 include 树（不解析网格）----------------------------------------
+
+
+def _scan_includes(path: str, root_dir: str, extra_dirs: List[str]) -> Tuple[List[str], bool]:
+    """只扫 *INCLUDE*，返回 (引用的绝对路径列表, 文件是否读到了)。
+
+    与 `_parse_one` 共用同一套 include 规则（续行、带后缀的变体只取首行、
+    *INCLUDE_PATH 并入搜索目录），但跳过 *NODE/*ELEMENT_*/*PART 的逐行解析——
+    枚举文件清单用不上网格数据，而网格恰是耗时大头：实测整车 deck 全解析约
+    40 秒，只扫 include 是毫秒级。
+    """
+    self_dir = os.path.dirname(path)
+    includes: List[str] = []
+    mode = ""
+    include_buf = ""
+    include_single = False
+    include_taken = False
+
+    def flush() -> None:
+        nonlocal include_buf
+        if not include_buf:
+            return
+        if mode == "*INCLUDE_PATH":
+            d = include_buf.strip().strip('"').replace("\\", "/")
+            if d:
+                extra_dirs.append(
+                    d if os.path.isabs(d) else os.path.normpath(os.path.join(root_dir, d))
+                )
+        else:
+            r = _resolve_include(include_buf, [root_dir, *extra_dirs, self_dir])
+            if r:
+                includes.append(r)
+        include_buf = ""
+
+    try:
+        fh = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError as e:
+        log.warning("打开 deck 文件失败 %s: %s", path, e)
+        return includes, False
+
+    with fh:
+        for raw in fh:
+            line = raw.rstrip("\n").rstrip("\r")
+            if not line or line.startswith("$"):
+                continue
+            if line.startswith("*"):
+                flush()
+                kw = line.strip().upper()
+                include_single = include_taken = False
+                if kw.startswith("*INCLUDE_PATH"):
+                    mode = "*INCLUDE_PATH"
+                elif kw.startswith(_INCLUDE):
+                    mode = _INCLUDE
+                    include_single = kw != _INCLUDE
+                else:
+                    mode = ""
+                continue
+            if mode not in (_INCLUDE, "*INCLUDE_PATH"):
+                continue
+            if include_single and include_taken:
+                continue
+            s = line.rstrip()
+            if s.endswith("+"):
+                include_buf += s[:-1].strip()
+            else:
+                include_buf += s
+                flush()
+                include_taken = True
+        flush()
+
+    return includes, True
+
+
+def list_deck_files(path: str, max_files: int = 2000) -> Tuple[List[str], List[str]]:
+    """枚举一份 deck 的 include 树，返回 (存在的绝对路径, 缺失的路径)。
+
+    用途是把整棵树交给外部能力（vektor3d 的 cae.deck.check）自取。清单**由服务端
+    解析得出**，下发文件时只认清单里的成员——否则 `?path=` 就成了任意文件读取的
+    口子：调用方可以拿它去读 /etc/shadow。
+    """
+    root = os.path.abspath(path)
+    root_dir = os.path.dirname(root)
+    extra_dirs: List[str] = []
+    seen: Set[str] = set()
+    found: List[str] = []
+    missing: List[str] = []
+    queue: List[str] = [root]
+
+    while queue:
+        cur = queue.pop(0)
+        if cur in seen:
+            continue
+        if len(found) >= max_files:
+            log.warning("deck include 文件数达上限 %d，停止枚举", max_files)
+            break
+        if not os.path.isfile(cur):
+            missing.append(cur)
+            continue
+        seen.add(cur)
+        found.append(cur)
+        subs, ok = _scan_includes(cur, root_dir, extra_dirs)
+        if ok:
+            queue.extend(subs)
+
+    return found, missing
+
+
 # --- 三角化 -------------------------------------------------------------
 
 # 六面体的 6 个面，按 *ELEMENT_SOLID 的节点顺序（n1..n8）

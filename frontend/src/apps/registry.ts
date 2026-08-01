@@ -20,6 +20,7 @@ import {
   FolderTree,
   GitBranch,
   Layers,
+  Settings2,
   ListTodo,
   Server,
   SlidersHorizontal,
@@ -82,6 +83,8 @@ export const APPS: AppDef[] = [
       { name: "sim-templates", label: "工况模板", icon: FileCode },
       { name: "sim-quality-templates", label: "质量卡模板", icon: ClipboardCheck },
       { name: "sim-materials", label: "材料库", icon: Layers },
+      { name: "sim-material-templates", label: "材料模板", icon: FileCode },
+      { name: "sim-control-templates", label: "控制卡模板", icon: Settings2 },
     ],
   },
   {

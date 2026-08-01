@@ -24,6 +24,7 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Response,
     UploadFile,
     status,
 )
@@ -749,6 +750,11 @@ AI_READ_SCOPE = "ai.read"
 # ① 产物有四类(.ansa 正本 / 求解器文件 / 预览 GLB / 质量报告),几何票据只认 glb;
 # ② mesh.merge 要同时拉多个零件的 .ansa —— 用 mid 列表绑定(见 bindings.mids)。
 MESH_JOB_SCOPE = "mesh.job"
+# 模板解析票据。绑 kind + tid ——只能 GET 那一份模板的导出正文，别的什么都干不了。
+# 用途单一到不必给写权限:解析结果由浏览器带着常规用户令牌 PATCH 回来,不走票据。
+# 之所以仍要签票据而不把正文直接塞给能力:vektor3d 的 cae.template.parse 契约是
+# sourceUrl 自取(与 geometry/mesh 一致),让能力侧统一按 URL 拉,少一条特例路径。
+CAE_TEMPLATE_SCOPE = "cae.template"
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -809,6 +815,37 @@ def _mesh_is_admin(
     """同 _geometry_is_admin,但主体由 _mesh_principal 解析(理由同前:
     is_admin_request 依赖 current_user,而 current_user 拒绝一切受限票据)。"""
     return principal_is_admin(user, creds.credentials if creds else None, portal_admin)
+
+
+def _material_template_principal(
+    tid: str,
+    token: Optional[str] = Query(None),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    act_as: Optional[str] = Header(None, alias="X-Act-As-User"),
+) -> str:
+    """材料模板导出端点的调用者:常规用户令牌,或本模板的解析票据。
+
+    kind 一并绑定:材料与控制卡的 id 各自独立,不绑 kind 的话一张材料票据能拿去
+    读同名 id 的控制卡。两者都是组织级资产、泄露危害有限,但票据的价值就在于
+    "能做的只有那一件事",这里不留缺口。
+    """
+    raw = token or (creds.credentials if creds else None)
+    return resolve_scoped_principal(
+        raw, act_as, scope=CAE_TEMPLATE_SCOPE, bindings={"tid": tid, "kind": "material"}
+    )
+
+
+def _control_template_principal(
+    tid: str,
+    token: Optional[str] = Query(None),
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    act_as: Optional[str] = Header(None, alias="X-Act-As-User"),
+) -> str:
+    """控制卡模板导出端点的调用者。同上,kind 绑 control。"""
+    raw = token or (creds.credentials if creds else None)
+    return resolve_scoped_principal(
+        raw, act_as, scope=CAE_TEMPLATE_SCOPE, bindings={"tid": tid, "kind": "control"}
+    )
 
 
 def _geometry_is_admin(
@@ -902,6 +939,86 @@ def download_geometry(
     if not path or not os.path.isfile(path):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "几何源文件不存在或已被删除")
     return FileResponse(path, filename=src.get("name") or os.path.basename(path),
+                        media_type="application/octet-stream")
+
+
+@router.get("/geometries/{gid}/deck-tree")
+def list_deck_tree(
+    request: Request,
+    gid: str,
+    user: str = Depends(_geometry_or_mesh_principal),
+    is_admin: bool = Depends(_geometry_or_mesh_is_admin),
+) -> Dict:
+    """列出该 deck 的 *INCLUDE 树。
+
+    给 vektor3d 的 cae.deck.check 用：它要整棵树一起看才判得准跨文件引用
+    （*PART 在网格文件、*MAT 在 MAT.K），逐份检查会把每条正常的跨文件引用
+    都报成"目标不存在"。清单在**服务端**解析，见 deck/parser.list_deck_files。
+
+    只枚举不解析网格，整车 deck 也是毫秒级。
+    """
+    from .deck.parser import list_deck_files
+
+    db = _db(request)
+    row = _owned_geometry(db, gid, user, is_admin)
+    src = _json_or_none(row["source_file_json"]) or {}
+    path = src.get("path")
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "deck 主控文件不存在或已被删除")
+
+    found, missing = list_deck_files(path)
+    root_dir = os.path.dirname(os.path.abspath(path))
+
+    def rel(p: str) -> str:
+        r = os.path.relpath(p, root_dir).replace("\\", "/")
+        return r
+
+    files = [{"path": rel(p), "bytes": os.path.getsize(p)} for p in found]
+    log.info("deck 树 gid=%s: %d 个文件, 缺失 %d", gid, len(files), len(missing))
+    return {
+        "gid": gid,
+        "master": rel(os.path.abspath(path)),
+        "files": files,
+        # 缺失的 include 一并给出:它不是"列不全",而是 deck 本身的错,
+        # 求解器会直接失败,必须让调用方看见而不是悄悄少给几个文件
+        "missing": [rel(p) for p in missing],
+        "total_bytes": sum(f["bytes"] for f in files),
+    }
+
+
+@router.get("/geometries/{gid}/deck-file")
+def download_deck_file(
+    request: Request,
+    gid: str,
+    path: str = Query(..., description="相对主控目录的路径，必须是 deck-tree 列出过的成员"),
+    user: str = Depends(_geometry_or_mesh_principal),
+    is_admin: bool = Depends(_geometry_or_mesh_is_admin),
+):
+    """下发 deck 树里的某一个文件。
+
+    **只认 deck-tree 列出过的成员**，而不是把 `path` 拼到目录上就读。后者即便
+    做了 `..` 过滤也仍然脆弱（软链接、绝对路径、大小写），而 include 树本来就
+    必须由服务端解析一遍，拿它当白名单是顺手且严密的做法。
+    """
+    from fastapi.responses import FileResponse
+    from .deck.parser import list_deck_files
+
+    db = _db(request)
+    row = _owned_geometry(db, gid, user, is_admin)
+    src = _json_or_none(row["source_file_json"]) or {}
+    master = src.get("path")
+    if not master or not os.path.isfile(master):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "deck 主控文件不存在或已被删除")
+
+    root_dir = os.path.dirname(os.path.abspath(master))
+    found, _ = list_deck_files(master)
+    want = os.path.normpath(os.path.join(root_dir, path.replace("\\", "/")))
+    allowed = {os.path.normpath(p) for p in found}
+    if want not in allowed:
+        # 不区分"不在树里"与"不存在":两者都不该让调用方拿来探测文件系统
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "该路径不属于本 deck 的 include 树")
+
+    return FileResponse(want, filename=os.path.basename(want),
                         media_type="application/octet-stream")
 
 
@@ -2529,6 +2646,342 @@ def delete_material(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "材料不存在")
     db.delete_material(mid)
     log.info("删除材料 %s(%s) by=%s", row["name"], mid, user)
+
+
+# --- 材料模板文件（组装式）-----------------------------------------------
+# 路径用独立前缀而非 /materials/templates：后者会被 /materials/{mid} 抢先匹配。
+
+
+class MaterialTemplateCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    unit_system: str = Field(..., max_length=40)
+    description: str = Field("", max_length=2000)
+    solver_type: str = Field("lsdyna", max_length=40)
+    card_ids: List[str] = Field(default_factory=list)
+
+
+class MaterialTemplateUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    description: Optional[str] = Field(None, max_length=2000)
+    unit_system: Optional[str] = Field(None, max_length=40)
+    status: Optional[str] = Field(None, pattern="^(active|deprecated)$")
+    summary_json: Optional[str] = None
+
+
+class MaterialTemplateItems(BaseModel):
+    card_ids: List[str]
+
+
+@router.get("/material-templates")
+def list_material_templates(
+    request: Request,
+    status_filter: Optional[str] = Query(None, alias="status"),
+    user: str = Depends(current_user),
+) -> List[Dict]:
+    return [_row(r) for r in _db(request).list_material_templates(status_filter)]
+
+
+@router.post("/material-templates/check")
+def check_material_template_api(
+    request: Request,
+    body: MaterialTemplateItems,
+    unit_system: Optional[str] = Query(None),
+    user: str = Depends(current_user),
+) -> Dict:
+    """入库前先看能不能组装。单位制不一致、MID/LCID 撞车都在这里拦下——
+    这几类问题进了 deck 求解器不会报错，但结果是错的。"""
+    from .materials.templates import check_material_template
+    return check_material_template(_db(request), body.card_ids, unit_system)
+
+
+@router.post("/material-templates", status_code=status.HTTP_201_CREATED)
+def create_material_template(
+    request: Request,
+    body: MaterialTemplateCreate,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    _require_admin(is_admin)
+    from .materials.templates import check_material_template
+    db = _db(request)
+    if db.get_material_template_by_name(body.name) is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"已存在同名模板: {body.name}")
+    if body.card_ids:
+        chk = check_material_template(db, body.card_ids, body.unit_system)
+        if not chk["ok"]:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                {"message": "成员卡无法组装", "problems": chk["problems"]})
+    tid = db.create_material_template(body.name, body.unit_system, body.description,
+                                      body.solver_type, created_by=user)
+    if body.card_ids:
+        db.set_material_template_items(tid, body.card_ids)
+    log.info("新建材料模板 %s(%s) 成员 %d by=%s", body.name, tid, len(body.card_ids), user)
+    return _row(db.get_material_template(tid))
+
+
+@router.get("/material-templates/{tid}")
+def get_material_template(request: Request, tid: str,
+                          user: str = Depends(current_user)) -> Dict:
+    db = _db(request)
+    row = db.get_material_template(tid)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "模板不存在")
+    out = _row(row)
+    out["items"] = [_row(r) for r in db.list_material_template_items(tid)]
+    return out
+
+
+@router.put("/material-templates/{tid}/items")
+def set_material_template_items(
+    request: Request,
+    tid: str,
+    body: MaterialTemplateItems,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    _require_admin(is_admin)
+    from .materials.templates import check_material_template
+    db = _db(request)
+    tpl = db.get_material_template(tid)
+    if tpl is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "模板不存在")
+    chk = check_material_template(db, body.card_ids, tpl["unit_system"])
+    if not chk["ok"]:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            {"message": "成员卡无法组装", "problems": chk["problems"]})
+    db.set_material_template_items(tid, body.card_ids)
+    log.info("模板 %s 成员更新为 %d 张 by=%s", tid, len(body.card_ids), user)
+    return _row(db.get_material_template(tid))
+
+
+@router.patch("/material-templates/{tid}")
+def update_material_template(
+    request: Request,
+    tid: str,
+    body: MaterialTemplateUpdate,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    _require_admin(is_admin)
+    db = _db(request)
+    if db.get_material_template(tid) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "模板不存在")
+    fields = body.model_dump(exclude_unset=True)
+    if "name" in fields:
+        other = db.get_material_template_by_name(fields["name"])
+        if other is not None and other["id"] != tid:
+            raise HTTPException(status.HTTP_409_CONFLICT, f"已存在同名模板: {fields['name']}")
+    db.update_material_template(tid, **fields)
+    return _row(db.get_material_template(tid))
+
+
+@router.delete("/material-templates/{tid}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_material_template(
+    request: Request, tid: str,
+    user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request),
+) -> None:
+    _require_admin(is_admin)
+    db = _db(request)
+    if db.get_material_template(tid) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "模板不存在")
+    db.delete_material_template(tid)
+    log.info("删除材料模板 %s by=%s", tid, user)
+
+
+class TemplateParseTicket(BaseModel):
+    tid: str
+    kind: str
+    token: str
+    expires_in: int
+    source_name: str
+    source_path_suffix: str
+    unit_system: str
+    version: str
+    expected_sha256: str = ""
+
+
+@router.post("/material-templates/{tid}/parse-ticket")
+def create_material_parse_ticket(
+    request: Request,
+    tid: str,
+    ttl_seconds: int = Query(900, ge=60, le=3600),
+    user: str = Depends(current_user),
+) -> TemplateParseTicket:
+    """为 vektor3d cae.template.parse 签票据（只读本模板导出正文）。
+
+    15 分钟就够：解析是纯计算、估时 20 秒，不像网格作业要跑几十分钟。
+    票据越短越好——它要交到浏览器再转给桌面进程。
+    """
+    db = _db(request)
+    row = db.get_material_template(tid)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "模板不存在")
+    token = issue_scoped_token(user, CAE_TEMPLATE_SCOPE, ttl_seconds,
+                               tid=tid, kind="material")
+    log.info("签发材料模板解析票据 tid=%s user=%s", tid, user)
+    return TemplateParseTicket(
+        tid=tid, kind="material", token=token, expires_in=ttl_seconds,
+        source_name=f"MAT_{row['name']}.k",
+        source_path_suffix=f"/sim/material-templates/{tid}/export",
+        unit_system=row["unit_system"],
+        # 版本号带 revision:成员卡换了但 revision 不变时,缓存该失效——
+        # 故拼上成员数与 updated_at,任一变化都是新版本。
+        version=f"r{row['revision']}-{int(row['updated_at'])}",
+    )
+
+
+@router.post("/control-templates/{tid}/parse-ticket")
+def create_control_parse_ticket(
+    request: Request,
+    tid: str,
+    ttl_seconds: int = Query(900, ge=60, le=3600),
+    user: str = Depends(current_user),
+) -> TemplateParseTicket:
+    """同上，控制卡侧。expected_sha256 用入库时记的指纹，供能力侧判缓存是否已脏。"""
+    db = _db(request)
+    row = db.get_control_template(tid)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "控制卡模板不存在")
+    token = issue_scoped_token(user, CAE_TEMPLATE_SCOPE, ttl_seconds,
+                               tid=tid, kind="control")
+    log.info("签发控制卡解析票据 tid=%s user=%s", tid, user)
+    return TemplateParseTicket(
+        tid=tid, kind="control", token=token, expires_in=ttl_seconds,
+        source_name=row["source_name"] or f"{row['name']}.k",
+        source_path_suffix=f"/sim/control-templates/{tid}/export",
+        unit_system=row["unit_system"],
+        version=f"r{row['revision']}-{int(row['updated_at'])}",
+        expected_sha256=row["source_sha256"] or "",
+    )
+
+
+@router.get("/material-templates/{tid}/export")
+def export_material_template(request: Request, tid: str,
+                             user: str = Depends(_material_template_principal)) -> Response:
+    """导出一份可 *INCLUDE 的 MAT.K：各卡原文原样拼接，不重新生成。
+
+    也是 vektor3d cae.template.parse 的 sourceUrl —— 故收解析票据，
+    否则桌面端能力拉不到正文（它拿不到用户的会话令牌）。
+    """
+    from .materials.templates import render_material_template
+    db = _db(request)
+    if db.get_material_template(tid) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "模板不存在")
+    text = render_material_template(db, tid)
+    return Response(
+        content=text, media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="MAT_{tid[:8]}.k"'},
+    )
+
+
+# --- 控制卡模板库（整份存档）---------------------------------------------
+
+
+class ControlTemplateCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    unit_system: str = Field(..., max_length=40)
+    keyword_text: str = Field(..., min_length=1)
+    analysis_type: str = Field("", max_length=80)
+    description: str = Field("", max_length=2000)
+    solver_type: str = Field("lsdyna", max_length=40)
+    source_name: str = Field("", max_length=200)
+
+
+class ControlTemplateUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    description: Optional[str] = Field(None, max_length=2000)
+    analysis_type: Optional[str] = Field(None, max_length=80)
+    unit_system: Optional[str] = Field(None, max_length=40)
+    status: Optional[str] = Field(None, pattern="^(active|deprecated)$")
+    keyword_text: Optional[str] = None
+    summary_json: Optional[str] = None
+
+
+@router.get("/control-templates")
+def list_control_templates(
+    request: Request,
+    analysis_type: Optional[str] = Query(None),
+    status_filter: Optional[str] = Query(None, alias="status"),
+    user: str = Depends(current_user),
+) -> List[Dict]:
+    return [_row(r) for r in _db(request).list_control_templates(analysis_type, status_filter)]
+
+
+@router.post("/control-templates", status_code=status.HTTP_201_CREATED)
+def create_control_template(
+    request: Request,
+    body: ControlTemplateCreate,
+    user: str = Depends(current_user),
+    is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    _require_admin(is_admin)
+    import hashlib
+    db = _db(request)
+    if db.get_control_template_by_name(body.name) is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"已存在同名控制卡模板: {body.name}")
+    sha = hashlib.sha256(body.keyword_text.encode("utf-8")).hexdigest()[:16]
+    tid = db.create_control_template(
+        body.name, body.unit_system, body.keyword_text, body.analysis_type,
+        body.description, body.solver_type, source_name=body.source_name,
+        source_sha256=sha, created_by=user)
+    log.info("新建控制卡模板 %s(%s) 类型=%s by=%s", body.name, tid, body.analysis_type, user)
+    return _row(db.get_control_template(tid))
+
+
+@router.get("/control-templates/{tid}")
+def get_control_template(request: Request, tid: str,
+                         user: str = Depends(current_user)) -> Dict:
+    row = _db(request).get_control_template(tid)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "控制卡模板不存在")
+    return _row(row)
+
+
+@router.patch("/control-templates/{tid}")
+def update_control_template(
+    request: Request, tid: str, body: ControlTemplateUpdate,
+    user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    _require_admin(is_admin)
+    db = _db(request)
+    if db.get_control_template(tid) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "控制卡模板不存在")
+    fields = body.model_dump(exclude_unset=True)
+    if "name" in fields:
+        other = db.get_control_template_by_name(fields["name"])
+        if other is not None and other["id"] != tid:
+            raise HTTPException(status.HTTP_409_CONFLICT,
+                                f"已存在同名控制卡模板: {fields['name']}")
+    db.update_control_template(tid, **fields)
+    return _row(db.get_control_template(tid))
+
+
+@router.delete("/control-templates/{tid}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_control_template(
+    request: Request, tid: str,
+    user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request),
+) -> None:
+    _require_admin(is_admin)
+    db = _db(request)
+    if db.get_control_template(tid) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "控制卡模板不存在")
+    db.delete_control_template(tid)
+    log.info("删除控制卡模板 %s by=%s", tid, user)
+
+
+@router.get("/control-templates/{tid}/export")
+def export_control_template(request: Request, tid: str,
+                            user: str = Depends(_control_template_principal)) -> Response:
+    """整份原样导出。同材料模板，兼作 cae.template.parse 的 sourceUrl。"""
+    from .materials.templates import render_control_template
+    db = _db(request)
+    if db.get_control_template(tid) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "控制卡模板不存在")
+    text = render_control_template(db, tid)
+    return Response(
+        content=text, media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="control_{tid[:8]}.k"'},
+    )
 
 
 # --- 工况模板 -----------------------------------------------------------

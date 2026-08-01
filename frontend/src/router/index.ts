@@ -105,6 +105,16 @@ const router = createRouter({
           component: () => import("@/views/sim/MaterialsView.vue"),
         },
         {
+          path: "sim/material-templates",
+          name: "sim-material-templates",
+          component: () => import("@/views/sim/MaterialTemplatesView.vue"),
+        },
+        {
+          path: "sim/control-templates",
+          name: "sim-control-templates",
+          component: () => import("@/views/sim/ControlTemplatesView.vue"),
+        },
+        {
           path: "sim/pipelines",
           name: "sim-pipelines",
           component: () => import("@/views/sim/SimPipelinesView.vue"),

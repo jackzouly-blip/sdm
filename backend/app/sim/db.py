@@ -368,6 +368,55 @@ CREATE TABLE IF NOT EXISTS sim_material_card (
     created_at   REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sim_mat_card ON sim_material_card(material_id);
+
+-- 材料模板文件：一组材料卡的具名选择，导出即一份可 *INCLUDE 的 MAT.K。
+-- 组装式而非整份存档：材料已在库内拆解且 keyword_text 保真，再存一份整文件
+-- 会产生第二份真相（改了库内材料而模板不变，或反之）。成员是引用，不是副本。
+CREATE TABLE IF NOT EXISTS sim_material_template (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL UNIQUE,
+    description  TEXT NOT NULL DEFAULT '',
+    solver_type  TEXT NOT NULL DEFAULT 'lsdyna',
+    unit_system  TEXT NOT NULL,              -- 模板级约束：成员卡单位制必须与之一致
+    summary_json TEXT,                       -- vektor3d 带 KB 的复核结果（字段级闭包/ID 区段）
+    status       TEXT NOT NULL DEFAULT 'active',
+    revision     INTEGER NOT NULL DEFAULT 1,
+    created_by   TEXT NOT NULL DEFAULT '',
+    created_at   REAL NOT NULL,
+    updated_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sim_mat_tpl_status ON sim_material_template(status);
+
+CREATE TABLE IF NOT EXISTS sim_material_template_item (
+    template_id  TEXT NOT NULL REFERENCES sim_material_template(id) ON DELETE CASCADE,
+    card_id      TEXT NOT NULL REFERENCES sim_material_card(id) ON DELETE CASCADE,
+    seq          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (template_id, card_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sim_mat_tpl_item ON sim_material_template_item(template_id, seq);
+
+-- 控制卡模板库：与材料相反，整份存档。
+-- 控制卡没有 ID、彼此无引用，拆解入库没有收益；而 *CONTROL_* 之间的取值
+-- 是一套互相配合的策略（时间步/接触/沙漏/输出频率），拆开反而丢了整体性。
+CREATE TABLE IF NOT EXISTS sim_control_template (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL UNIQUE,
+    description   TEXT NOT NULL DEFAULT '',
+    analysis_type TEXT NOT NULL DEFAULT '',  -- 气囊展开/整车碰撞/跌落…策略跟分析类型走
+    solver_type   TEXT NOT NULL DEFAULT 'lsdyna',
+    unit_system   TEXT NOT NULL,             -- 控制卡自身推不出单位制，必须声明
+    keyword_text  TEXT NOT NULL,             -- 整份原文（正本）
+    summary_json  TEXT,                      -- 求解策略摘要，由 vektor3d 解析回填
+    source_name   TEXT NOT NULL DEFAULT '',
+    source_sha256 TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'active',
+    revision      INTEGER NOT NULL DEFAULT 1,
+    created_by    TEXT NOT NULL DEFAULT '',
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sim_ctrl_tpl_type ON sim_control_template(analysis_type);
+CREATE INDEX IF NOT EXISTS idx_sim_ctrl_tpl_status ON sim_control_template(status);
 """
 
 
@@ -436,6 +485,10 @@ class SimDB(PipelineStoreMixin):
             "part_inventory_json": "TEXT",
             "mesh_strategy_json": "TEXT",
         })
+
+        # 材料模板的 vektor3d 复核结果。控制卡建表时就带了 summary_json，材料模板
+        # 是后加的——库已经上线过一版，只能走 ALTER 补列。
+        ensure("sim_material_template", {"summary_json": "TEXT"})
 
     # --- 内部工具 -------------------------------------------------------
 
@@ -1310,6 +1363,149 @@ class SimDB(PipelineStoreMixin):
                ORDER BY variant='primary' DESC, title""",
             (mid,),
         )
+
+    def get_material_card(self, card_id: str) -> Optional[sqlite3.Row]:
+        return self._one("SELECT * FROM sim_material_card WHERE id=?", (card_id,))
+
+    # ── 材料模板文件（组装式：模板只记选了哪几张卡，导出时拼原文）──────
+
+    def create_material_template(self, name: str, unit_system: str,
+                                 description: str = "", solver_type: str = "lsdyna",
+                                 created_by: str = "") -> str:
+        tid = _uid()
+        now = time.time()
+        self._write(
+            """INSERT INTO sim_material_template
+               (id, name, description, solver_type, unit_system, status, revision,
+                created_by, created_at, updated_at)
+               VALUES (?,?,?,?,?, 'active', 1, ?,?,?)""",
+            (tid, name, description, solver_type, unit_system, created_by, now, now),
+        )
+        return tid
+
+    def get_material_template(self, tid: str) -> Optional[sqlite3.Row]:
+        return self._one("SELECT * FROM sim_material_template WHERE id=?", (tid,))
+
+    def get_material_template_by_name(self, name: str) -> Optional[sqlite3.Row]:
+        return self._one("SELECT * FROM sim_material_template WHERE name=?", (name,))
+
+    def list_material_templates(self, status: Optional[str] = None) -> List[sqlite3.Row]:
+        sql = """SELECT t.*,
+                   (SELECT COUNT(*) FROM sim_material_template_item i
+                     WHERE i.template_id=t.id) AS card_count
+                 FROM sim_material_template t WHERE 1=1"""
+        args: List = []
+        if status:
+            sql += " AND t.status=?"
+            args.append(status)
+        return self._all(sql + " ORDER BY t.name", tuple(args))
+
+    def update_material_template(self, tid: str, **fields) -> None:
+        allowed = {"name", "description", "unit_system", "status", "solver_type",
+                   "summary_json"}
+        self._update("sim_material_template", tid,
+                     {k: v for k, v in fields.items() if k in allowed})
+
+    def delete_material_template(self, tid: str) -> bool:
+        return self._write("DELETE FROM sim_material_template WHERE id=?", (tid,)) > 0
+
+    def set_material_template_items(self, tid: str, card_ids: List[str]) -> None:
+        """整体替换成员列表，单事务。顺序即导出顺序。
+
+        顺带清空 summary_json：成员一变，上一次的复核结果就是**另一份文件**的了。
+        留着它比没有更糟——页面会显示一份"复核通过"，而通过的不是现在这套卡。
+        """
+        with self._lock:
+            try:
+                self.conn.execute(
+                    "DELETE FROM sim_material_template_item WHERE template_id=?", (tid,))
+                for seq, cid in enumerate(card_ids):
+                    self.conn.execute(
+                        """INSERT INTO sim_material_template_item
+                           (template_id, card_id, seq) VALUES (?,?,?)""",
+                        (tid, cid, seq),
+                    )
+                self.conn.execute(
+                    "UPDATE sim_material_template"
+                    " SET updated_at=?, revision=revision+1, summary_json=NULL"
+                    " WHERE id=?", (time.time(), tid))
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def list_material_template_items(self, tid: str) -> List[sqlite3.Row]:
+        return self._all(
+            """SELECT i.*, c.title, c.mat_type, c.unit_system, c.source_mid,
+                      c.material_id, m.name AS material_name
+               FROM sim_material_template_item i
+               JOIN sim_material_card c ON c.id = i.card_id
+               JOIN sim_material m ON m.id = c.material_id
+               WHERE i.template_id=? ORDER BY i.seq""",
+            (tid,),
+        )
+
+    # ── 控制卡模板（整份存档）────────────────────────────────
+
+    def create_control_template(self, name: str, unit_system: str, keyword_text: str,
+                                analysis_type: str = "", description: str = "",
+                                solver_type: str = "lsdyna",
+                                summary_json: Optional[str] = None,
+                                source_name: str = "", source_sha256: str = "",
+                                created_by: str = "") -> str:
+        tid = _uid()
+        now = time.time()
+        self._write(
+            """INSERT INTO sim_control_template
+               (id, name, description, analysis_type, solver_type, unit_system,
+                keyword_text, summary_json, source_name, source_sha256,
+                status, revision, created_by, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?, 'active', 1, ?,?,?)""",
+            (tid, name, description, analysis_type, solver_type, unit_system,
+             keyword_text, summary_json, source_name, source_sha256,
+             created_by, now, now),
+        )
+        return tid
+
+    def get_control_template(self, tid: str) -> Optional[sqlite3.Row]:
+        return self._one("SELECT * FROM sim_control_template WHERE id=?", (tid,))
+
+    def get_control_template_by_name(self, name: str) -> Optional[sqlite3.Row]:
+        return self._one("SELECT * FROM sim_control_template WHERE name=?", (name,))
+
+    def list_control_templates(self, analysis_type: Optional[str] = None,
+                               status: Optional[str] = None) -> List[sqlite3.Row]:
+        # 列表不带 keyword_text：整份控制卡有几 KB，列表页不需要
+        sql = """SELECT id, name, description, analysis_type, solver_type, unit_system,
+                        summary_json, source_name, source_sha256, status, revision,
+                        created_by, created_at, updated_at
+                 FROM sim_control_template WHERE 1=1"""
+        args: List = []
+        if analysis_type:
+            sql += " AND analysis_type=?"
+            args.append(analysis_type)
+        if status:
+            sql += " AND status=?"
+            args.append(status)
+        return self._all(sql + " ORDER BY analysis_type, name", tuple(args))
+
+    def update_control_template(self, tid: str, **fields) -> None:
+        allowed = {"name", "description", "analysis_type", "unit_system",
+                   "status", "solver_type", "summary_json", "keyword_text"}
+        fields = {k: v for k, v in fields.items() if k in allowed}
+        # 换了正文而调用方没同时给新摘要 —— 旧摘要描述的是另一份文件，作废。
+        # 单独一条 SQL：_update 会过滤掉 None，清不掉字段。
+        if fields.get("keyword_text") is not None and fields.get("summary_json") is None:
+            import hashlib
+            self._write(
+                "UPDATE sim_control_template SET summary_json=NULL, source_sha256=?"
+                " WHERE id=?",
+                (hashlib.sha256(fields["keyword_text"].encode("utf-8")).hexdigest()[:16], tid),
+            )
+        self._update("sim_control_template", tid, fields)
+
+    def delete_control_template(self, tid: str) -> bool:
+        return self._write("DELETE FROM sim_control_template WHERE id=?", (tid,)) > 0
 
     def replace_material_content(
         self,

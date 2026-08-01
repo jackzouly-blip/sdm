@@ -37,6 +37,11 @@ import type {
   SimMaterial,
   SimMaterialDetail,
   SimMaterialImportReport,
+  SimMaterialTemplate,
+  SimMaterialTemplateDetail,
+  SimControlTemplate,
+  SimTemplateCheck,
+  SimTemplateParseTicket,
   SimQualityCardDetail,
   SimQualityTemplate,
   SimRequirementDoc,
@@ -587,6 +592,41 @@ export function pollTask(
 }
 
 /**
+ * 模板解析票据 → vektor3d 能直接用的入参。
+ *
+ * 与 meshTicket 同法把相对路径拼成绝对 URL：票据要交给**桌面上的 vektor3d**，
+ * 它和浏览器不在同一个进程里，相对路径对它没有意义。
+ */
+async function templateParseTicket(
+  seg: "material-templates" | "control-templates",
+  tid: string,
+  kind: "material" | "control"
+): Promise<SimTemplateParseTicket> {
+  const { data } = await http.post<{
+    tid: string;
+    kind: string;
+    token: string;
+    expires_in: number;
+    source_name: string;
+    source_path_suffix: string;
+    unit_system: string;
+    version: string;
+    expected_sha256: string;
+  }>(`/sim/${seg}/${tid}/parse-ticket`);
+  return {
+    tid: data.tid,
+    kind,
+    token: data.token,
+    expiresIn: data.expires_in,
+    sourceName: data.source_name,
+    sourceUrl: `${window.location.origin}/api${data.source_path_suffix}`,
+    unitSystem: data.unit_system,
+    version: data.version,
+    expectedSha256: data.expected_sha256 || "",
+  };
+}
+
+/**
  * SDM 仿真设计接口。
  *
  * 单独成组而非平铺进 api：仿真是一个独立的一级 APP，接口数量会持续增长，
@@ -1037,6 +1077,96 @@ export const simApi = {
   },
   async deleteMaterial(mid: string): Promise<void> {
     await http.delete(`/sim/materials/${mid}`);
+  },
+
+  // --- 材料模板文件（组装式）---
+  async listMaterialTemplates(params?: { status?: string }): Promise<SimMaterialTemplate[]> {
+    const { data } = await http.get<SimMaterialTemplate[]>("/sim/material-templates", { params });
+    return data;
+  },
+  async getMaterialTemplate(tid: string): Promise<SimMaterialTemplateDetail> {
+    const { data } = await http.get<SimMaterialTemplateDetail>(`/sim/material-templates/${tid}`);
+    return data;
+  },
+  /** 选卡时先看能不能组装：单位制不一致、MID/LCID 撞车都在这里暴露 */
+  async checkMaterialTemplate(cardIds: string[], unitSystem?: string): Promise<SimTemplateCheck> {
+    const { data } = await http.post<SimTemplateCheck>(
+      "/sim/material-templates/check",
+      { card_ids: cardIds },
+      { params: unitSystem ? { unit_system: unitSystem } : undefined },
+    );
+    return data;
+  },
+  async createMaterialTemplate(body: {
+    name: string;
+    unit_system: string;
+    description?: string;
+    card_ids?: string[];
+  }): Promise<SimMaterialTemplate> {
+    const { data } = await http.post<SimMaterialTemplate>("/sim/material-templates", body);
+    return data;
+  },
+  async setMaterialTemplateItems(tid: string, cardIds: string[]): Promise<SimMaterialTemplate> {
+    const { data } = await http.put<SimMaterialTemplate>(
+      `/sim/material-templates/${tid}/items`, { card_ids: cardIds });
+    return data;
+  },
+  async updateMaterialTemplate(
+    tid: string,
+    body: Partial<Pick<SimMaterialTemplate,
+      "name" | "description" | "unit_system" | "status" | "summary_json">>,
+  ): Promise<SimMaterialTemplate> {
+    const { data } = await http.patch<SimMaterialTemplate>(`/sim/material-templates/${tid}`, body);
+    return data;
+  },
+  async deleteMaterialTemplate(tid: string): Promise<void> {
+    await http.delete(`/sim/material-templates/${tid}`);
+  },
+  materialTemplateExportUrl(tid: string): string {
+    return `/api/sim/material-templates/${tid}/export`;
+  },
+  materialParseTicket(tid: string): Promise<SimTemplateParseTicket> {
+    return templateParseTicket("material-templates", tid, "material");
+  },
+
+  // --- 控制卡模板库（整份存档）---
+  async listControlTemplates(params?: { analysis_type?: string; status?: string }):
+    Promise<SimControlTemplate[]> {
+    const { data } = await http.get<SimControlTemplate[]>("/sim/control-templates", { params });
+    return data;
+  },
+  async getControlTemplate(tid: string): Promise<SimControlTemplate> {
+    const { data } = await http.get<SimControlTemplate>(`/sim/control-templates/${tid}`);
+    return data;
+  },
+  async createControlTemplate(body: {
+    name: string;
+    unit_system: string;
+    keyword_text: string;
+    analysis_type?: string;
+    description?: string;
+    source_name?: string;
+  }): Promise<SimControlTemplate> {
+    const { data } = await http.post<SimControlTemplate>("/sim/control-templates", body);
+    return data;
+  },
+  async updateControlTemplate(
+    tid: string,
+    body: Partial<Pick<SimControlTemplate,
+      "name" | "description" | "analysis_type" | "unit_system" | "status"
+      | "keyword_text" | "summary_json">>,
+  ): Promise<SimControlTemplate> {
+    const { data } = await http.patch<SimControlTemplate>(`/sim/control-templates/${tid}`, body);
+    return data;
+  },
+  async deleteControlTemplate(tid: string): Promise<void> {
+    await http.delete(`/sim/control-templates/${tid}`);
+  },
+  controlTemplateExportUrl(tid: string): string {
+    return `/api/sim/control-templates/${tid}/export`;
+  },
+  controlParseTicket(tid: string): Promise<SimTemplateParseTicket> {
+    return templateParseTicket("control-templates", tid, "control");
   },
 
   // --- AI 会话（契约：docs/vektor3d-ai-session-contract.md）---
