@@ -73,7 +73,8 @@ interface NavPart {
 const navParts = shallowRef<NavPart[]>([]);
 const activePart = ref<string | null>(null);
 const KIND_LABEL: Record<string, string> = {
-  nangdai: "囊袋", chamber: "腔体", diffuser: "导流袋", named: "点名件",
+  single: "单层区(囊袋支撑层)", nangdai: "囊袋", chamber: "腔体", diffuser: "导流袋",
+  fix: "固定带", tie: "扎带(仿真忽略)", named: "点名件",
   carrier: "固定件", tether: "拉带", band: "缝线带", other: "其它",
 };
 /** 认件口径（可能多于画出来的：窄缝线带的边界曲线常被邻近大区吸走） */
@@ -129,13 +130,18 @@ function focusPart(p: NavPart | null) {
 
 /** 分组后的导航列表：主件在前，同类聚在一起 */
 const navGroups = computed(() => {
-  const order = ["nangdai", "chamber", "diffuser", "named", "carrier", "tether", "band", "other"];
+  const order = ["single", "nangdai", "chamber", "diffuser", "fix", "tie",
+                 "named", "carrier", "tether", "band", "other"];
   const by = new Map<string, NavPart[]>();
   for (const p of navParts.value) {
     if (!by.has(p.kind)) by.set(p.kind, []);
     by.get(p.kind)!.push(p);
   }
-  return order.filter((k) => by.has(k)).map((k) => ({
+  // order 只定次序，**不当白名单**：不认识的类别追加在后面。早先按 order 过滤，
+  // Python 侧把类名从 nangdai/carrier/band 改成 single/fix/tie 之后，15 个件
+  // (单层区 + 固定带 7 + 扎带 7)渲染出来了却整个从导航里消失，只剩 5 件可点。
+  const extra = [...by.keys()].filter((k) => !order.includes(k)).sort();
+  return [...order.filter((k) => by.has(k)), ...extra].map((k) => ({
     kind: k,
     label: KIND_LABEL[k] ?? k,
     parts: by.get(k)!,
