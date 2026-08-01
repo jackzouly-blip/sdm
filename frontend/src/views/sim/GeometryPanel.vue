@@ -178,8 +178,11 @@ async function lightweight(g: SimGeometry) {
         ...(flat ? { profile: airbagProfile.value } : { options: { unit: "mm" } }),
       },
       {
-        // 幂等键带上 gid：页面刷新后重复点不会真的转两遍
-        idempotencyKey: `sdm-geometry-${flat ? `flat-${airbagProfile.value}-` : ""}${g.id}`,
+        // 幂等键只对**耗时**的转换有意义：几何轻量化动辄几分钟，重复点一次
+        // 很贵。而气囊平面图预览只要 3 秒，缓存省不下什么，却会带来真实的坑——
+        // 键不随算法版本变，改了算法再点还是拿回上次的旧产物，看上去"没变化"。
+        // 实测踩过一次：服务器上存的还是 4 组的旧 GLB。故预览不做幂等。
+        ...(flat ? {} : { idempotencyKey: `sdm-geometry-${g.id}` }),
         onProgress: (p, job) => {
           const step = p
             ? p.step
@@ -320,8 +323,9 @@ async function airbagMesh(g: SimGeometry) {
         profile: airbagProfile.value,
       },
       {
-        // 幂等键带 gid + profile：换 profile 是一次新的作业，不该复用上次结果
-        idempotencyKey: `sdm-airbag-${g.id}-${airbagProfile.value}`,
+        // 不做幂等：键不随算法版本变，改了算法再点会拿回旧产物(实测踩过)。
+        // 重复点本就发生不了——按钮在运行期间是禁用的；幂等只防"刷新后再点",
+        // 那种情况重跑一次的代价，远小于拿到一份看不出是旧的产物。
         // 只显示粗粒度阶段：能力侧的 detail 是 Python 日志原文（"边翻转: 0 次"
         // 之类），对使用者是噪声。要排查时看 vektor3d 的作业进度时间线。
         onProgress: (p) => { if (p?.step) meshStage.value = p.step; },
