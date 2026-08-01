@@ -174,11 +174,12 @@ async function lightweight(g: SimGeometry) {
         uploadUrl: ticket.uploadUrl,
         authToken: ticket.token,
         sourceName: ticket.sourceName,
-        ...(flat ? {} : { options: { unit: "mm" } }),
+        // 预览与建网格用同一个 profile：导航里列出的件就是将要建的那些片
+        ...(flat ? { profile: airbagProfile.value } : { options: { unit: "mm" } }),
       },
       {
         // 幂等键带上 gid：页面刷新后重复点不会真的转两遍
-        idempotencyKey: `sdm-geometry-${flat ? "flat-" : ""}${g.id}`,
+        idempotencyKey: `sdm-geometry-${flat ? `flat-${airbagProfile.value}-` : ""}${g.id}`,
         onProgress: (p, job) => {
           const step = p
             ? p.step

@@ -15,7 +15,7 @@
  * 工作台也是这么做的。这意味着任何一个合规 GLB 都能有边线，
  * 不必要求 vektor3d 在产物里额外塞线段。
  */
-import { onBeforeUnmount, onMounted, ref, shallowRef } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from "vue";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
@@ -56,6 +56,94 @@ const emit = defineEmits<{ (e: "close"): void }>();
 const host = ref<HTMLDivElement | null>(null);
 const loading = ref(true);
 const error = ref("");
+/**
+ * 零件导航。**直接从 GLB 的 node.extras 生成**——气囊预览把每个识别出的件
+ * 单独成 node 并带上 kind/bbox，所以这里不需要另开接口或加库字段。
+ *
+ * 它的价值不只是"看得方便"：预览列出的件与「生成网格」将要建的那些片一一
+ * 对应，认少了、认错了在这里一眼看得出来，不必先花几十秒建完再发现。
+ */
+interface NavPart {
+  name: string;
+  kind: string;
+  segments: number;
+  obj: THREE.Object3D;
+  box: THREE.Box3;
+}
+const navParts = shallowRef<NavPart[]>([]);
+const activePart = ref<string | null>(null);
+const KIND_LABEL: Record<string, string> = {
+  nangdai: "囊袋", chamber: "腔体", diffuser: "导流袋", named: "点名件",
+  carrier: "固定件", tether: "拉带", band: "缝线带", other: "其它",
+};
+/** 认件口径（可能多于画出来的：窄缝线带的边界曲线常被邻近大区吸走） */
+const identified = ref<Record<string, number>>({});
+
+function collectNav(root: THREE.Object3D) {
+  const out: NavPart[] = [];
+  root.traverse((o) => {
+    const ex = o.userData as Record<string, unknown> | undefined;
+    if (!ex || ex.source !== "airbag-flat" || !ex.partId) return;
+    const bb = ex.bbox as number[] | undefined;
+    const box = bb && bb.length === 6
+      ? new THREE.Box3(new THREE.Vector3(bb[0], bb[1], bb[2]),
+                       new THREE.Vector3(bb[3], bb[4], bb[5]))
+      : new THREE.Box3().setFromObject(o);
+    out.push({
+      name: String(ex.partId), kind: String(ex.kind ?? "other"),
+      segments: Number(ex.segments ?? 0), obj: o, box,
+    });
+  });
+  navParts.value = out;
+}
+
+/** 点导航：把相机对准该件，并把其它件压暗（不隐藏——要看它在整图里的位置） */
+function focusPart(p: NavPart | null) {
+  const cam = cameraRef.value;
+  const ctl = controls.value;
+  activePart.value = p ? p.name : null;
+  for (const q of navParts.value) {
+    // 压暗而不隐藏：要能看出这个件在整张图里的位置
+    const dim = !!p && q.name !== p.name;
+    q.obj.traverse((o) => {
+      const mat = (o as THREE.Mesh).material;
+      const list = Array.isArray(mat) ? mat : mat ? [mat] : [];
+      for (const mt of list) {
+        mt.transparent = dim;
+        mt.opacity = dim ? 0.12 : 1.0;
+        mt.depthWrite = !dim;
+        mt.needsUpdate = true;
+      }
+    });
+  }
+  if (!p || !cam || !ctl) return;
+  const size = p.box.getSize(new THREE.Vector3());
+  const center = p.box.getCenter(new THREE.Vector3());
+  // 件可能是一条极扁的窄带，用最大维定视距；下限避免贴到脸上
+  const radius = Math.max(size.x, size.y, size.z, 20);
+  cam.position.set(center.x, center.y - radius * 0.15, center.z + radius * 2.2);
+  cam.updateProjectionMatrix();
+  ctl.target.copy(center);
+  ctl.update();
+}
+
+/** 分组后的导航列表：主件在前，同类聚在一起 */
+const navGroups = computed(() => {
+  const order = ["nangdai", "chamber", "diffuser", "named", "carrier", "tether", "band", "other"];
+  const by = new Map<string, NavPart[]>();
+  for (const p of navParts.value) {
+    if (!by.has(p.kind)) by.set(p.kind, []);
+    by.get(p.kind)!.push(p);
+  }
+  return order.filter((k) => by.has(k)).map((k) => ({
+    kind: k,
+    label: KIND_LABEL[k] ?? k,
+    parts: by.get(k)!,
+    /** 认出来但没画出来的差额，如实标出 */
+    hidden: Math.max(0, (identified.value[k] ?? 0) - by.get(k)!.length),
+  }));
+});
+
 const stats = ref<{
   tris: number;
   /** 线段数。平面展开图这类纯线框模型三角面为 0，读数要落在这里 */
@@ -74,6 +162,8 @@ const stats = ref<{
 const edgesSkipped = ref(false);
 const renderer = shallowRef<THREE.WebGLRenderer | null>(null);
 const controls = shallowRef<OrbitControls | null>(null);
+// 相机原本是 onMounted 里的局部变量；导航要聚焦到某个件，得能在外面拿到它
+const cameraRef = shallowRef<THREE.PerspectiveCamera | null>(null);
 let frame = 0;
 
 function makeGradientBackground(top: number, bottom: number): THREE.CanvasTexture {
@@ -167,6 +257,7 @@ onMounted(async () => {
   // 渐变背景而非纯白：纯白底上浅色零件的轮廓会被"洗掉"，深浅过渡才看得出体积
   scene.background = makeGradientBackground(0xf8fafc, 0xe7edf5);
   const camera = new THREE.PerspectiveCamera(45, el.clientWidth / el.clientHeight, 0.1, 1e6);
+  cameraRef.value = camera;
   const r = new THREE.WebGLRenderer({ antialias: true });
   r.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   r.setSize(el.clientWidth, el.clientHeight);
@@ -211,6 +302,8 @@ onMounted(async () => {
     camera.updateProjectionMatrix();
     ctl.target.copy(center);
     ctl.update();
+
+    collectNav(gltf.scene);
 
     // 统计同时充当契约验收读数：装配层级、零件标识、mesh 复用这三条要求
     // （见 docs/vektor3d-geometry-capability-contract.md 的装配小节）
@@ -337,7 +430,42 @@ onMounted(async () => {
         </button>
       </div>
 
-      <div class="relative flex-1 min-h-0">
+      <div class="relative flex-1 min-h-0 flex">
+        <!-- 零件导航：只有气囊平面图预览才有（node.extras.source=airbag-flat） -->
+        <aside
+          v-if="navParts.length"
+          class="w-48 shrink-0 overflow-auto border-r border-slate-200 bg-slate-50/70 text-xs"
+        >
+          <button
+            class="w-full px-3 py-1.5 text-left border-b border-slate-200 hover:bg-white"
+            :class="activePart === null ? 'bg-white font-medium text-slate-800' : 'text-slate-500'"
+            @click="focusPart(null)"
+          >
+            全部（{{ navParts.length }} 件）
+          </button>
+          <div v-for="g in navGroups" :key="g.kind" class="border-b border-slate-200 last:border-0">
+            <div class="px-3 py-1 text-[11px] text-slate-400 flex items-center gap-1">
+              {{ g.label }} · {{ g.parts.length }}
+              <span
+                v-if="g.hidden"
+                class="text-amber-600"
+                :title="`另有 ${g.hidden} 个已识别但预览里没画出来——窄件的边界曲线常被邻近大区吸走，建网格时仍会建`"
+              >+{{ g.hidden }} 未绘出</span>
+            </div>
+            <button
+              v-for="p in g.parts"
+              :key="p.name"
+              class="w-full px-3 py-1 text-left hover:bg-white flex items-center justify-between gap-2"
+              :class="activePart === p.name ? 'bg-white text-slate-900 font-medium' : 'text-slate-600'"
+              @click="focusPart(activePart === p.name ? null : p)"
+            >
+              <span class="truncate">{{ p.name }}</span>
+              <span class="text-[10px] text-slate-400 shrink-0">{{ p.segments }}</span>
+            </button>
+          </div>
+        </aside>
+
+        <div class="relative flex-1 min-h-0">
         <div ref="host" class="absolute inset-0"></div>
         <div
           v-if="loading"
@@ -350,7 +478,8 @@ onMounted(async () => {
           class="absolute inset-0 flex items-center justify-center text-rose-600 text-sm bg-slate-50 px-6 text-center"
         >
           {{ error }}
-        </div>
+          </div>
+      </div>
       </div>
     </div>
   </div>
