@@ -58,6 +58,8 @@ const loading = ref(true);
 const error = ref("");
 const stats = ref<{
   tris: number;
+  /** 线段数。平面展开图这类纯线框模型三角面为 0，读数要落在这里 */
+  segs: number;
   objects: number;
   /** 装配层级深度；1 表示被拍平了 */
   depth: number;
@@ -214,6 +216,7 @@ onMounted(async () => {
     // （见 docs/vektor3d-geometry-capability-contract.md 的装配小节）
     // 是否被满足，在这里一眼可见，不必等用久了才发现标识是随机生成的。
     let tris = 0;
+    let segs = 0;
     let objects = 0;
     let depth = 0;
     let withPartId = 0;
@@ -232,10 +235,23 @@ onMounted(async () => {
           const idx = m.geometry.getIndex();
           tris += (idx ? idx.count : m.geometry.getAttribute("position")?.count ?? 0) / 3;
         }
+        return;
+      }
+      // 线框（气囊平面展开图的预览是 LINES）。GLTFLoader 对 mode=1 建的是
+      // LineSegments，不是 Mesh —— 只数 isMesh 会显示"0 个对象"，看着像加载失败。
+      const l = o as unknown as THREE.LineSegments;
+      if (l.isLineSegments && l.geometry) {
+        objects += 1;
+        if (!meshIds.has(l.geometry.id)) {
+          meshIds.add(l.geometry.id);
+          const idx = l.geometry.getIndex();
+          segs += (idx ? idx.count : l.geometry.getAttribute("position")?.count ?? 0) / 2;
+        }
       }
     });
     stats.value = {
       tris: Math.round(tris),
+      segs: Math.round(segs),
       objects,
       depth,
       withPartId,
@@ -285,7 +301,10 @@ onMounted(async () => {
         </span>
         <span v-if="!title" class="text-xs text-slate-400">v{{ geometry.version_no }}</span>
         <span v-if="stats" class="text-xs text-slate-500">
-          {{ stats.objects }} 个零件 · {{ stats.tris.toLocaleString() }} 三角面
+          {{ stats.objects }} 个零件 ·
+          <template v-if="stats.tris">{{ stats.tris.toLocaleString() }} 三角面</template>
+          <template v-else-if="stats.segs">{{ stats.segs.toLocaleString() }} 线段（线框）</template>
+          <template v-else>空</template>
           <template v-if="stats.uniqueMeshes < stats.objects">
             （复用后 {{ stats.uniqueMeshes }} 份几何）
           </template>

@@ -162,18 +162,23 @@ async function lightweight(g: SimGeometry) {
     // 票据只对这一个 gid、这两个端点有效，半小时过期——不把会话 JWT 交出去
     const ticket = await simApi.convertTicket(g.id);
     stage("已交付 vektor3d", `已交付 vektor3d：${ticket.sourceName}（源文件与产物由它直连收发）`);
+    // 气囊平面图是纯线框（只有曲线，没有曲面/实体），B-rep 三角化对它必然产出为空。
+    // 线框得按线框画：换 mesh.airbag.preview，离散曲线出线段 GLB 并按识别出的
+    // 囊袋/腔体/导流袋着色——让人在花几十秒建网格**之前**就看出算法认对没有。
+    // 票据与落点完全复用轻量化那套，产物同样落成 lightweight_file。
+    const flat = isAirbagFlat(g);
     const result = await vektor3d.runJob<ConvertResult>(
-      "geometry.convert",
+      flat ? "mesh.airbag.preview" : "geometry.convert",
       {
         sourceUrl: ticket.sourceUrl,
         uploadUrl: ticket.uploadUrl,
         authToken: ticket.token,
         sourceName: ticket.sourceName,
-        options: { unit: "mm" },
+        ...(flat ? {} : { options: { unit: "mm" } }),
       },
       {
         // 幂等键带上 gid：页面刷新后重复点不会真的转两遍
-        idempotencyKey: `sdm-geometry-${g.id}`,
+        idempotencyKey: `sdm-geometry-${flat ? "flat-" : ""}${g.id}`,
         onProgress: (p, job) => {
           const step = p
             ? p.step
@@ -189,7 +194,10 @@ async function lightweight(g: SimGeometry) {
         },
       }
     );
-    stage("产物已回传", `产物已回传：${(result.bytes / 1048576).toFixed(1)} MB / ${result.triangleCount} 三角面`);
+    const seg = (result as unknown as { segments?: number }).segments;
+    stage("产物已回传", seg != null
+      ? `平面图预览已回传：${seg} 条线段`
+      : `产物已回传：${(result.bytes / 1048576).toFixed(1)} MB / ${result.triangleCount} 三角面`);
     convertResult.value = { ...convertResult.value, [g.id]: result };
     if (result.warnings?.length) {
       error.value = `转换完成，但有提示：${result.warnings.join("；")}`;
@@ -199,10 +207,15 @@ async function lightweight(g: SimGeometry) {
   } catch (e) {
     // 保留时间线：错误本身往往只有一句网络层措辞，落在哪个阶段才是线索
     convertFailedAt.value = convertStep();
-    error.value =
-      e instanceof Vektor3dError
-        ? `vektor3d：${e.message}`
-        : errMsg(e);
+    const raw = e instanceof Vektor3dError ? `vektor3d：${e.message}` : errMsg(e);
+    // 纯线框 IGES（气囊平面展开图就是）没有任何曲面/实体，轻量化必然产出为空。
+    // 这不是故障而是用错了操作，但原始措辞是 "triangleCount=0" 这类内部读数，
+    // 看不出该怎么办 —— 直接把下一步指出来。
+    const emptyProduct = /triangleCount=0|faceCount=0|bodies=0|产物不可用/.test(raw);
+    error.value = emptyProduct && isAirbagFlat(g)
+      ? `${raw}\n—— 这份 IGES 是纯线框（只有曲线，没有曲面/实体），轻量化取不到可渲染的面。`
+        + `若它是气囊平面展开图，请改用「生成网格」直接生成 LS-DYNA deck。`
+      : raw;
   } finally {
     window.clearInterval(elapsedTimer);
     converting.value = null;
@@ -528,7 +541,7 @@ defineExpose({ reload: load });
       </button>
     </div>
 
-    <div v-if="error" class="mb-3 px-3 py-2 rounded-md bg-rose-50 text-rose-700 text-sm">
+    <div v-if="error" class="mb-3 px-3 py-2 rounded-md bg-rose-50 text-rose-700 text-sm whitespace-pre-line">
       {{ error }}
     </div>
     <div v-else-if="notice" class="mb-3 px-3 py-2 rounded-md bg-emerald-50 text-emerald-800 text-sm">
@@ -594,29 +607,6 @@ defineExpose({ reload: load });
           <td class="py-2 text-slate-500">{{ fmt(g.created_at) }}</td>
           <td class="py-2">
             <div class="flex items-center gap-1">
-              <button
-                v-if="renderState(g).can"
-                class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs text-blue-600 hover:bg-blue-50"
-                @click="emit('preview', g)"
-              >
-                <Eye :size="12" /> 预览
-              </button>
-              <!-- CAD 原生格式：派给桌面端 vektor3d 转 glTF/GLB -->
-              <button
-                v-else-if="needsLightweight(g)"
-                class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs text-indigo-600 hover:bg-indigo-50 disabled:opacity-40 disabled:hover:bg-transparent"
-                :disabled="!vkUsable() || !!converting"
-                :title="
-                  vkUsable()
-                    ? '经 vektor3d 转成 glTF/GLB；文件由 vektor3d 与本服务直连收发，不经浏览器'
-                    : 'vektor3d 未连接或本页面未被授权，先在上方「连接设置」处理'
-                "
-                @click="lightweight(g)"
-              >
-                <Loader2 v-if="converting === g.id" :size="12" class="animate-spin" />
-                <Wand2 v-else :size="12" />
-                {{ converting === g.id ? "转换中" : "轻量化" }}
-              </button>
               <!-- 气囊平面图:直接生成 deck。产物登记为**新的几何版本**,
                    故渲染预览复用现成的 deck→GLB 链路,不必另做一套 -->
               <template v-if="isAirbagFlat(g)">
@@ -645,6 +635,29 @@ defineExpose({ reload: load });
                   {{ meshing === g.id ? (meshStage || "生成中") : "生成网格" }}
                 </button>
               </template>
+              <button
+                v-if="renderState(g).can"
+                class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs text-blue-600 hover:bg-blue-50"
+                @click="emit('preview', g)"
+              >
+                <Eye :size="12" /> 预览
+              </button>
+              <!-- CAD 原生格式：派给桌面端 vektor3d 转 glTF/GLB -->
+              <button
+                v-else-if="needsLightweight(g)"
+                class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs text-indigo-600 hover:bg-indigo-50 disabled:opacity-40 disabled:hover:bg-transparent"
+                :disabled="!vkUsable() || !!converting"
+                :title="
+                  vkUsable()
+                    ? '经 vektor3d 转成 glTF/GLB；文件由 vektor3d 与本服务直连收发，不经浏览器'
+                    : 'vektor3d 未连接或本页面未被授权，先在上方「连接设置」处理'
+                "
+                @click="lightweight(g)"
+              >
+                <Loader2 v-if="converting === g.id" :size="12" class="animate-spin" />
+                <Wand2 v-else :size="12" />
+                {{ converting === g.id ? "转换中" : (isAirbagFlat(g) ? "预览平面图" : "轻量化") }}
+              </button>
               <!-- 网格:属于几何版本,故就近展开而不另设顶级 tab -->
               <button
                 class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs hover:bg-slate-50"
