@@ -652,9 +652,12 @@ defineExpose({ reload: load });
               >
                 <Eye :size="12" /> 预览
               </button>
-              <!-- CAD 原生格式：派给桌面端 vektor3d 转 glTF/GLB -->
+              <!-- CAD 原生格式：派给桌面端 vektor3d 转 glTF/GLB。
+                   **独立 v-if，不与「预览」互斥**：气囊平面图已有产物时仍要能
+                   重新识别，而挂在 v-else-if 上时"预览"分支一命中它就永远不渲染
+                   —— 改 needsLightweight 也没用，因为那个条件根本不会被求值。 -->
               <button
-                v-else-if="needsLightweight(g)"
+                v-if="needsLightweight(g)"
                 class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs text-indigo-600 hover:bg-indigo-50 disabled:opacity-40 disabled:hover:bg-transparent"
                 :disabled="!vkUsable() || !!converting"
                 :title="
