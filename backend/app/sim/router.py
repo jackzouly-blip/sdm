@@ -1040,8 +1040,13 @@ async def upload_airbag_deck(
     if not name.lower().endswith((".k", ".key", ".dyn")):
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
                             f"deck 的扩展名必须是 .k/.key/.dyn（收到 {name}）")
-    # 文件名带上源版本号，重复生成不会互相覆盖
-    name = f"airbag-v{src_geom['version_no']:02d}{os.path.splitext(name)[1]}"
+    # 文件名带上源版本号；**同一个源反复生成**时再挂序号——每次生成都登记成一个
+    # 独立的几何版本，各自的 deck 必须是独立文件，不能互相覆盖（只带源版本号时
+    # 第二次生成会撞名，落盘直接 500）。
+    prior = sum(1 for g in db.list_geometries(src_geom["sim_target_id"])
+                if g["derived_from_id"] == gid and g["source_type"] == "deck")
+    seq = f"-r{prior + 1}" if prior else ""
+    name = f"airbag-v{src_geom['version_no']:02d}{seq}{os.path.splitext(name)[1]}"
 
     data = await file.read()
     try:
@@ -1203,8 +1208,9 @@ async def upload_lightweight(
         )
     data = await file.read()
     try:
+        # 产物是几何版本的派生物，重跑转换 / 重新识别就该换成新的一份
         written = write_file(proj["owner"], parent, name, data,
-                             get_settings().fs_root_list)
+                             get_settings().fs_root_list, replace=True)
     except FsError as e:
         raise HTTPException(e.status, f"写入轻量化产物失败: {e.message}")
 
@@ -1459,8 +1465,9 @@ async def upload_mesh_artifact(
 
     data = await file.read()
     try:
+        # 固定文件名的用意就是同一版本重复检入时换掉旧的（见上），必须允许覆盖
         written = write_file(proj["owner"], parent, name, data,
-                             get_settings().fs_root_list)
+                             get_settings().fs_root_list, replace=True)
     except FsError as e:
         raise HTTPException(e.status, f"写入网格产物失败: {e.message}")
 

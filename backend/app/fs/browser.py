@@ -155,22 +155,48 @@ def _do_mkdir(path: str) -> Dict:
     return {"realpath_parent": real_parent}
 
 
-def _do_write_file(path: str, data: bytes) -> Dict:
-    """写入新文件（不覆盖已存在文件）。返回父目录 realpath 供二次校验。
+def _write_all(fd: int, data: bytes) -> None:
+    mv = memoryview(data)
+    while mv:
+        n = os.write(fd, mv)
+        mv = mv[n:]
+
+
+def _do_write_file(path: str, data: bytes, replace: bool = False) -> Dict:
+    """写入文件。返回父目录 realpath 供二次校验。
 
     父目录不存在时按降权身份自动创建（目录上传需保留层级）。
+
+    `replace` 只给**派生产物**用（轻量化 glb 等重跑后要换新的），普通上传保持
+    不覆盖：用户手工传文件时静默盖掉同名件是数据丢失。
     """
     parent = os.path.dirname(path)
     # 目录上传：中间目录可能尚不存在，按当前（已降权）身份创建，umask 077 → 0700
     os.makedirs(parent, exist_ok=True)
     real_parent = os.path.realpath(parent)
+    if replace:
+        # 先写临时文件再原子换名：传到一半失败不会把已有产物毁掉，
+        # 也不会让读的人看到半截文件。
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            try:
+                _write_all(fd, data)
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+        except BaseException:
+            # 任何一步失败都要收走临时文件，否则目录里会积一堆 .tmp
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return {"realpath_parent": real_parent}
     # O_EXCL：目标已存在则报错，避免静默覆盖
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        mv = memoryview(data)
-        while mv:
-            n = os.write(fd, mv)
-            mv = mv[n:]
+        _write_all(fd, data)
     finally:
         os.close(fd)
     return {"realpath_parent": real_parent}
@@ -328,9 +354,10 @@ def rename_path(user: str, path: str, new_name: str, roots: List[str]) -> Dict:
 
 
 def write_file(
-    user: str, parent: str, filename: str, data: bytes, roots: List[str]
+    user: str, parent: str, filename: str, data: bytes, roots: List[str],
+    replace: bool = False
 ) -> Dict:
-    """把上传的文件写入 parent 目录，不覆盖已有。
+    """把上传的文件写入 parent 目录，默认不覆盖已有（`replace=True` 时原子替换）。
 
     filename 可含相对子路径（目录上传时保留层级，如 "sub/a.txt"）：逐段校验，
     禁止空段 / "." / ".." / 绝对路径；中间目录按目标用户身份自动创建。
@@ -343,7 +370,7 @@ def write_file(
     parent_norm = normalize_under_roots(parent, roots)
     target = os.path.join(parent_norm, rel)
     normalize_under_roots(target, roots)
-    result = call_as_user(user, _do_write_file, target, data)
+    result = call_as_user(user, _do_write_file, target, data, replace)
     if not _contains(roots, result["realpath_parent"]):
         raise FsError("目标经符号链接解析后超出允许范围", 403)
     return {"path": target}
