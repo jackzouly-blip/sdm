@@ -78,6 +78,8 @@ const KIND_LABEL: Record<string, string> = {
   strap: "安装位", fix: "固定带", tie: "扎带", named: "点名件",
   // 建网格用的标识层：叠加在布片之上，不是要建模的面
   anchor: "固定点(刚体)", seam: "缝线(与单层区融合)",
+  // 气室边界上没贴着单层区的段：没东西可缝，目前靠把上下两层捏到一起收口
+  open: "未缝合边界(气室收口)",
   carrier: "固定件", tether: "拉带", band: "缝线带", other: "其它",
 };
 /** 认件口径（可能多于画出来的：窄缝线带的边界曲线常被邻近大区吸走） */
@@ -135,7 +137,7 @@ function focusPart(p: NavPart | null) {
 const navGroups = computed(() => {
   // 标识层(anchor/seam)排在布片之后：它们不是件，是建网格时的约束
   const order = ["single", "nangdai", "chamber", "diffuser", "strap", "fix", "tie",
-                 "named", "carrier", "tether", "band", "anchor", "seam", "other"];
+                 "named", "carrier", "tether", "band", "anchor", "seam", "open", "other"];
   const by = new Map<string, NavPart[]>();
   for (const p of navParts.value) {
     if (!by.has(p.kind)) by.set(p.kind, []);
