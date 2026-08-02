@@ -66,8 +66,6 @@ const error = ref("");
 interface NavPart {
   name: string;
   kind: string;
-  /** 归并键（如"安装位3"）。同一安装位上的固定带与扎带实物叠在一起，列一处 */
-  group?: string;
   segments: number;
   obj: THREE.Object3D;
   box: THREE.Box3;
@@ -76,7 +74,8 @@ const navParts = shallowRef<NavPart[]>([]);
 const activePart = ref<string | null>(null);
 const KIND_LABEL: Record<string, string> = {
   single: "单层区(囊袋支撑层)", nangdai: "囊袋", chamber: "腔体", diffuser: "导流袋",
-  fix: "固定带", tie: "扎带(仿真忽略)", named: "点名件",
+  // 一个安装位 = 固定带 + 扎带，它们叠着共缝，网格也建成一片
+  strap: "安装位", fix: "固定带", tie: "扎带", named: "点名件",
   carrier: "固定件", tether: "拉带", band: "缝线带", other: "其它",
 };
 /** 认件口径（可能多于画出来的：窄缝线带的边界曲线常被邻近大区吸走） */
@@ -94,7 +93,6 @@ function collectNav(root: THREE.Object3D) {
       : new THREE.Box3().setFromObject(o);
     out.push({
       name: String(ex.partId), kind: String(ex.kind ?? "other"),
-      group: ex.group ? String(ex.group) : undefined,
       segments: Number(ex.segments ?? 0), obj: o, box,
     });
   });
@@ -133,30 +131,18 @@ function focusPart(p: NavPart | null) {
 
 /** 分组后的导航列表：主件在前，同类聚在一起；带 group 的按归并键成组 */
 const navGroups = computed(() => {
-  const order = ["single", "nangdai", "chamber", "diffuser", "fix", "tie",
+  const order = ["single", "nangdai", "chamber", "diffuser", "strap", "fix", "tie",
                  "named", "carrier", "tether", "band", "other"];
-  // 归并键优先于类别：固定带3 与扎带3 是同一安装位上叠着的两件，列一处才好看。
-  // 键由 GLB 的 extras.group 给死，不从件名里猜序号。
   const by = new Map<string, NavPart[]>();
   for (const p of navParts.value) {
-    const key = p.group ?? p.kind;
-    if (!by.has(key)) by.set(key, []);
-    by.get(key)!.push(p);
+    if (!by.has(p.kind)) by.set(p.kind, []);
+    by.get(p.kind)!.push(p);
   }
-  // order 只定次序，**不当白名单**：不认识的键追加在后面。早先按 order 过滤，
+  // order 只定次序，**不当白名单**：不认识的类别追加在后面。早先按 order 过滤，
   // Python 侧把类名从 nangdai/carrier/band 改成 single/fix/tie 之后，15 个件
   // (单层区 + 固定带 7 + 扎带 7)渲染出来了却整个从导航里消失，只剩 5 件可点。
-  const rank = (k: string) => {
-    const parts = by.get(k)!;
-    // 归并组按其中排得最靠前的那件定位；同名组之间再按键排，安装位才按序
-    const i = Math.min(...parts.map((p) => {
-      const j = order.indexOf(p.kind);
-      return j < 0 ? order.length : j;
-    }));
-    return i;
-  };
-  return [...by.keys()]
-    .sort((a, b) => rank(a) - rank(b) || a.localeCompare(b, "zh"))
+  const extra = [...by.keys()].filter((k) => !order.includes(k)).sort();
+  return [...order.filter((k) => by.has(k)), ...extra]
     .map((k) => ({
       kind: k,
       label: KIND_LABEL[k] ?? k,
