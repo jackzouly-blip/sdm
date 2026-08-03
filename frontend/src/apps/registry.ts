@@ -27,6 +27,7 @@ import {
   SlidersHorizontal,
   TerminalSquare,
   UploadCloud,
+  Wrench,
 } from "lucide-vue-next";
 
 export interface AppNavItem {
@@ -36,6 +37,20 @@ export interface AppNavItem {
   icon: Component;
   /** 仅管理员可见（后端同样会强制校验，这里只是不显示入口） */
   admin?: boolean;
+}
+
+/**
+ * 顶栏的二级分组（下拉菜单）。
+ *
+ * 动机：页面数量只会增不会减，全部平铺在顶栏迟早放不下——挤到一定程度
+ * 导航文字会逐字换行，非常难看。把同类页面收进下拉，顶栏项数就稳定了。
+ * 组内项同样按 admin 过滤；整组可见项为空时，该下拉不渲染。
+ */
+export interface AppNavGroup {
+  id: string;
+  label: string;
+  icon: Component;
+  items: AppNavItem[];
 }
 
 export interface AppDef {
@@ -48,7 +63,10 @@ export interface AppDef {
   base: string;
   /** 进入该 APP 时的默认页面（路由 name） */
   home: string;
+  /** 顶栏直接平铺的页面（日常高频） */
   nav: AppNavItem[];
+  /** 收进下拉的页面分组（低频/运维），可选 */
+  navGroups?: AppNavGroup[];
 }
 
 export const APPS: AppDef[] = [
@@ -59,17 +77,28 @@ export const APPS: AppDef[] = [
     icon: Cpu,
     base: "/hpc",
     home: "jobs",
+    // 日常作业相关平铺；运维配置类收进「运维」下拉——普通用户本就看不到那 5 项，
+    // 顶栏拥挤只发生在管理员视图，收纳后管理员也只剩 6 项。
     nav: [
       { name: "jobs", label: "任务", icon: ListTodo },
       { name: "files", label: "文件浏览", icon: FolderTree },
       { name: "netdisk", label: "网盘数据", icon: CloudDownload },
       { name: "tasks", label: "打包记录", icon: UploadCloud },
       { name: "rules", label: "后处理工具", icon: FileCog },
-      { name: "templates", label: "模板管理", icon: FileCode, admin: true },
-      { name: "user-policies", label: "用户策略", icon: SlidersHorizontal, admin: true },
-      { name: "stats", label: "机时统计", icon: BarChart3, admin: true },
-      { name: "nodes", label: "节点监控", icon: Server, admin: true },
-      { name: "shell", label: "在线终端", icon: TerminalSquare, admin: true },
+    ],
+    navGroups: [
+      {
+        id: "ops",
+        label: "运维",
+        icon: Wrench,
+        items: [
+          { name: "templates", label: "模板管理", icon: FileCode, admin: true },
+          { name: "user-policies", label: "用户策略", icon: SlidersHorizontal, admin: true },
+          { name: "stats", label: "机时统计", icon: BarChart3, admin: true },
+          { name: "nodes", label: "节点监控", icon: Server, admin: true },
+          { name: "shell", label: "在线终端", icon: TerminalSquare, admin: true },
+        ],
+      },
     ],
   },
   {
@@ -105,7 +134,32 @@ export function appForPath(path: string): AppDef {
   return APPS.find((a) => path.startsWith(a.base + "/") || path === a.base) ?? APPS[0];
 }
 
-/** 该 APP 对当前用户可见的导航项。 */
+/** 该 APP 顶栏平铺的可见导航项。 */
 export function visibleNav(app: AppDef, isAdmin: boolean): AppNavItem[] {
   return app.nav.filter((i) => !i.admin || isAdmin);
+}
+
+/** 该 APP 可见的下拉分组；组内无可见项时整组不返回（避免空下拉）。 */
+export function visibleGroups(app: AppDef, isAdmin: boolean): AppNavGroup[] {
+  return (app.navGroups ?? [])
+    .map((g) => ({ ...g, items: g.items.filter((i) => !i.admin || isAdmin) }))
+    .filter((g) => g.items.length > 0);
+}
+
+/**
+ * 全部可见页面的扁平列表（平铺项 + 各组项）。
+ *
+ * 移动端抽屉用它：小屏没有"顶栏放不下"的问题，分组反而多一层点击，
+ * 直接铺开更好用。
+ */
+export function flatNav(app: AppDef, isAdmin: boolean): AppNavItem[] {
+  return [
+    ...visibleNav(app, isAdmin),
+    ...visibleGroups(app, isAdmin).flatMap((g) => g.items),
+  ];
+}
+
+/** 路由 name 是否属于某个分组——用于给下拉按钮打高亮。 */
+export function groupContains(group: AppNavGroup, routeName?: string | null): boolean {
+  return !!routeName && group.items.some((i) => i.name === routeName);
 }

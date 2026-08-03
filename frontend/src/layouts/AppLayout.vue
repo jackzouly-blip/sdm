@@ -3,12 +3,20 @@ import { computed, onMounted, ref } from "vue";
 import { RouterView, RouterLink, useRouter, useRoute } from "vue-router";
 import { useAuthStore } from "@/stores/auth";
 import { api, errMsg } from "@/api";
-import { APPS, appForPath, visibleNav } from "@/apps/registry";
+import {
+  APPS,
+  appForPath,
+  flatNav,
+  groupContains,
+  visibleGroups,
+  visibleNav,
+} from "@/apps/registry";
 import {
   LogOut,
   Globe,
   Copy,
   Check,
+  ChevronDown,
   ExternalLink,
   Menu as MenuIcon,
   X as XIcon,
@@ -68,7 +76,17 @@ const route = useRoute();
 const currentApp = computed(() => appForPath(route.path));
 // 管理员专属入口在此过滤（后端同样会以 is_admin 强制校验，这里只是不显示入口）。
 const nav = computed(() => visibleNav(currentApp.value, !!auth.me?.is_admin));
+// 低频/运维页面收进下拉，避免顶栏项数无限增长后挤到逐字换行。
+const navGroups = computed(() => visibleGroups(currentApp.value, !!auth.me?.is_admin));
+// 移动端抽屉直接铺开：小屏没有"放不下"的问题，分组反而多一层点击。
+const mobileNav = computed(() => flatNav(currentApp.value, !!auth.me?.is_admin));
+const openGroup = ref<string | null>(null);
 const appSwitcherOpen = ref(false);
+
+function toggleGroup(id: string) {
+  openGroup.value = openGroup.value === id ? null : id;
+  appSwitcherOpen.value = false;
+}
 
 function switchApp(appId: string) {
   appSwitcherOpen.value = false;
@@ -138,18 +156,56 @@ function switchApp(appId: string) {
         </div>
       </div>
 
-      <!-- 桌面导航（当前 APP 内） -->
-      <nav class="hidden md:flex items-center gap-1">
+      <!-- 桌面导航（当前 APP 内）：胶囊标签，纯文字。
+           whitespace-nowrap + shrink-0 是必需的——缺了它宽度不足时文字会逐字换行；
+           overflow-x-auto 作兜底，页面再多也只是横向滚动，不会把右侧用户区挤出去。 -->
+      <nav class="hidden md:flex items-center gap-1.5 min-w-0 overflow-x-auto nav-scroll">
         <RouterLink
           v-for="item in nav"
           :key="item.name"
           :to="{ name: item.name }"
-          class="px-3 py-1.5 rounded-md text-sm flex items-center gap-1.5 text-slate-600 hover:bg-slate-100 transition"
-          active-class="!bg-blue-50 !text-blue-700"
+          class="shrink-0 whitespace-nowrap px-3.5 py-1.5 rounded-full border border-slate-200 bg-white text-sm text-slate-600 hover:bg-slate-50 hover:border-slate-300 transition"
+          active-class="!bg-blue-50 !border-blue-300 !text-blue-700"
         >
-          <component :is="item.icon" :size="16" />
           {{ item.label }}
         </RouterLink>
+
+        <!-- 分组下拉（如「运维」）：组内有当前页时按钮同样高亮，
+             否则用户会以为自己不在任何导航项上 -->
+        <div v-for="g in navGroups" :key="g.id" class="relative shrink-0">
+          <button
+            class="flex items-center gap-1 whitespace-nowrap px-3.5 py-1.5 rounded-full border text-sm transition"
+            :class="
+              groupContains(g, route.name as string)
+                ? 'bg-blue-50 border-blue-300 text-blue-700'
+                : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100 hover:border-slate-300'
+            "
+            @click="toggleGroup(g.id)"
+          >
+            {{ g.label }}
+            <ChevronDown :size="13" class="opacity-60" />
+          </button>
+          <div
+            v-if="openGroup === g.id"
+            class="fixed inset-0 z-10"
+            @click="openGroup = null"
+          ></div>
+          <div
+            v-if="openGroup === g.id"
+            class="absolute left-0 top-full mt-1 z-20 w-40 bg-white border border-slate-200 rounded-lg shadow-lg p-1"
+          >
+            <RouterLink
+              v-for="item in g.items"
+              :key="item.name"
+              :to="{ name: item.name }"
+              class="block px-3 py-2 rounded-md text-sm text-slate-700 hover:bg-slate-50 transition"
+              active-class="!bg-blue-50 !text-blue-700"
+              @click="openGroup = null"
+            >
+              {{ item.label }}
+            </RouterLink>
+          </div>
+        </div>
       </nav>
       <div class="ml-auto flex items-center gap-2 sm:gap-3 text-sm text-slate-600">
         <!-- IPv6 入口：显示服务器当前 IPv6，可复制 / 一键切换（前缀变化自动更新） -->
@@ -204,8 +260,9 @@ function switchApp(appId: string) {
       v-if="mobileOpen"
       class="md:hidden bg-white border-b border-slate-200 flex flex-col p-2 gap-1 shadow-sm"
     >
+      <!-- 移动端保留图标：竖排列表里图标帮助快速定位，且触摸目标更好点 -->
       <RouterLink
-        v-for="item in nav"
+        v-for="item in mobileNav"
         :key="item.name"
         :to="{ name: item.name }"
         class="px-3 py-3 rounded-md text-sm flex items-center gap-2 text-slate-700 hover:bg-slate-100"
@@ -232,3 +289,13 @@ function switchApp(appId: string) {
     </main>
   </div>
 </template>
+
+<style scoped>
+/* 顶栏导航的横向滚动只是极窄屏下的兜底，平时不该出现滚动条占位 */
+.nav-scroll {
+  scrollbar-width: none;
+}
+.nav-scroll::-webkit-scrollbar {
+  display: none;
+}
+</style>
