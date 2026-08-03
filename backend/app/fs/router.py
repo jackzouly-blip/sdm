@@ -29,13 +29,16 @@ from ..privilege.actas import (
     run_as_user,
     stream_tar_as_user,
 )
+from . import mover as _fs_mover  # noqa: F401  注册 fs_move 任务
 from .browser import (
     FsError,
     delete_path,
     find_files,
     list_dir,
     make_dir,
+    move_paths,
     path_size,
+    probe_move,
     read_text,
     rename_path,
     stat_path,
@@ -137,6 +140,40 @@ def fs_rename(
 ) -> PathResponse:
     result = _handle(rename_path, _fs_user(user), req.path, req.new_name, _roots())
     return PathResponse(path=result["path"])
+
+
+class MoveRequest(BaseModel):
+    paths: List[str]   # 待移动的绝对路径（文件或目录）
+    dst_dir: str       # 目标目录绝对路径
+
+
+@router.post("/move")
+def fs_move_paths(
+    req: MoveRequest,
+    request: Request,
+    user: str = Depends(current_user),
+):
+    """把一批文件/目录移动到 dst_dir（同 fs_roots 内跨目录）。
+
+    同一文件系统内是 os.rename，瞬时完成，直接同步返回 {moved: [...]}；
+    跨文件系统要复制字节，改为派发 fs_move 任务并返回 {task_id}，
+    前端用 pollTask 拿进度——放在请求里做必然超时。
+    """
+    fs_user = _fs_user(user)
+    roots = _roots()
+    probe = _handle(probe_move, fs_user, req.paths, req.dst_dir, roots)
+
+    if not probe["cross_device"]:
+        result = _handle(move_paths, fs_user, req.paths, req.dst_dir, roots)
+        return {"task_id": None, **result}
+
+    tm = getattr(request.app.state, "task_manager", None)
+    if tm is None:
+        raise HTTPException(status_code=503, detail="任务管理器不可用")
+    task_id = tm.submit("fs_move", owner=user, params={
+        "user": fs_user, "paths": req.paths, "dst_dir": req.dst_dir, "roots": roots,
+    })
+    return {"task_id": task_id, "moved": [], "failed": [], "cross_device": True}
 
 
 @router.delete("/delete")

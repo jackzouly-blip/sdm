@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import stat
@@ -351,6 +352,117 @@ def rename_path(user: str, path: str, new_name: str, roots: List[str]) -> Dict:
     if not _contains(roots, result["realpath_parent"]):
         raise FsError("目标经符号链接解析后超出允许范围", 403)
     return {"path": dst}
+
+
+# --- 跨目录移动 -------------------------------------------------------
+
+def _do_probe_move(srcs: List[str], dst_dir: str) -> Dict:
+    """降权后勘察：目标是否目录、各源是否存在、是否同一文件系统。
+
+    同设备可用 os.rename 瞬时完成；跨设备要复制字节，对大目录是分钟级操作，
+    必须走异步任务。故先勘察再决定同步还是异步——这一步很轻，只做 stat。
+
+    业务性错误经返回值回传而非抛出：本函数在降权子进程里跑，call_as_user 会
+    把任何异常压成 PrivilegeError(repr)，类型与可读文案都会丢失。故只让
+    OS 级异常（不存在/无权限）自然抛出，其余交父进程构造 FsError。
+    """
+    if not os.path.isdir(dst_dir):
+        raise NotADirectoryError(dst_dir)
+    dst_dev = os.stat(dst_dir).st_dev
+    real_dst = os.path.realpath(dst_dir)
+    items = []
+    cross = False
+    for s in srcs:
+        if not os.path.lexists(s):
+            raise FileNotFoundError(s)
+        name = os.path.basename(s)
+        real_src = os.path.realpath(s)
+        # 把目录移进它自己（或自己的子孙）里，会造出无法访问的自嵌套结构
+        if os.path.isdir(s) and (real_dst == real_src
+                                 or real_dst.startswith(real_src + os.sep)):
+            return {"error": {"kind": "self_nest", "name": name}}
+        dst = os.path.join(dst_dir, name)
+        if os.path.lexists(dst):
+            return {"error": {"kind": "exists", "name": name}}
+        # 用 lstat：符号链接移动的是链接本身，跟它指向哪儿无关
+        if os.lstat(s).st_dev != dst_dev:
+            cross = True
+        items.append({"src": s, "dst": dst})
+    return {"items": items, "cross_device": cross, "realpath_dst": real_dst,
+            "error": None}
+
+
+def _do_move_one(src: str, dst: str) -> Dict:
+    """移动单个条目。同设备 os.rename，跨设备退化为复制+删除。"""
+    if not os.path.lexists(src):
+        raise FileNotFoundError(src)
+    if os.path.lexists(dst):
+        raise FileExistsError(dst)
+    try:
+        os.rename(src, dst)
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+        # 跨文件系统：shutil.move 会复制后删源，保留符号链接语义
+        shutil.move(src, dst)
+    return {"dst": dst}
+
+
+def probe_move(user: str, paths: List[str], dst_dir: str, roots: List[str]) -> Dict:
+    """校验一次移动请求，返回 {items, cross_device}。不实际移动。
+
+    路径白名单、根本身保护、符号链接逃逸都在这里挡掉；真正的可读可写
+    仍由降权后的 OS 权限兜底。
+    """
+    if not paths:
+        raise FsError("没有要移动的文件", 400)
+    dst = normalize_under_roots(dst_dir, roots)
+    srcs = []
+    for p in paths:
+        norm = normalize_under_roots(p, roots)
+        for r in roots:
+            if os.path.realpath(norm) == os.path.realpath(r):
+                raise FsError("不能移动根目录", 400)
+        if os.path.dirname(norm) == dst:
+            raise FsError(f"{os.path.basename(norm)} 已在目标目录中", 400)
+        srcs.append(norm)
+
+    result = call_as_user(user, _do_probe_move, srcs, dst)
+    err = result.get("error")
+    if err:
+        if err["kind"] == "self_nest":
+            raise FsError(f"不能把目录移动到它自己内部：{err['name']}", 400)
+        raise FsError(f"目标目录中已存在同名文件：{err['name']}", 409)
+    if not _contains(roots, result["realpath_dst"]):
+        raise FsError("目标经符号链接解析后超出允许范围", 403)
+    return result
+
+
+def move_paths(
+    user: str, paths: List[str], dst_dir: str, roots: List[str],
+    progress_cb=None,
+) -> Dict:
+    """把 paths 移动到 dst_dir。返回 {moved: [目标路径...]}。
+
+    progress_cb(done, total, name) 供异步任务上报进度；同步调用可不传。
+    逐个移动而非整体事务：部分失败时已完成的保持已完成，错误如实上报，
+    比回滚更符合"移动文件"的直觉（用户重试只会补上剩下的）。
+    """
+    probe = probe_move(user, paths, dst_dir, roots)
+    items = probe["items"]
+    moved, failed = [], []
+    for i, it in enumerate(items):
+        name = os.path.basename(it["src"])
+        if progress_cb is not None:
+            progress_cb(i, len(items), name)
+        try:
+            call_as_user(user, _do_move_one, it["src"], it["dst"])
+            moved.append(it["dst"])
+        except Exception as e:  # noqa: BLE001
+            failed.append({"path": it["src"], "error": str(e)[:200]})
+    if progress_cb is not None:
+        progress_cb(len(items), len(items), "")
+    return {"moved": moved, "failed": failed, "cross_device": probe["cross_device"]}
 
 
 def write_file(
