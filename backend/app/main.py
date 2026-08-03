@@ -18,7 +18,11 @@ from .extract.rules_db import RulesDB
 from .fs.favorites_db import FavoritesDB
 from .fs.router import router as fs_router
 from .jobs.poller import JobPoller
+from .netdisk import puller as _netdisk_puller  # noqa: F401  注册 netdisk_pull 任务
+from .netdisk.router import router as netdisk_router
+from .netdisk.scanner import NetdiskScanner, set_scanner
 from .netdisk.streamer import NetdiskStreamer, set_streamer
+from .netdisk.sync_db import NetdiskSyncDB
 from .jobs.router import router as jobs_router
 from .nodes.router import router as nodes_router
 from .logger import get_logger, setup_logging
@@ -66,6 +70,16 @@ async def lifespan(app: FastAPI):
         stable_seconds=settings.netdisk_stream_stable_seconds,
     )
     set_streamer(streamer)
+    # 网盘入站同步：分享源库 + 定时轮询（凭据未配时轮询自身会空转，不影响启动）
+    netdisk_sync_db = NetdiskSyncDB(str(BACKEND_DIR / "state" / "netdisk_sync.db"))
+    _netdisk_puller.set_sync_db(netdisk_sync_db)
+    netdisk_scanner = NetdiskScanner(
+        netdisk_sync_db,
+        task_manager,
+        interval=settings.netdisk_pull_interval,
+        jitter=settings.netdisk_pull_jitter,
+    )
+    set_scanner(netdisk_scanner)
     scheduler = SubmissionScheduler(db, interval=settings.submit_scheduler_interval)
     set_scheduler(scheduler)
     trial_manager = TrialManager(
@@ -78,6 +92,8 @@ async def lifespan(app: FastAPI):
     app.state.poller = poller
     app.state.task_manager = task_manager
     app.state.netdisk_streamer = streamer
+    app.state.netdisk_sync_db = netdisk_sync_db
+    app.state.netdisk_scanner = netdisk_scanner
     app.state.rules_db = rules_db
     app.state.templates_db = templates_db
     app.state.favorites_db = favorites_db
@@ -95,8 +111,16 @@ async def lifespan(app: FastAPI):
         dispatcher.recover_pending()
     except Exception:  # noqa: BLE001
         log.exception("提取补派发失败")
+    # 上次进程被杀时残留的 syncing 占位会让该源永远无法再同步，启动时清掉
+    try:
+        stuck = netdisk_sync_db.reset_stuck()
+        if stuck:
+            log.warning("清理 %d 个中断的网盘同步占位", stuck)
+    except Exception:  # noqa: BLE001
+        log.exception("清理网盘同步占位失败")
     poller.start()
     streamer.start()
+    netdisk_scanner.start()
     scheduler.start()
     trial_manager.start()
     try:
@@ -104,9 +128,11 @@ async def lifespan(app: FastAPI):
     finally:
         poller.stop()
         streamer.stop()
+        netdisk_scanner.stop()
         scheduler.stop()
         trial_manager.stop()
         task_manager.close()
+        netdisk_sync_db.close()
         rules_db.close()
         templates_db.close()
         favorites_db.close()
@@ -136,6 +162,7 @@ app.include_router(submit_router)
 app.include_router(stats_router)
 app.include_router(trial_router)
 app.include_router(nodes_router)
+app.include_router(netdisk_router)
 app.include_router(sim_router)
 app.include_router(sim_pipeline_router)
 

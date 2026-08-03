@@ -345,6 +345,86 @@ def stream_file_as_user(username: str, path: str, chunk: int = 1 << 20):
     return _gen()
 
 
+def write_stream_as_user(
+    username: str,
+    path: str,
+    chunks,
+    *,
+    append: bool = False,
+    mode: int = 0o600,
+    chunk: int = 1 << 20,
+) -> int:
+    """以目标用户身份把字节流写入文件：与 stream_file_as_user 方向相反。
+
+    只 fork 一次：子进程降权后从管道读并落盘，父进程把 chunks 逐块写入管道。
+    适合"父进程持有网络流、但文件必须以目标用户身份创建"的场景（网盘入站下载）——
+    字节数在父进程天然可见（进度条直接可用），而文件的属主与权限校验仍归 OS
+    与目标用户，不会出现 root 越过目录权限写入用户目录的破窗。
+
+    append=True 用于断点续传（不截断已有内容）。返回父进程写入管道的字节数。
+
+    注意：若 chunks 中途抛异常（如网络中断），已落盘的部分会保留——这正是
+    续传所需要的，异常照常向上传播由调用方处理。
+    """
+    user = resolve_user(username)
+    demote = not _is_self(user)
+    if demote:
+        _require_root()
+    rfd, wfd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        # 子进程：降权后从管道读，写入目标文件
+        code = 1
+        try:
+            os.close(wfd)
+            if demote:
+                os.setgid(user.gid)
+                os.setgroups(_supplementary_gids(user))
+                os.setuid(user.uid)
+            flags = os.O_WRONLY | os.O_CREAT
+            flags |= os.O_APPEND if append else os.O_TRUNC
+            fd = os.open(path, flags, mode)
+            try:
+                while True:
+                    b = os.read(rfd, chunk)
+                    if not b:
+                        break
+                    off = 0
+                    while off < len(b):
+                        off += os.write(fd, b[off:])
+            finally:
+                os.close(fd)
+            code = 0
+        except BaseException:  # noqa: BLE001
+            code = 1
+        finally:
+            try:
+                os.close(rfd)
+            except OSError:
+                pass
+            os._exit(code)
+
+    os.close(rfd)
+    written = 0
+    try:
+        for b in chunks:
+            if not b:
+                continue
+            off = 0
+            while off < len(b):
+                off += os.write(wfd, b[off:])
+            written += len(b)
+    finally:
+        try:
+            os.close(wfd)
+        except OSError:
+            pass
+        _, status = os.waitpid(pid, 0)
+    if not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0):
+        raise PrivilegeError(f"以用户 {username} 写入 {path} 失败（子进程异常退出）")
+    return written
+
+
 def stream_tar_as_user(
     username: str, base: str, rel_paths: list[str], chunk: int = 1 << 20
 ):

@@ -71,6 +71,25 @@ class Settings(BaseSettings):
     netdisk_stream_interval: int = 60        # 流式扫描间隔（秒）
     netdisk_stream_stable_seconds: int = 120  # d3plot 距上次写入多久算“写完稳定”
 
+    # --- 网盘入站同步（客户分享链接 → 中转区 → 集群）---------------------
+    # 平台账号的网页 cookie。转存(share/transfer)没有开放接口，只能走网页私有
+    # 接口，故必须要它；OAuth token 只负责后半段下载。留空=入站同步禁用。
+    # 会过期，失效时同步会置 auth_failed 并告警，需运维更换。
+    netdisk_bduss: str = ""
+    netdisk_stoken: str = ""
+    # 中转区：转存落点根目录。批次目录为 <根>/<用户>/<分享源 id>/<批次>/
+    # 普通权限应用只保证能读写 /apps/<应用名>，故默认放在应用目录下。
+    netdisk_inbox_remote: str = "/apps/HPC/inbox"
+    # 集群落点根；留空=取白名单第一个根下的 hpc-portal/netdisk-inbox
+    # （与 sim_workdir_root 同样的派生思路，保证天然落在 fs_roots 内）
+    netdisk_inbox_root: str = ""
+    netdisk_pull_enabled: bool = False       # 定时轮询总开关（手动同步不受此限）
+    netdisk_pull_interval: int = 600         # 轮询间隔（秒）；私有接口需克制，别调太小
+    netdisk_pull_jitter: int = 60            # 轮询随机抖动上限（秒），避开整点齐发
+    netdisk_pull_batch: int = 100            # 单次 share/transfer 的 fs_id 数上限
+    netdisk_pull_verify_md5: bool = True     # 下载后校验 md5（防拿到中转区旧版本）
+    netdisk_pull_max_entries: int = 20000    # 单个分享递归遍历的文件数上限
+
     # d3plot 网页可视化
     # 装有 lasso-python 的 Python 解释器路径；留空则用后端自身解释器（须已装 lasso）
     d3plot_python: str = ""
@@ -121,6 +140,24 @@ class Settings(BaseSettings):
             return configured
         roots = self.fs_root_list
         return f"{roots[0]}/hpc-portal/sim" if roots else "/tmp/hpc-portal-sim"
+
+    @property
+    def netdisk_inbox_base_dir(self) -> str:
+        """网盘入站数据在集群上的落点根：<根>/<用户>/<源名>/ 由它派生。
+
+        与 sim_workdir_base_dir 同理——留空则回退到文件根白名单的第一个根，
+        保证派生结果天然落在白名单内（否则写入会被 403 拒掉）。
+        """
+        configured = (self.netdisk_inbox_root or "").strip().rstrip("/")
+        if configured:
+            return configured
+        roots = self.fs_root_list
+        return f"{roots[0]}/hpc-portal/netdisk-inbox" if roots else "/tmp/hpc-portal-inbox"
+
+    @property
+    def netdisk_pull_ready(self) -> bool:
+        """入站同步是否具备凭据（缺 BDUSS 时整个功能不可用）。"""
+        return bool(self.netdisk_bduss)
 
     @property
     def fs_root_list(self) -> list[str]:

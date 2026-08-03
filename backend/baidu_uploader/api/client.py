@@ -21,6 +21,7 @@ log = get_logger(__name__)
 
 FILE_API = "https://pan.baidu.com/rest/2.0/xpan/file"
 SHARE_API = "https://pan.baidu.com/rest/2.0/xpan/share"
+MULTIMEDIA_API = "https://pan.baidu.com/rest/2.0/xpan/multimedia"
 SUPERFILE = "https://d.pcs.baidu.com/rest/2.0/pcs/superfile2"
 HEADERS = {"User-Agent": "pan.baidu.com"}
 
@@ -207,6 +208,91 @@ class BaiduPanClient:
             if item.get("path") == remote_path:
                 return int(item["fs_id"])
         raise FileNotFoundError(f"网盘中未找到文件: {remote_path}")
+
+    def list_all(self, remote_dir: str, limit: int = 1000) -> list[dict]:
+        """递归列出目录下所有条目（listall，自动翻页）。
+
+        比自己递归调 list 省大量请求。普通权限应用对该接口的可用性需实测，
+        不可用时调用方应回退到 list_dir 自行递归。
+        """
+        out: list[dict] = []
+        start = 0
+        while True:
+            resp = self._client.get(
+                FILE_API,
+                params={
+                    "method": "listall",
+                    "access_token": self._get_token(),
+                    "path": remote_dir,
+                    "recursion": "1",
+                    "start": str(start),
+                    "limit": str(limit),
+                },
+            )
+            payload = self._json(resp)
+            if payload.get("errno", 0) != 0:
+                raise BaiduApiError("listall", payload.get("errno", -1), payload)
+            batch = payload.get("list", [])
+            out.extend(batch)
+            # has_more 为 0/缺失即到底；另防接口不返回 has_more 时靠空批次收敛
+            if not payload.get("has_more") or not batch:
+                return out
+            start += len(batch)
+
+    # --- 取下载直链 -----------------------------------------------------
+
+    def filemetas(self, fs_ids: list[int], dlink: bool = True) -> list[dict]:
+        """批量取文件元信息；dlink=True 时返回下载直链。
+
+        dlink 有效期约 8 小时，且使用时必须：
+          1) 手工拼接 `&access_token=`——不能走 httpx params，否则已签名的
+             query 会被重新编码导致 errno 31023 sign error；
+          2) 带 User-Agent: pan.baidu.com；
+          3) 跟随 302 跳转。
+        见 download.py::stream_dlink。
+        """
+        if not fs_ids:
+            return []
+        resp = self._client.get(
+            MULTIMEDIA_API,
+            params={
+                "method": "filemetas",
+                "access_token": self._get_token(),
+                "fsids": json.dumps(fs_ids),
+                "dlink": "1" if dlink else "0",
+            },
+        )
+        payload = self._json(resp)
+        if payload.get("errno", 0) != 0:
+            raise BaiduApiError("filemetas", payload.get("errno", -1), payload)
+        return payload.get("list", [])
+
+    # --- 删除 -----------------------------------------------------------
+
+    def delete(self, remote_paths: list[str]) -> dict:
+        """删除网盘文件/目录（filemanager opera=delete）。
+
+        用于中转区人工清理。async=1 走异步任务，返回 taskid；小批量通常立即完成。
+        """
+        if not remote_paths:
+            return {}
+        resp = self._client.post(
+            FILE_API,
+            params={
+                "method": "filemanager",
+                "access_token": self._get_token(),
+                "opera": "delete",
+            },
+            data={
+                "async": "1",
+                "filelist": json.dumps(remote_paths),
+                "ondup": "fail",
+            },
+        )
+        payload = self._json(resp)
+        if payload.get("errno", 0) != 0:
+            raise BaiduApiError("filemanager.delete", payload.get("errno", -1), payload)
+        return payload
 
     # --- 创建分享链接 ---------------------------------------------------
 
