@@ -294,7 +294,6 @@ const AIRBAG_PROFILES = [
 ];
 const airbagProfile = ref("5p-bag");
 const meshing = ref("");
-const meshStage = ref("");
 
 function isAirbagFlat(g: SimGeometry) {
   return g.source_type === "airbag_flat"
@@ -302,12 +301,23 @@ function isAirbagFlat(g: SimGeometry) {
 }
 
 async function airbagMesh(g: SimGeometry) {
+  // 进度走**和轻量化同一条时间线**，不再只写按钮文字。建网格要一分多钟、
+  // 中间十来个阶段，塞在按钮里既看不全也留不下痕迹；失败时更要紧的是"死在
+  // 哪一段"，而按钮文字在 finally 里就被清掉了。
   meshing.value = g.id;
   error.value = "";
-  meshStage.value = "申请票据";
+  convertStages.value = [];
+  convertFailedAt.value = "";
+  convertStartedAt.value = Date.now();
+  convertElapsed.value = 0;
+  window.clearInterval(elapsedTimer);
+  elapsedTimer = window.setInterval(() => {
+    convertElapsed.value = Math.round((Date.now() - convertStartedAt.value) / 1000);
+  }, 1000);
+  stage("申请票据", "申请票据");
   try {
     const t = await simApi.airbagTicket(g.id);
-    meshStage.value = "已交付 vektor3d";
+    stage("已交付 vektor3d", `已交付 vektor3d：${t.sourceName}（源文件与 deck 由它直连收发）`);
     const r = await vektor3d.runJob<{
       ok: boolean;
       mesh?: { nodes: number; elements: number };
@@ -326,9 +336,18 @@ async function airbagMesh(g: SimGeometry) {
         // 不做幂等：键不随算法版本变，改了算法再点会拿回旧产物(实测踩过)。
         // 重复点本就发生不了——按钮在运行期间是禁用的；幂等只防"刷新后再点",
         // 那种情况重跑一次的代价，远小于拿到一份看不出是旧的产物。
-        // 只显示粗粒度阶段：能力侧的 detail 是 Python 日志原文（"边翻转: 0 次"
-        // 之类），对使用者是噪声。要排查时看 vektor3d 的作业进度时间线。
-        onProgress: (p) => { if (p?.step) meshStage.value = p.step; },
+        // 阶段 + detail 一起显示，与轻量化那条时间线一致：detail 是能力侧
+        // 回报的一句话（"注释墙: 56 块中 47 块可拆" 之类），正是判断"卡在哪、
+        // 认出了什么"的依据。同名阶段就地更新，不会把时间线冲成几十行。
+        onProgress: (p, job) => {
+          const step = p ? p.step : job.queuePosition != null ? "排队中" : "建网格中";
+          const text = p
+            ? `${p.step}${p.detail ? ` · ${p.detail}` : ""}`
+            : job.queuePosition != null
+              ? `排队中（第 ${job.queuePosition + 1} 位）`
+              : "建网格中";
+          if (lastStage()?.text !== text) stage(step, text, "remote");
+        },
       }
     );
     const nm = r.check?.nonmanifold ?? 0;
@@ -339,12 +358,16 @@ async function airbagMesh(g: SimGeometry) {
     if (r.generic_only) {
       notice.value += "（通用规则：拉带等未识别）";
     }
+    stage("deck 已回传", `deck 已回传：${r.mesh?.nodes ?? 0} 节点 / ${r.mesh?.elements ?? 0} 单元`);
     await load();
+    convertStages.value = [];
   } catch (e) {
+    // 保留时间线：错误常只有一句网络层措辞，落在哪个阶段才是线索
+    convertFailedAt.value = convertStep();
     error.value = e instanceof Vektor3dError ? `vektor3d：${e.message}` : errMsg(e);
   } finally {
+    window.clearInterval(elapsedTimer);
     meshing.value = "";
-    meshStage.value = "";
   }
 }
 
@@ -642,7 +665,7 @@ defineExpose({ reload: load });
                 >
                   <Loader2 v-if="meshing === g.id" :size="12" class="animate-spin" />
                   <Wand2 v-else :size="12" />
-                  {{ meshing === g.id ? (meshStage || "生成中") : "生成网格" }}
+                  {{ meshing === g.id ? "生成网格中…" : "生成网格" }}
                 </button>
               </template>
               <button
@@ -725,10 +748,12 @@ defineExpose({ reload: load });
       :class="convertFailedAt ? 'bg-rose-50 text-rose-900' : 'bg-indigo-50 text-indigo-900'"
     >
       <div class="flex items-center gap-2">
-        <Loader2 v-if="converting" :size="13" class="animate-spin shrink-0" />
+        <Loader2 v-if="converting || meshing" :size="13" class="animate-spin shrink-0" />
         <AlertTriangle v-else :size="13" class="shrink-0" />
         <span class="font-medium">
-          {{ convertFailedAt ? `转换中断于「${convertFailedAt}」` : "轻量化进行中" }}
+          {{ convertFailedAt
+            ? `${meshing ? "生成网格" : "转换"}中断于「${convertFailedAt}」`
+            : meshing ? "生成网格进行中" : "轻量化进行中" }}
         </span>
         <span class="ml-auto shrink-0 tabular-nums opacity-70">
           已用 {{ fmtElapsed(convertElapsed) }}
@@ -753,6 +778,9 @@ defineExpose({ reload: load });
       <p v-if="convertFailedAt" class="mt-1.5 opacity-80">
         时间线停在此处即为断点：若最后一条是 sdm 阶段，说明 vektor3d 未回报任何进度，
         请查看桌面端 vektor3d 的日志。
+      </p>
+      <p v-else-if="meshing" class="mt-1.5 opacity-70">
+        建网格通常 1~2 分钟；期间可以离开本页，回来后结果会登记成新的几何版本。
       </p>
     </div>
 
