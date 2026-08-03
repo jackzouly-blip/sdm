@@ -41,6 +41,11 @@ const router = createRouter({
           component: () => import("@/views/FilesView.vue"),
         },
         {
+          path: "hpc/netdisk",
+          name: "netdisk",
+          component: () => import("@/views/NetdiskView.vue"),
+        },
+        {
           path: "hpc/tasks",
           name: "tasks",
           component: () => import("@/views/TasksView.vue"),

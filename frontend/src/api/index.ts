@@ -17,7 +17,16 @@ import type {
   ListResponse,
   LoginResponse,
   MeResponse,
+  MoveResult,
   NetdiskPreview,
+  NetdiskShare,
+  NetdiskShareFile,
+  NetdiskShareInput,
+  NetdiskSyncStatus,
+  NetdiskCredStatus,
+  NetdiskCredTestResult,
+  ShareBatch,
+  SharePreview,
   NodesResponse,
   PackageRequest,
   DagDoc,
@@ -216,6 +225,14 @@ export const api = {
   async deletePath(path: string): Promise<void> {
     await http.delete("/fs/delete", { params: { path } });
   },
+  /** 把一批文件/目录移动到 dst_dir。跨文件系统时返回 task_id，需配合 pollTask。 */
+  async movePaths(paths: string[], dstDir: string): Promise<MoveResult> {
+    const { data } = await http.post<MoveResult>("/fs/move", {
+      paths,
+      dst_dir: dstDir,
+    });
+    return data;
+  },
   // 递归查找目录下指定扩展名文件（相对路径），供提交作业选输入文件
   async findFiles(dir: string, exts = "k,key"): Promise<string[]> {
     const { data } = await http.get<string[]>("/fs/find-files", {
@@ -408,6 +425,76 @@ export const api = {
     const { data } = await http.post<{ jobid: string; dispatched: number }>(
       `/extract/jobs/${encodeURIComponent(jobid)}/run`
     );
+    return data;
+  },
+
+  // --- 网盘数据管理（入站：客户分享链接 → 集群）---
+  async netdiskSyncStatus(): Promise<NetdiskSyncStatus> {
+    const { data } = await http.get<NetdiskSyncStatus>("/netdisk/status");
+    return data;
+  },
+  /** 配置平台账号的网页 cookie（仅管理员）。存库，改完立即生效、无需重启。 */
+  async setNetdiskCredentials(body: {
+    bduss: string;
+    stoken: string;
+  }): Promise<NetdiskCredStatus> {
+    const { data } = await http.put<NetdiskCredStatus>("/netdisk/credentials", body);
+    return data;
+  },
+  async clearNetdiskCredentials(): Promise<NetdiskCredStatus> {
+    const { data } = await http.delete<NetdiskCredStatus>("/netdisk/credentials");
+    return data;
+  },
+  /** 当场验证凭据是否有效（不需要分享链接）。 */
+  async testNetdiskCredentials(): Promise<NetdiskCredTestResult> {
+    const { data } = await http.post<NetdiskCredTestResult>(
+      "/netdisk/credentials/test"
+    );
+    return data;
+  },
+  /** 落库前先验一次链接与提取码，并列出该层目录供挑子目录。 */
+  async previewShare(body: {
+    share_url: string;
+    pwd: string;
+    sub_dir?: string;
+  }): Promise<SharePreview> {
+    const { data } = await http.post<SharePreview>("/netdisk/preview", body);
+    return data;
+  },
+  async listShares(): Promise<NetdiskShare[]> {
+    const { data } = await http.get<NetdiskShare[]>("/netdisk/shares");
+    return data;
+  },
+  async createShare(input: NetdiskShareInput): Promise<NetdiskShare> {
+    const { data } = await http.post<NetdiskShare>("/netdisk/shares", input);
+    return data;
+  },
+  async updateShare(
+    id: number,
+    patch: Partial<NetdiskShareInput>
+  ): Promise<NetdiskShare> {
+    const { data } = await http.patch<NetdiskShare>(`/netdisk/shares/${id}`, patch);
+    return data;
+  },
+  async deleteShare(id: number): Promise<void> {
+    await http.delete(`/netdisk/shares/${id}`);
+  },
+  /** 手动触发同步；返回 task_id，配合 pollTask 拿进度（与打包/d3plot 同构）。 */
+  async syncShare(id: number): Promise<{ task_id: string }> {
+    const { data } = await http.post<{ task_id: string }>(
+      `/netdisk/shares/${id}/sync`
+    );
+    return data;
+  },
+  async listShareFiles(id: number, state?: string): Promise<NetdiskShareFile[]> {
+    const { data } = await http.get<NetdiskShareFile[]>(
+      `/netdisk/shares/${id}/files`,
+      { params: state ? { state } : undefined }
+    );
+    return data;
+  },
+  async listShareBatches(id: number): Promise<ShareBatch[]> {
+    const { data } = await http.get<ShareBatch[]>(`/netdisk/shares/${id}/batches`);
     return data;
   },
   // 清理任务工作目录下的 disk* / mes* / scr* 临时文件

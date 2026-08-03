@@ -6,6 +6,7 @@ import type { FsEntry } from "@/api/types";
 import { fmtBytes, fmtTime } from "@/lib/format";
 import PreviewModal from "@/components/PreviewModal.vue";
 import PackageDialog from "@/components/PackageDialog.vue";
+import MoveDialog from "@/components/MoveDialog.vue";
 import SubmitJobModal from "@/components/SubmitJobModal.vue";
 import {
   Folder,
@@ -19,6 +20,7 @@ import {
   PackageIcon,
   FolderPlus,
   FolderUp,
+  FolderInput,
   Upload,
   Check,
   X,
@@ -443,6 +445,15 @@ async function removeEntry(entry: FsEntry) {
   }
 }
 
+// 移动选中项到别的目录（对话框里选目标）
+const showMove = ref(false);
+const movePaths = computed(() => Array.from(selected.value));
+async function onMoved() {
+  showMove.value = false;
+  selected.value = new Set();
+  await load();
+}
+
 // 批量删除选中项（并发上限 4）
 const batchDeleting = ref(false);
 async function removeSelected() {
@@ -753,6 +764,14 @@ defineExpose({ reload: () => load() });
         </button>
         <button
           v-if="selected.size"
+          class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-slate-300 bg-white hover:bg-slate-50"
+          title="把选中的文件/目录移动到其他目录"
+          @click="showMove = true"
+        >
+          <FolderInput :size="15" /> 移动到… ({{ selected.size }})
+        </button>
+        <button
+          v-if="selected.size"
           class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-rose-300 text-rose-600 bg-white hover:bg-rose-50 disabled:opacity-60"
           :disabled="batchDeleting"
           title="删除选中的文件/目录"
@@ -1016,6 +1035,12 @@ defineExpose({ reload: () => load() });
       :input-file="submitInput"
       @close="showSubmit = false"
       @submitted="showSubmit = false"
+    />
+    <MoveDialog
+      v-if="showMove"
+      :paths="movePaths"
+      @close="showMove = false"
+      @moved="onMoved"
     />
   </div>
 </template>

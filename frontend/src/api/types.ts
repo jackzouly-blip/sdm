@@ -127,6 +127,131 @@ export type NetdiskState =
   | "failed"
   | "skipped";
 
+/** 跨目录移动的结果。同一文件系统内瞬时完成（task_id 为 null）；
+ *  跨文件系统要复制字节，返回 task_id 由前端轮询进度。 */
+export interface MoveResult {
+  task_id: string | null;
+  moved: string[];
+  failed: { path: string; error: string }[];
+  cross_device: boolean;
+}
+
+// --- 网盘数据管理（入站：客户分享链接 → 集群）---
+// 注意与上面的 Netdisk* 区分：那些是**出站**（结果上传网盘并分享），
+// 下面这组是**入站**（把客户放在网盘里的输入数据同步到 HPC 服务器）。
+
+/** 平台凭据状态。**只有状态，永远不含凭据本身**——后端不回显。 */
+export interface NetdiskCredStatus {
+  configured: boolean;
+  /** db=管理页配置（可热改）；env=部署文件配置（改了要重启）；none=未配 */
+  source: "db" | "env" | "none";
+  has_stoken: boolean;
+  /** unknown=尚未验证；ok=可用；auth_failed=已失效需更换 */
+  state: "none" | "unknown" | "ok" | "auth_failed";
+  account: string;
+  updated_at: number;
+  updated_by: string;
+  last_checked_at: number;
+}
+
+/** 入站功能可用性；ready=false 时表示平台未配置网盘凭据。 */
+export interface NetdiskSyncStatus {
+  ready: boolean;
+  inbox_base: string;
+  poll_enabled: boolean;
+  default_interval: number;
+  is_admin: boolean;
+  credentials: NetdiskCredStatus;
+}
+
+/** 「测试连接」的返回：状态字段 + 本次结论。 */
+export interface NetdiskCredTestResult extends NetdiskCredStatus {
+  ok: boolean;
+  detail: string;
+}
+
+/** 链接健康度：invalid 需用户重交链接，auth_failed 是平台侧故障。 */
+export type ShareLinkState = "unknown" | "ok" | "invalid" | "auth_failed";
+
+/** 一轮同步的结果状态。 */
+export type ShareSyncStatus = "" | "idle" | "syncing" | "done" | "partial" | "failed";
+
+export interface NetdiskShare {
+  id: number;
+  owner: string;
+  name: string;
+  share_url: string;
+  pwd: string;
+  sub_dir: string;
+  local_dir: string;
+  enabled: boolean;
+  /** 秒；0 = 仅手动同步 */
+  poll_interval: number;
+  link_state: ShareLinkState;
+  last_poll_at: number;
+  last_status: ShareSyncStatus;
+  last_error: string;
+  last_task_id: string;
+  syncing: boolean;
+  created_at: number;
+  updated_at: number;
+  /** 各状态文件计数，如 { done: 12, failed: 2 } */
+  counts?: Record<string, number>;
+}
+
+export interface NetdiskShareInput {
+  name: string;
+  share_url: string;
+  pwd: string;
+  sub_dir: string;
+  /** 留空由后端派生到 inbox 根下，用户不必知道集群绝对路径 */
+  local_dir: string;
+  enabled: boolean;
+  poll_interval: number;
+}
+
+export type ShareFileState = "seen" | "transferred" | "done" | "failed";
+
+export interface NetdiskShareFile {
+  /** 字符串：百度 fs_id 超出 JS 安全整数范围，**切勿 Number() 转换** */
+  fs_id: string;
+  share_path: string;
+  filename: string;
+  size: number;
+  md5: string;
+  batch_id: string;
+  state: ShareFileState;
+  local_path: string;
+  error: string;
+  updated_at: number;
+}
+
+export interface SharePreviewItem {
+  fs_id: string;
+  name: string;
+  path: string;
+  isdir: boolean;
+  size: number;
+}
+
+/** 新建向导里"先验链接再落库"的返回。 */
+export interface SharePreview {
+  sub_dir: string;
+  items: SharePreviewItem[];
+  file_count: number;
+  total_bytes: number;
+}
+
+/** 中转区批次汇总，供人工清理决策。 */
+export interface ShareBatch {
+  batch_id: string;
+  files: number;
+  bytes: number;
+  done: number;
+  complete: boolean;
+  remote_dir: string;
+}
+
 export type ExtractState =
   | "none"
   | "pending"
