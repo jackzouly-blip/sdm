@@ -208,7 +208,11 @@ def cmd_pull(args) -> None:
         print(f"[4] filemetas 解析到 {len(metas)} 个 dlink")
 
         # --- Q3/Q5：下载计时 + md5 校验 ---
-        os.makedirs(dest_local, exist_ok=True)
+        # 走与生产同一套落点创建逻辑：root 直接 makedirs 会造出 root 所有的目录，
+        # 之后以属主身份写入必然 EACCES（这正是 2026-08-03 踩到的坑）。
+        from app.netdisk.puller import ensure_local_dir
+
+        ensure_local_dir(args.user, dest_local)
         grand_bytes = 0
         grand_t0 = time.time()
         for fs_id, rf in metas.items():
