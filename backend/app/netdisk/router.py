@@ -190,12 +190,16 @@ def netdisk_preview(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    from .share_client import is_dir
+
+    # isdir 必须用 is_dir() 归一：根目录返回字符串 "0"/"1"，子目录返回整数，
+    # 直接取真值会把根目录下的文件显示成目录（见 share_client.is_dir 注释）
     items = [
         {
             "fs_id": str(e.get("fs_id")),
             "name": e.get("server_filename") or "",
             "path": e.get("path") or "",
-            "isdir": bool(e.get("isdir")),
+            "isdir": is_dir(e),
             "size": int(e.get("size", 0) or 0),
         }
         for e in entries

@@ -82,6 +82,20 @@ class ShareSession:
         return f"<ShareSession surl={self.surl} shareid={self.shareid} uk={self.uk}>"
 
 
+def is_dir(item: dict) -> bool:
+    """判断分享条目是否为目录。
+
+    **不能直接用 `item.get("isdir")` 判真值**：share/list 在根目录（root=1）返回的
+    是字符串 `"1"`/`"0"`，而在子目录（dir=...）返回的是整数 `1`/`0`。字符串 `"0"`
+    在 Python 里是真值，于是根目录下的**文件**会被误判成目录——递归进去列不到东西，
+    文件也就永远同步不到，且全程不报错。实测（2026-08-03）确认了这个类型不一致。
+    """
+    v = item.get("isdir")
+    if isinstance(v, str):
+        return v.strip() not in ("", "0")
+    return bool(v)
+
+
 def parse_surl(url: str) -> str:
     """从分享链接提取 surl（/s/1 后面的部分，不含前导 1）。"""
     m = re.search(r"/s/1([\w-]+)", url)
@@ -248,7 +262,7 @@ class BaiduShareClient:
                 continue
             seen_dirs.add(cur)
             for item in self.list_share(sess, cur):
-                if item.get("isdir"):
+                if is_dir(item):
                     stack.append(item.get("path") or "")
                 else:
                     files.append(item)

@@ -6,7 +6,25 @@
 import pytest
 
 from app import config
-from app.netdisk.share_client import ShareError, parse_surl
+from app.netdisk.share_client import ShareError, is_dir, parse_surl
+
+
+# --- isdir 类型归一 -----------------------------------------------------
+
+def test_is_dir_handles_string_and_int():
+    """share/list 的 isdir 类型不一致：根目录给字符串,子目录给整数。
+
+    实测（2026-08-03）：root=1 时返回 {"isdir": "1", "size": "0"}，
+    dir=... 时返回 {"isdir": 1, "size": 0}。字符串 "0" 在 Python 是真值，
+    直接取真值会把根目录下的**文件**误判成目录——递归进去列不到东西，
+    文件永远同步不到且不报错。
+    """
+    assert is_dir({"isdir": "1"}) is True
+    assert is_dir({"isdir": 1}) is True
+    assert is_dir({"isdir": "0"}) is False   # 曾经的 bug：字符串 "0" 是真值
+    assert is_dir({"isdir": 0}) is False
+    assert is_dir({}) is False               # 字段缺失按文件处理
+    assert is_dir({"isdir": ""}) is False
 
 
 # --- 分享链接解析 -------------------------------------------------------
