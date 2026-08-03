@@ -239,6 +239,26 @@ class BaiduPanClient:
                 return out
             start += len(batch)
 
+    # --- 建目录 ---------------------------------------------------------
+
+    def mkdir(self, remote_dir: str) -> dict:
+        """在网盘创建目录（多级会一并创建）。已存在时视为成功。
+
+        share/transfer 不会自动创建目标目录，落点不存在会直接返回 errno=2
+        （转存路径不存在），故转存前必须先建好中转区批次目录。
+        """
+        resp = self._client.post(
+            FILE_API,
+            params={"method": "create", "access_token": self._get_token()},
+            data={"path": remote_dir, "isdir": "1", "rtype": "3"},
+        )
+        payload = self._json(resp)
+        errno = payload.get("errno", 0)
+        # -8 = 同名文件/目录已存在；对建目录来说就是已经就绪，不算失败
+        if errno not in (0, -8):
+            raise BaiduApiError("mkdir", errno, payload)
+        return payload
+
     # --- 取下载直链 -----------------------------------------------------
 
     def filemetas(self, fs_ids: list[int], dlink: bool = True) -> list[dict]:

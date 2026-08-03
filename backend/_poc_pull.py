@@ -166,8 +166,12 @@ def cmd_pull(args) -> None:
         total = sum(int(f.get("size", 0)) for f in picked)
         print(f"\n[1] 选中 {len(picked)} 个文件 / {_human(total)} 用于转存")
 
-        # --- Q2/Q4: 转存 ---
+        # --- Q2/Q4: 转存（先建目录，否则 errno=2 转存路径不存在）---
         fs_ids = [int(f["fs_id"]) for f in picked]
+        from app.netdisk.puller import ensure_remote_dir
+
+        print(f"[2] 建中转目录 {dest_remote}")
+        ensure_remote_dir(dest_remote)
         print(f"[2] share/transfer → {dest_remote}（批量 {len(fs_ids)}）")
         t0 = time.time()
         try:

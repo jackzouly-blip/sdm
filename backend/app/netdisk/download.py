@@ -68,6 +68,18 @@ def resolve_dlinks(client, fs_ids: List[int], batch: int = 100) -> Dict[int, Rem
     return out
 
 
+def is_real_md5(value: str) -> bool:
+    """是否是可用于校验的合法 md5（32 位十六进制）。
+
+    百度 share/list 返回的 md5 是**混淆过的**，含 g-v 之类的非十六进制字符
+    （2026-08-03 实测：`cbd02d4d0vd262cd69aa1cd072c3ac38`）。拿它跟本地实算的
+    md5 比对必然全部不符——若不做这层判别，校验会把每个文件都判成失败。
+    """
+    if not value or len(value) != 32:
+        return False
+    return all(c in "0123456789abcdefABCDEF" for c in value)
+
+
 def _dl_url(dlink: str, token: str) -> str:
     """手工拼接 access_token（见模块 docstring 坑 1）。"""
     sep = "&" if "?" in dlink else "?"
@@ -142,13 +154,17 @@ def download_file(
         raise DownloadError(
             f"{rf.filename} 大小不符：期望 {rf.size} 实得 {actual}（已保留 .part 供续传）"
         )
-    if verify_md5 and rf.md5:
+    if verify_md5 and is_real_md5(rf.md5):
         got = md5_as_user(username, part_path)
         if got.lower() != rf.md5.lower():
             raise DownloadError(
                 f"{rf.filename} md5 不符：期望 {rf.md5} 实得 {got}"
                 "（可能取到了中转区的旧版本，检查批次目录隔离）"
             )
+    elif verify_md5 and rf.md5:
+        # 拿到的不是合法 md5（百度部分接口返回的是混淆过的串，含非十六进制字符），
+        # 拿它比对必然全员失败。降级为只靠 size 校验，并说明原因。
+        log.debug("%s 的 md5 非法(%s)，跳过 md5 校验，仅比对大小", rf.filename, rf.md5)
 
     call_as_user(username, _rename, part_path, final_path)
     return final_path

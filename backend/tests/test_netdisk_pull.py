@@ -130,6 +130,28 @@ def test_safe_filename_keeps_normal_names(dl):
 
 # --- dlink 拼接：踩过的坑不能再踩 ---------------------------------------
 
+def test_is_real_md5_rejects_baidu_obfuscated(dl):
+    """百度 share/list 返回的 md5 是混淆串，含非十六进制字符。
+
+    实测（2026-08-03）拿到 `cbd02d4d0vd262cd69aa1cd072c3ac38` 这类值。若不判别就
+    直接比对，校验会把**每一个**文件都判成失败——功能整体不可用。
+    """
+    assert dl.is_real_md5("cbd02d4d09d262cd69aa1cd072c3ac38") is True
+    assert dl.is_real_md5("CBD02D4D09D262CD69AA1CD072C3AC38") is True
+    # 真实踩到的混淆串：含 v / t / r / i / m
+    for bad in (
+        "cbd02d4d0vd262cd69aa1cd072c3ac38",
+        "abf5223fatfe682e95736c945297079b",
+        "909ea04a5r453db1d95223bc91d9b82f",
+        "6545342a1i03a1eb3c4b66a7e37114ac",
+        "fd527ec46m0ceff1c9d293d860e9fa7d",
+    ):
+        assert dl.is_real_md5(bad) is False, bad
+    assert dl.is_real_md5("") is False
+    assert dl.is_real_md5("abc") is False            # 长度不足
+    assert dl.is_real_md5("0" * 33) is False         # 长度超出
+
+
 def test_dl_url_appends_token_manually(dl):
     """dlink 自带已签名 query，token 只能手工拼——走 params 会破坏签名(31023)。"""
     assert dl._dl_url("https://d.pcs.baidu.com/file?sign=abc", "TK") == \

@@ -63,6 +63,57 @@ def remote_batch_dir(owner: str, share_id: int, batch_id: str) -> str:
     return f"{base}/{owner}/{share_id}/{batch_id}"
 
 
+def ensure_remote_dir(remote_dir: str) -> None:
+    """确保中转区目录存在。
+
+    share/transfer **不会自动创建目标目录**，落点不存在会直接返回
+    errno=2「转存路径不存在」（2026-08-03 实测）。故每批转存前必须先建目录。
+    用 OAuth 官方接口建（应用目录内有写权限），比走网页接口稳。
+    """
+    from .engine import NetdiskEngine
+
+    engine = NetdiskEngine()
+    try:
+        engine.client.mkdir(remote_dir)
+    finally:
+        engine.close()
+
+
+def ensure_local_dir(owner: str, local_dir: str) -> None:
+    """确保集群落点存在且属主正确。
+
+    先以属主身份建——正常情况（父目录已存在且用户有权）到此为止，root 不介入。
+    只有在 inbox 根尚不存在、而它又位于 root 拥有的目录下（如 /caedata）时，
+    普通用户建不出来，才由 root 建出「根 + 用户目录」并把用户目录 chown 给属主。
+    再往下的层级仍由用户自己创建，写入权限依旧由 OS 强制。
+
+    不这么做的后果：首次同步必然 PermissionError(13)——2026-08-03 实测踩到。
+    """
+    from ..config import get_settings
+    from ..privilege.actas import call_as_user, resolve_user
+
+    from .download import _ensure_dir
+
+    if os.path.isdir(local_dir):
+        return
+    try:
+        call_as_user(owner, _ensure_dir, local_dir)
+        return
+    except Exception:  # noqa: BLE001
+        log.info("以 %s 身份创建落点失败，改由 root 建根目录后 chown", owner)
+
+    user = resolve_user(owner)
+    base = get_settings().netdisk_inbox_base_dir.rstrip("/")
+    os.makedirs(base, exist_ok=True)  # 共享父目录，保持 root 所有
+    user_dir = f"{base}/{owner}"
+    if not os.path.isdir(user_dir):
+        os.makedirs(user_dir, exist_ok=True)
+        os.chown(user_dir, user.uid, user.gid)
+        os.chmod(user_dir, 0o700)
+    # 用户目录就位后，剩余层级重新以属主身份创建
+    call_as_user(owner, _ensure_dir, local_dir)
+
+
 def _normalize(entries: List[dict]) -> List[dict]:
     """把 share/list 的原始条目收敛成清单需要的字段。"""
     out = []
@@ -84,7 +135,7 @@ def run_sync(share_id: int, handle: Optional[TaskHandle] = None) -> Dict:
     调用方必须已通过 try_begin_sync 认领；本函数负责 end_sync 收尾。
     """
     from ..config import get_settings
-    from .download import download_file, part_size, resolve_dlinks
+    from .download import download_file, is_real_md5, part_size, resolve_dlinks
     from .engine import NetdiskEngine
     from .share_client import BaiduShareClient, ShareError
 
@@ -135,6 +186,8 @@ def run_sync(share_id: int, handle: Optional[TaskHandle] = None) -> Dict:
             # --- 3：分批转存到独立批次目录 ---------------------------
             batch_id = time.strftime("%Y%m%d-%H%M%S")
             dest_remote = remote_batch_dir(owner, share_id, batch_id)
+            _phase("准备中转目录", 6)
+            ensure_remote_dir(dest_remote)  # 不先建目录，转存会报 errno=2
             todo = [r for r in pending if r["state"] != "transferred"]
             n_batches = max(1, (len(todo) + s.netdisk_pull_batch - 1) // s.netdisk_pull_batch)
             for bi in range(n_batches):
@@ -178,6 +231,8 @@ def run_sync(share_id: int, handle: Optional[TaskHandle] = None) -> Dict:
         _phase("完成", 100)
         return stats
 
+    ensure_local_dir(owner, local_dir)  # 首次同步落点还不存在，且用户多半建不出来
+
     engine = NetdiskEngine()
     try:
         token = engine.oauth.get_access_token()
@@ -219,8 +274,10 @@ def run_sync(share_id: int, handle: Optional[TaskHandle] = None) -> Dict:
                             error="中转区未找到该文件（转存可能未完成）")
                     stats["failed"] += 1
                     continue
-                # 分享侧的 md5 更可信（是客户原文件的），用它覆盖校验依据
-                if r["md5"]:
+                # 仅当分享侧给的是合法 md5 时才用它覆盖——share/list 返回的多是
+                # 混淆串（含非十六进制字符），拿去比对会把每个文件都判成失败。
+                # 覆盖不成时沿用 filemetas 的 md5（官方接口，通常是真值）。
+                if is_real_md5(r["md5"] or ""):
                     rf.md5 = r["md5"]
 
                 def _cb(done: int, tot: int, _b=base_pct, _s=seg) -> None:
