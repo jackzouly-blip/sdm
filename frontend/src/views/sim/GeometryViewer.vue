@@ -175,21 +175,50 @@ const stats = ref<{
 const edgesSkipped = ref(false);
 const renderer = shallowRef<THREE.WebGLRenderer | null>(null);
 const sceneRef = shallowRef<THREE.Scene | null>(null);
-/** 是否画单元/折角边线。网格件上边线密到糊成一片，看面色反而看不清 */
-const showEdges = ref(true);
-const hasEdges = ref(false);
+/** 是否画**单元边线**（每条三角形边）。
+ *
+ * 与既有的"折角边线"是两回事：后者按 35° 折角取棱，是 CAD 件的观感所需；而
+ * 网格件整片是平的，单元之间的夹角几乎都是 0°，折角边线一条都画不出来 ——
+ * 用户看到的就是"没有网格线"。要看网格必须画全部边，即 WireframeGeometry。
+ *
+ * 默认关：180k 三角面 = 54 万条线段，一上来就画会明显拖慢旋转。 */
+const showWire = ref(false);
+let wireBuilt = false;
 
-function applyEdgeVisibility() {
+/** 只有真有三角面才谈得上单元边线（气囊平面图预览是纯线段，没有面） */
+const hasTris = computed(() => (stats.value?.tris ?? 0) > 0);
+
+function applyWireframe() {
   const sc = sceneRef.value;
   if (!sc) return;
+  if (showWire.value && !wireBuilt) {
+    const meshes: THREE.Mesh[] = [];
+    sc.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (m.isMesh && m.geometry) meshes.push(m);
+    });
+    for (const m of meshes) {
+      const wg = new THREE.WireframeGeometry(m.geometry);
+      const line = new THREE.LineSegments(
+        wg,
+        new THREE.LineBasicMaterial({
+          color: 0x2b2b2b, transparent: true, opacity: 0.55, depthWrite: false,
+        })
+      );
+      line.renderOrder = 3;
+      line.userData.isWire = true;
+      m.add(line);      // 挂在 mesh 下，跟随它自己的世界变换
+    }
+    wireBuilt = true;
+  }
   sc.traverse((o) => {
-    if (o.userData?.isEdge) o.visible = showEdges.value;
+    if (o.userData?.isWire) o.visible = showWire.value;
   });
   // 单次渲染即可：动画循环只在有阻尼惯性时才连续画
   const cam = cameraRef.value;
   if (renderer.value && cam) renderer.value.render(sc, cam);
 }
-watch(showEdges, applyEdgeVisibility);
+watch(showWire, applyWireframe);
 const controls = shallowRef<OrbitControls | null>(null);
 // 相机原本是 onMounted 里的局部变量；导航要聚焦到某个件，得能在外面拿到它
 const cameraRef = shallowRef<THREE.PerspectiveCamera | null>(null);
@@ -322,7 +351,6 @@ onMounted(async () => {
     scene.add(gltf.scene);
     const look = applyWorkbenchLook(gltf.scene);
     edgesSkipped.value = look.skipped;
-    hasEdges.value = look.edges > 0;
 
     // 按包围盒自动取景：CAD 模型尺度差异极大（毫米级零件到米级总成），
     // 固定相机位置必然要么看不见要么穿模。
@@ -439,14 +467,14 @@ onMounted(async () => {
         <!-- 网格线开关：网格件上边线密到糊成一片，看面色反而看不清。
              默认开——CAD 件的结构本来就靠边线读出来。 -->
         <button
-          v-if="hasEdges"
+          v-if="hasTris"
           type="button"
           class="text-xs px-1.5 py-0.5 rounded inline-flex items-center gap-1 border"
-          :class="showEdges
+          :class="showWire
             ? 'bg-slate-800 text-white border-slate-800'
             : 'bg-white text-slate-500 border-slate-300 hover:bg-slate-50'"
-          :title="showEdges ? '点击隐藏网格线，只看面' : '点击显示网格线'"
-          @click="showEdges = !showEdges"
+          :title="showWire ? '点击隐藏单元边线' : '点击画出每条单元边（面数多时旋转会变慢）'"
+          @click="showWire = !showWire"
         >
           <Spline :size="11" /> 网格线
         </button>
