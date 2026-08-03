@@ -40,12 +40,29 @@ SNAPSHOT = os.path.join(os.path.dirname(__file__), "state", "_poc_pull_snapshot.
 
 
 def _creds() -> tuple:
+    """取平台凭据：与服务端同源——先查同步库（管理页配的），再回退到环境变量。
+
+    管理页把凭据存进 netdisk_sync.db，只读 env 会拿不到，探针就成了"配好了却
+    还说没配"。这里复用 NetdiskSyncDB.resolve_credentials，保证与生产同一套优先级。
+    """
     s = get_settings()
+    db_path = os.path.join(os.path.dirname(__file__), "state", "netdisk_sync.db")
+    if os.path.exists(db_path):
+        from app.netdisk.sync_db import NetdiskSyncDB
+
+        db = NetdiskSyncDB(db_path)
+        try:
+            bduss, stoken = db.resolve_credentials()
+        finally:
+            db.close()
+        if bduss:
+            return bduss, stoken
     bduss = s.netdisk_bduss or os.getenv("BAIDU_BDUSS", "")
     stoken = s.netdisk_stoken or os.getenv("BAIDU_STOKEN", "")
     if not bduss:
         raise SystemExit(
-            "缺少 BDUSS：设置 HPC_NETDISK_BDUSS 或环境变量 BAIDU_BDUSS"
+            "缺少凭据：请先在门户「网盘数据 → 平台网盘凭据」配置，"
+            "或设置 HPC_NETDISK_BDUSS / 环境变量 BAIDU_BDUSS"
         )
     return bduss, stoken
 
