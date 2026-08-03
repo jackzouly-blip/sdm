@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { RouterView, RouterLink, useRouter, useRoute } from "vue-router";
 import { useAuthStore } from "@/stores/auth";
 import { api, errMsg } from "@/api";
@@ -83,10 +83,38 @@ const mobileNav = computed(() => flatNav(currentApp.value, !!auth.me?.is_admin))
 const openGroup = ref<string | null>(null);
 const appSwitcherOpen = ref(false);
 
-function toggleGroup(id: string) {
-  openGroup.value = openGroup.value === id ? null : id;
+/**
+ * 分组下拉的屏幕坐标。
+ *
+ * 面板必须 Teleport 到 body 并用 fixed 定位：<nav> 上有 overflow-x-auto，
+ * 而浏览器在 overflow-x 非 visible 时会把 overflow-y 也算成 auto，
+ * 于是挂在 nav 内部的绝对定位面板会被**整个裁掉**——菜单确实打开了，但看不见。
+ */
+const menuPos = ref({ left: 0, top: 0 });
+
+function toggleGroup(id: string, ev: MouseEvent) {
   appSwitcherOpen.value = false;
+  if (openGroup.value === id) {
+    openGroup.value = null;
+    return;
+  }
+  const r = (ev.currentTarget as HTMLElement).getBoundingClientRect();
+  menuPos.value = { left: r.left, top: r.bottom + 4 };
+  openGroup.value = id;
 }
+
+// 面板是 fixed 定位的，页面滚动或窗口变化后位置就不再对齐按钮，直接关掉最省事
+function closeGroup() {
+  openGroup.value = null;
+}
+onMounted(() => {
+  window.addEventListener("resize", closeGroup);
+  window.addEventListener("scroll", closeGroup, true);
+});
+onUnmounted(() => {
+  window.removeEventListener("resize", closeGroup);
+  window.removeEventListener("scroll", closeGroup, true);
+});
 
 function switchApp(appId: string) {
   appSwitcherOpen.value = false;
@@ -172,7 +200,7 @@ function switchApp(appId: string) {
 
         <!-- 分组下拉（如「运维」）：组内有当前页时按钮同样高亮，
              否则用户会以为自己不在任何导航项上 -->
-        <div v-for="g in navGroups" :key="g.id" class="relative shrink-0">
+        <div v-for="g in navGroups" :key="g.id" class="shrink-0">
           <button
             class="flex items-center gap-1 whitespace-nowrap px-3.5 py-1.5 rounded-full border text-sm transition"
             :class="
@@ -180,31 +208,33 @@ function switchApp(appId: string) {
                 ? 'bg-blue-50 border-blue-300 text-blue-700'
                 : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100 hover:border-slate-300'
             "
-            @click="toggleGroup(g.id)"
+            @click="toggleGroup(g.id, $event)"
           >
             {{ g.label }}
             <ChevronDown :size="13" class="opacity-60" />
           </button>
-          <div
-            v-if="openGroup === g.id"
-            class="fixed inset-0 z-10"
-            @click="openGroup = null"
-          ></div>
-          <div
-            v-if="openGroup === g.id"
-            class="absolute left-0 top-full mt-1 z-20 w-40 bg-white border border-slate-200 rounded-lg shadow-lg p-1"
-          >
-            <RouterLink
-              v-for="item in g.items"
-              :key="item.name"
-              :to="{ name: item.name }"
-              class="block px-3 py-2 rounded-md text-sm text-slate-700 hover:bg-slate-50 transition"
-              active-class="!bg-blue-50 !text-blue-700"
-              @click="openGroup = null"
-            >
-              {{ item.label }}
-            </RouterLink>
-          </div>
+          <!-- Teleport 到 body：留在 nav 内会被 overflow-x-auto 连带的
+               overflow-y 裁掉，表现为"点了没反应" -->
+          <Teleport to="body">
+            <template v-if="openGroup === g.id">
+              <div class="fixed inset-0 z-40" @click="closeGroup"></div>
+              <div
+                class="fixed z-50 w-40 bg-white border border-slate-200 rounded-lg shadow-lg p-1"
+                :style="{ left: menuPos.left + 'px', top: menuPos.top + 'px' }"
+              >
+                <RouterLink
+                  v-for="item in g.items"
+                  :key="item.name"
+                  :to="{ name: item.name }"
+                  class="block px-3 py-2 rounded-md text-sm text-slate-700 hover:bg-slate-50 transition"
+                  active-class="!bg-blue-50 !text-blue-700"
+                  @click="closeGroup"
+                >
+                  {{ item.label }}
+                </RouterLink>
+              </div>
+            </template>
+          </Teleport>
         </div>
       </nav>
       <div class="ml-auto flex items-center gap-2 sm:gap-3 text-sm text-slate-600">
