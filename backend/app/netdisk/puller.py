@@ -344,6 +344,136 @@ def run_sync(share_id: int, handle: Optional[TaskHandle] = None) -> Dict:
     return stats
 
 
+def run_resync_one(share_id: int, fs_id: str, handle: Optional[TaskHandle] = None) -> Dict:
+    """重新拉取单个文件并覆盖本地。
+
+    两种用途：网盘上的文件被客户换了新版本；或本地文件被误删/损坏要补一份
+    （后者 fs_id 未变，常规同步因状态已是 done 会跳过，只能靠这里强制）。
+
+    **按文件名重新定位，而不是死抱旧 fs_id**：客户替换文件后百度会分配新的
+    fs_id，旧 id 已不在分享里，直接拿它转存必然失败。定位到新版本后先删旧记录
+    再重登（fs_id 是主键，改不了只能删了重来）。
+
+    比整源同步快得多——只列该文件所在的一层目录，不做全量递归遍历（那要 ~20s）。
+    """
+    from ..config import get_settings
+    from .download import download_file, is_real_md5, resolve_dlinks
+    from .engine import NetdiskEngine
+    from .share_client import BaiduShareClient, ShareError, is_dir
+
+    db = _sync_db()
+    if db is None:
+        raise RuntimeError("同步库未初始化")
+    row = db.get(share_id)
+    if row is None:
+        raise RuntimeError(f"分享源不存在: {share_id}")
+    frow = db.get_file(share_id, fs_id)
+    if frow is None:
+        raise RuntimeError("该文件不在同步清单中")
+
+    s = get_settings()
+    owner, local_dir = row["owner"], row["local_dir"]
+    filename = frow["filename"]
+    rel = rel_dir_of(frow["share_path"], row["sub_dir"])
+
+    def _phase(text: str, pct: float) -> None:
+        if handle is not None:
+            handle.update(phase=text, progress=pct)
+
+    bduss, stoken = db.resolve_credentials()
+    if not bduss:
+        raise RuntimeError("平台未配置网盘凭据")
+
+    # --- 在分享里按文件名重新定位 ---
+    _phase(f"定位 {filename}", 5)
+    share_dir = (row["sub_dir"] or "").rstrip("/")
+    if rel:
+        share_dir = f"{share_dir}/{rel}" if share_dir else f"/{rel}"
+    with BaiduShareClient(bduss, stoken) as cli:
+        sess = cli.open_share(row["share_url"], row["pwd"])
+        entries = [e for e in cli.list_share(sess, share_dir) if not is_dir(e)]
+        match = next(
+            (e for e in entries if (e.get("server_filename") or "") == filename), None
+        )
+        if match is None:
+            db.mark(share_id, [fs_id], state="failed",
+                    error="该文件已不在分享中（可能被客户删除或改名）")
+            raise RuntimeError(f"{filename} 已不在分享中")
+
+        new_fs_id = str(match.get("fs_id"))
+        if new_fs_id != str(fs_id):
+            # 网盘上已是新版本：删旧记录、登记新 fs_id，后续按新记录走
+            log.info("文件 %s 在网盘已更新：fs_id %s → %s", filename, fs_id, new_fs_id)
+            db.drop_file(share_id, fs_id)
+            db.add_seen(share_id, [{
+                "fs_id": new_fs_id,
+                "share_path": match.get("path") or frow["share_path"],
+                "filename": filename,
+                "size": int(match.get("size", 0) or 0),
+                "md5": match.get("md5") or "",
+            }])
+            fs_id = new_fs_id
+
+        # --- 转存到独立批次目录 ---
+        batch_id = time.strftime("%Y%m%d-%H%M%S")
+        batch_root = remote_batch_dir(owner, share_id, batch_id)
+        remote_dir = f"{batch_root}/{rel}" if rel else batch_root
+        _phase("转存到中转区", 20)
+        ensure_remote_dir(remote_dir)
+        try:
+            cli.transfer(sess, [int(fs_id)], remote_dir)
+        except ShareError as e:
+            db.mark(share_id, [fs_id], state="failed", error=str(e)[:300])
+            raise
+        db.mark(share_id, [fs_id], state="transferred", batch_id=batch_id, error="")
+
+    # --- 下载覆盖 ---
+    ensure_local_dir(owner, local_dir)
+    engine = NetdiskEngine()
+    try:
+        token = engine.oauth.get_access_token()
+        listed = [it for it in engine.client.list_dir(remote_dir) if not it.get("isdir")]
+        target = next(
+            (it for it in listed if it.get("server_filename") == filename), None
+        )
+        if target is None:
+            db.mark(share_id, [fs_id], state="failed", error="中转区未找到该文件")
+            raise RuntimeError("中转区未找到该文件")
+        metas = resolve_dlinks(engine.client, [int(target["fs_id"])])
+        rf = next(iter(metas.values()))
+        frow2 = db.get_file(share_id, fs_id)
+        if frow2 is not None and is_real_md5(frow2["md5"] or ""):
+            rf.md5 = frow2["md5"]
+
+        def _cb(done: int, total: int) -> None:
+            _phase(f"下载 {filename}", 30 + 65 * done / max(total, 1))
+
+        # resume_from=0：这是"重新拉取覆盖"，任何残留 .part 都要丢弃重来
+        path = download_file(
+            rf, token, local_dir, owner,
+            resume_from=0,
+            verify_md5=s.netdisk_pull_verify_md5,
+            progress_cb=_cb,
+            rel_dir=rel,
+        )
+    except Exception as e:  # noqa: BLE001
+        db.mark(share_id, [fs_id], state="failed", error=str(e)[:300])
+        raise
+    finally:
+        engine.close()
+
+    db.mark(share_id, [fs_id], state="done", local_path=path, error="")
+    _phase("完成", 100)
+    log.info("单文件重新拉取完成 share=%s file=%s", share_id, filename)
+    return {"filename": filename, "local_path": path, "fs_id": fs_id}
+
+
+@register_task("netdisk_resync_one")
+def netdisk_resync_one(handle: TaskHandle, params: dict) -> Dict:
+    """重新拉取单个文件。params: {share_id, fs_id}"""
+    return run_resync_one(int(params["share_id"]), str(params["fs_id"]), handle=handle)
+
+
 @register_task("netdisk_pull")
 def netdisk_pull(handle: TaskHandle, params: dict) -> Dict:
     """异步同步任务。params: {share_id}"""

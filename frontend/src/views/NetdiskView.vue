@@ -40,6 +40,46 @@ function openFileDir(localPath: string) {
   if (dir) openInFiles(dir);
 }
 
+// 正在重新拉取的文件 → 进度文案，按 fs_id 索引（同时可能有多个在跑）
+const resyncing = ref<Record<string, string>>({});
+
+/**
+ * 重新拉取单个文件并覆盖本地。
+ *
+ * 两种用途：网盘上换了新版本要马上刷下来（不必等整源同步，那要先花 ~20s 递归
+ * 遍历分享）；或本地文件被误删/损坏要补一份——后者 fs_id 未变，常规同步因状态
+ * 已是 done 会跳过，只能靠这里强制。
+ */
+async function resyncFile(f: NetdiskShareFile) {
+  const share = shares.value.find((s) => s.id === expanded.value);
+  if (!share || resyncing.value[f.fs_id]) return;
+  error.value = "";
+  resyncing.value = { ...resyncing.value, [f.fs_id]: "排队中" };
+  try {
+    const { task_id } = await api.resyncShareFile(share.id, f.fs_id);
+    const stop = pollTask(task_id, (s) => {
+      resyncing.value = {
+        ...resyncing.value,
+        [f.fs_id]: s.phase || "拉取中",
+      };
+      if (["success", "failed", "interrupted"].includes(s.status)) {
+        const next = { ...resyncing.value };
+        delete next[f.fs_id];
+        resyncing.value = next;
+        if (s.status !== "success") error.value = s.error || `${f.filename} 重新拉取失败`;
+        void openFiles(share.id); // 刷新清单：状态、大小、fs_id 都可能已变
+        void load();
+      }
+    });
+    stoppers.push(stop);
+  } catch (e) {
+    const next = { ...resyncing.value };
+    delete next[f.fs_id];
+    resyncing.value = next;
+    error.value = errMsg(e);
+  }
+}
+
 /**
  * 文件在落点下的相对目录。
  *
@@ -442,6 +482,7 @@ onUnmounted(() => stoppers.forEach((s) => s()));
                       <th class="py-1.5 font-medium w-24">大小</th>
                       <th class="py-1.5 font-medium w-24">状态</th>
                       <th class="py-1.5 font-medium w-40">更新时间</th>
+                      <th class="py-1.5 font-medium w-10"></th>
                     </tr>
                   </thead>
                   <tbody>
@@ -449,7 +490,7 @@ onUnmounted(() => stoppers.forEach((s) => s()));
                          此前每行重复完整相对路径，五行一模一样，反而像"全堆在一起"。 -->
                     <template v-for="g in fileGroups" :key="g.dir">
                       <tr class="border-t border-slate-200/70 bg-slate-100/50">
-                        <td colspan="4" class="py-1.5 pr-3">
+                        <td colspan="5" class="py-1.5 pr-3">
                           <button
                             class="group inline-flex items-center gap-1.5 text-left"
                             :title="`在「文件浏览」中打开 ${g.localDir}`"
@@ -502,7 +543,27 @@ onUnmounted(() => stoppers.forEach((s) => s()));
                           {{ fileBadge(f.state).text }}
                         </span>
                       </td>
-                      <td class="py-1.5 text-slate-400">{{ fmtTime(f.updated_at) }}</td>
+                      <td class="py-1.5 text-slate-400">
+                        <span v-if="!resyncing[f.fs_id]">{{ fmtTime(f.updated_at) }}</span>
+                        <span v-else class="text-blue-700 truncate">
+                          {{ resyncing[f.fs_id] }}
+                        </span>
+                      </td>
+                      <td class="py-1.5 text-right">
+                        <button
+                          class="p-1 rounded hover:bg-blue-100 text-slate-400 hover:text-blue-600 disabled:opacity-40"
+                          title="重新拉取并覆盖本地（网盘上已更新，或本地文件丢失/损坏时用）"
+                          :disabled="!!resyncing[f.fs_id] || !!progress[s.id]"
+                          @click="resyncFile(f)"
+                        >
+                          <Loader2
+                            v-if="resyncing[f.fs_id]"
+                            :size="13"
+                            class="animate-spin text-blue-600"
+                          />
+                          <RefreshCw v-else :size="13" />
+                        </button>
+                      </td>
                       </tr>
                     </template>
                   </tbody>

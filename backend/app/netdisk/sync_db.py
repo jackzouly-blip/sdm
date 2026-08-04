@@ -299,6 +299,27 @@ class NetdiskSyncDB:
                 )
             self.conn.commit()
 
+    def get_file(self, share_id: int, fs_id: str) -> Optional[sqlite3.Row]:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM netdisk_share_files WHERE share_id=? AND fs_id=?",
+                (share_id, str(fs_id)),
+            ).fetchone()
+
+    def drop_file(self, share_id: int, fs_id: str) -> None:
+        """删除一条清单记录。
+
+        用于客户在网盘上替换了文件的情形：新版本是新的 fs_id，旧记录既不再对应
+        分享里的任何文件、也不该继续占着列表，删掉后由 add_seen 重新登记新 fs_id。
+        （fs_id 是主键，"改 id"只能删了重登。）
+        """
+        with self._lock:
+            self.conn.execute(
+                "DELETE FROM netdisk_share_files WHERE share_id=? AND fs_id=?",
+                (share_id, str(fs_id)),
+            )
+            self.conn.commit()
+
     def list_files(
         self, share_id: int, state: Optional[str] = None, limit: int = 2000
     ) -> List[sqlite3.Row]:

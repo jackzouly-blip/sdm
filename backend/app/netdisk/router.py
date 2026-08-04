@@ -300,6 +300,33 @@ def sync_share(share_id: int, request: Request, user: str = Depends(current_user
     return {"task_id": task_id}
 
 
+@router.post("/shares/{share_id}/files/{fs_id}/resync")
+def resync_file(
+    share_id: int,
+    fs_id: str,
+    request: Request,
+    user: str = Depends(current_user),
+) -> dict:
+    """重新拉取单个文件并覆盖本地，返回 task_id。
+
+    比整源同步快得多——只列该文件所在的一层目录，不做全量递归遍历。
+    会按文件名重新定位：客户在网盘上换了新版本时 fs_id 会变，这里能跟上。
+    """
+    row = _own(request, share_id, user)
+    db = _db(request)
+    if not db.resolve_credentials()[0]:
+        raise HTTPException(status_code=503, detail="平台未配置网盘凭据，请联系运维")
+    if db.get_file(share_id, fs_id) is None:
+        raise HTTPException(status_code=404, detail="该文件不在同步清单中")
+
+    tm = getattr(request.app.state, "task_manager", None)
+    if tm is None:
+        raise HTTPException(status_code=503, detail="任务管理器不可用")
+    task_id = tm.submit("netdisk_resync_one", owner=row["owner"],
+                        params={"share_id": share_id, "fs_id": fs_id})
+    return {"task_id": task_id}
+
+
 @router.get("/shares/{share_id}/files")
 def list_share_files(
     share_id: int,

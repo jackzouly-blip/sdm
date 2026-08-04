@@ -139,7 +139,9 @@ def download_file(
             raise DownloadError(
                 f"下载 {rf.filename} 失败 HTTP {resp.status_code}: {body}"
             )
-        append = True
+        # 只有真在续传时才追加。resume_from=0 却用 O_APPEND，会把新内容接在
+        # 残留的旧 .part 后面拼出脏数据——重新拉取（覆盖）走的正是这条路径。
+        append = resume_from > 0
         if resume_from > 0 and resp.status_code == 200:
             # 服务端忽略了 Range，整个文件从头返回：必须重来，否则会拼接出脏数据
             log.warning("dlink 未响应 Range（返回 200），%s 放弃续传从头下载", rf.filename)
