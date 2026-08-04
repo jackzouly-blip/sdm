@@ -270,6 +270,9 @@ class ProjectUpdate(BaseModel):
     default_solver: Optional[str] = None
     unit_system: Optional[str] = None
     workdir: Optional[str] = None
+    # 结算组装引用的模板发布版本(见 sim_template_release)；传 "" 解除引用
+    control_release_id: Optional[str] = None
+    material_release_id: Optional[str] = None
 
 
 class TargetCreate(BaseModel):
@@ -1070,10 +1073,28 @@ async def upload_airbag_deck(
     master_name = None
     try:
         tdir = os.path.join(os.path.dirname(__file__), "templates", "airbag")
+        # 项目引用了发布版本的, 用发布快照; 没引用的用内置模板兜底。
+        # 引用的是**不可变快照**: 模板后续在线编辑不影响已生成的结算包。
+        overrides = {}
+        for col, fn in (("control_release_id", "03_Control_card.k"),
+                        ("material_release_id", "MAT.K")):
+            rid_ = (proj[col] if col in proj.keys() else None) or ""
+            if rid_:
+                rel = db.get_template_release(rid_)
+                if rel is not None:
+                    overrides[fn] = rel["content"].encode("latin-1", "replace")
+                    log.info("结算组装用项目引用的模板版本 %s v%d -> %s",
+                             rel["name"], rel["version_no"], fn)
+                else:
+                    log.warning("项目引用的模板版本不存在(%s), 回退内置模板", rid_)
         for fn in ("03_Control_card.k", "MAT.K", "inflator.k"):
-            with open(os.path.join(tdir, fn), "rb") as fh:
-                write_file(proj["owner"], parent, fn, fh.read(),
-                           get_settings().fs_root_list, replace=True)
+            if fn in overrides:
+                data_ = overrides[fn]
+            else:
+                with open(os.path.join(tdir, fn), "rb") as fh:
+                    data_ = fh.read()
+            write_file(proj["owner"], parent, fn, data_,
+                       get_settings().fs_root_list, replace=True)
         with open(os.path.join(tdir, "main.key.tpl"), encoding="latin-1") as fh:
             tpl = fh.read()
         master_name = f"{os.path.splitext(name)[0]}-main.key"
@@ -3162,6 +3183,79 @@ def export_control_template(request: Request, tid: str,
         content=text, media_type="text/plain; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="control_{tid[:8]}.k"'},
     )
+
+
+# --- 模板发布版本（发布=不可变快照，项目引用快照而非模板本身）-----------
+
+@router.post("/material-templates/{tid}/publish", status_code=status.HTTP_201_CREATED)
+def publish_material_template(
+    request: Request, tid: str, note: str = Query("", max_length=500),
+    user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """发布材料模板：把当刻组装出的 MAT.K 存成不可变版本。"""
+    _require_admin(is_admin)
+    from .materials.templates import render_material_template
+    db = _db(request)
+    t = db.get_material_template(tid)
+    if t is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "材料模板不存在")
+    text = render_material_template(db, tid)
+    rid = db.create_template_release("material", tid, t["name"],
+                                     t["unit_system"], text, note, user)
+    log.info("发布材料模板 %s -> release=%s by=%s", tid, rid, user)
+    out = _row(db.get_template_release(rid)); out.pop("content", None)
+    return out
+
+
+@router.post("/control-templates/{tid}/publish", status_code=status.HTTP_201_CREATED)
+def publish_control_template(
+    request: Request, tid: str, note: str = Query("", max_length=500),
+    user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    _require_admin(is_admin)
+    from .materials.templates import render_control_template
+    db = _db(request)
+    t = db.get_control_template(tid)
+    if t is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "控制卡模板不存在")
+    text = render_control_template(db, tid)
+    rid = db.create_template_release("control", tid, t["name"],
+                                     t["unit_system"], text, note, user)
+    log.info("发布控制卡模板 %s -> release=%s by=%s", tid, rid, user)
+    out = _row(db.get_template_release(rid)); out.pop("content", None)
+    return out
+
+
+@router.get("/material-templates/{tid}/releases")
+def list_material_template_releases(
+    request: Request, tid: str, user: str = Depends(current_user),
+) -> List[Dict]:
+    return [_row(r) for r in _db(request).list_template_releases("material", tid)]
+
+
+@router.get("/control-templates/{tid}/releases")
+def list_control_template_releases(
+    request: Request, tid: str, user: str = Depends(current_user),
+) -> List[Dict]:
+    return [_row(r) for r in _db(request).list_template_releases("control", tid)]
+
+
+@router.get("/template-releases/{rid}")
+def get_template_release(
+    request: Request, rid: str,
+    download: bool = Query(False),
+    user: str = Depends(current_user),
+) -> Response:
+    r = _db(request).get_template_release(rid)
+    if r is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "模板版本不存在")
+    if download:
+        fn = "MAT.K" if r["kind"] == "material" else "03_Control_card.k"
+        return Response(content=r["content"],
+                        media_type="text/plain; charset=utf-8",
+                        headers={"Content-Disposition": f'attachment; filename="{fn}"'})
+    from fastapi.responses import JSONResponse
+    return JSONResponse(_row(r))
 
 
 # --- 工况模板 -----------------------------------------------------------

@@ -422,6 +422,24 @@ CREATE TABLE IF NOT EXISTS sim_control_template (
 );
 CREATE INDEX IF NOT EXISTS idx_sim_ctrl_tpl_type ON sim_control_template(analysis_type);
 CREATE INDEX IF NOT EXISTS idx_sim_ctrl_tpl_status ON sim_control_template(status);
+
+-- 模板发布版本：发布 = 把当刻渲染出的完整原文存成不可变快照。
+-- 项目引用的是**快照**而不是模板本身——模板继续在线编辑不影响已引用的项目；
+-- 要用新内容，再发布一版、项目改引用。这就是"发布并创建新的版本"的载体。
+CREATE TABLE IF NOT EXISTS sim_template_release (
+    id          TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL,               -- material | control
+    template_id TEXT NOT NULL,
+    version_no  INTEGER NOT NULL,
+    name        TEXT NOT NULL,
+    unit_system TEXT NOT NULL DEFAULT '',
+    content     TEXT NOT NULL,               -- 发布时点的完整原文
+    note        TEXT NOT NULL DEFAULT '',
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL,
+    UNIQUE(kind, template_id, version_no)
+);
+CREATE INDEX IF NOT EXISTS idx_sim_tpl_release ON sim_template_release(kind, template_id, version_no);
 """
 
 
@@ -497,6 +515,9 @@ class SimDB(PipelineStoreMixin):
         # 材料模板的 vektor3d 复核结果。控制卡建表时就带了 summary_json，材料模板
         # 是后加的——库已经上线过一版，只能走 ALTER 补列。
         ensure("sim_material_template", {"summary_json": "TEXT"})
+        # 仿真项目引用的模板发布版本（结算组装用）
+        ensure("sim_project", {"control_release_id": "TEXT",
+                               "material_release_id": "TEXT"})
 
     # --- 内部工具 -------------------------------------------------------
 
@@ -1461,6 +1482,35 @@ class SimDB(PipelineStoreMixin):
         )
 
     # ── 控制卡模板（整份存档）────────────────────────────────
+
+    # ── 模板发布版本 ────────────────────────────────────────────
+    def create_template_release(self, kind: str, template_id: str, name: str,
+                                unit_system: str, content: str, note: str,
+                                user: str) -> str:
+        rid = _uid()
+        now = time.time()
+        row = self._one(
+            "SELECT MAX(version_no) v FROM sim_template_release"
+            " WHERE kind=? AND template_id=?", (kind, template_id))
+        ver = int(row["v"] or 0) + 1
+        self._write(
+            """INSERT INTO sim_template_release
+               (id, kind, template_id, version_no, name, unit_system, content,
+                note, created_by, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (rid, kind, template_id, ver, name, unit_system, content,
+             note, user, now))
+        return rid
+
+    def list_template_releases(self, kind: str, template_id: str):
+        return self._all(
+            "SELECT id, kind, template_id, version_no, name, unit_system,"
+            " note, created_by, created_at, LENGTH(content) content_bytes"
+            " FROM sim_template_release WHERE kind=? AND template_id=?"
+            " ORDER BY version_no DESC", (kind, template_id))
+
+    def get_template_release(self, rid: str):
+        return self._one("SELECT * FROM sim_template_release WHERE id=?", (rid,))
 
     def create_control_template(self, name: str, unit_system: str, keyword_text: str,
                                 analysis_type: str = "", description: str = "",
