@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from "vue";
+import { useRouter } from "vue-router";
 import { api, errMsg, pollTask } from "@/api";
 import type {
   NetdiskShare,
@@ -22,7 +23,31 @@ import {
   ChevronRight,
   AlertTriangle,
   CloudDownload,
+  FolderOpen,
 } from "lucide-vue-next";
+
+const router = useRouter();
+
+/** 跳到「文件浏览」并直接定位到该目录（?path= 由 FilesView 解析）。 */
+function openInFiles(dir: string) {
+  if (!dir) return;
+  router.push({ name: "files", query: { path: dir } });
+}
+
+/** 同步下来的文件按网盘层级落盘，故要打开的是它所在的目录而非文件本身。 */
+function openFileDir(localPath: string) {
+  const dir = localPath.replace(/\/[^/]+$/, "");
+  if (dir) openInFiles(dir);
+}
+
+/** 文件在落点下的相对目录；同名文件分布在不同子目录时靠它区分。 */
+function relDir(f: NetdiskShareFile): string {
+  const share = shares.value.find((s) => s.id === expanded.value);
+  if (!share || !f.local_path) return "";
+  const base = share.local_dir.replace(/\/$/, "");
+  const dir = f.local_path.replace(/\/[^/]+$/, "");
+  return dir.startsWith(base + "/") ? dir.slice(base.length + 1) : "";
+}
 
 const status = ref<NetdiskSyncStatus | null>(null);
 const shares = ref<NetdiskShare[]>([]);
@@ -271,7 +296,20 @@ onUnmounted(() => stoppers.forEach((s) => s()));
                 </div>
               </td>
               <td class="px-4 py-2.5">
-                <code class="text-xs text-slate-600 break-all">{{ s.local_dir }}</code>
+                <button
+                  class="group flex items-start gap-1 text-left"
+                  title="在「文件浏览」中打开该目录"
+                  @click="openInFiles(s.local_dir)"
+                >
+                  <code
+                    class="text-xs text-slate-600 break-all group-hover:text-blue-700 group-hover:underline"
+                    >{{ s.local_dir }}</code
+                  >
+                  <FolderOpen
+                    :size="13"
+                    class="mt-0.5 shrink-0 text-slate-300 group-hover:text-blue-600"
+                  />
+                </button>
               </td>
               <td class="px-4 py-2.5">
                 <button
@@ -375,7 +413,23 @@ onUnmounted(() => stoppers.forEach((s) => s()));
                   <tbody>
                     <tr v-for="f in files" :key="f.fs_id" class="border-t border-slate-200/70">
                       <td class="py-1.5 pr-3">
-                        <div class="text-slate-700 truncate">{{ f.filename }}</div>
+                        <button
+                          v-if="f.local_path"
+                          class="text-slate-700 truncate hover:text-blue-700 hover:underline text-left"
+                          title="打开该文件所在目录"
+                          @click="openFileDir(f.local_path)"
+                        >
+                          {{ f.filename }}
+                        </button>
+                        <div v-else class="text-slate-700 truncate">{{ f.filename }}</div>
+                        <!-- 相对目录：同步保留网盘层级后，同名文件靠它区分 -->
+                        <div
+                          v-if="relDir(f)"
+                          class="text-slate-400 truncate font-mono"
+                          :title="f.share_path"
+                        >
+                          {{ relDir(f) }}
+                        </div>
                         <div
                           v-if="f.error"
                           class="text-rose-500 truncate"

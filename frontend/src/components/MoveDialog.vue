@@ -1,52 +1,23 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from "vue";
+import { ref, computed } from "vue";
 import { api, errMsg, pollTask } from "@/api";
-import type { FsEntry } from "@/api/types";
-import { FolderInput, Folder, Loader2, X, CornerLeftUp, Home } from "lucide-vue-next";
+import DirPicker from "@/components/DirPicker.vue";
+import { FolderInput, Loader2, X } from "lucide-vue-next";
 
 const props = defineProps<{ paths: string[] }>();
 const emit = defineEmits<{ close: []; moved: [] }>();
 
-const roots = ref<string[]>([]);
 const cwd = ref("");
-const entries = ref<FsEntry[]>([]);
-const loading = ref(false);
 const moving = ref(false);
 const error = ref("");
 const phase = ref("");
 
-const dirs = computed(() => entries.value.filter((e) => e.is_dir));
 /** 源本身不能作为目标（移进自己里），提前灰掉比让后端报错友好。 */
-const srcSet = computed(() => new Set(props.paths));
+const srcSet = computed(() => props.paths);
 
 const names = computed(() =>
   props.paths.map((p) => p.split("/").filter(Boolean).pop() ?? p)
 );
-
-async function load(p?: string) {
-  loading.value = true;
-  error.value = "";
-  try {
-    const resp = await api.listDir(p ?? cwd.value);
-    cwd.value = resp.path;
-    entries.value = resp.entries;
-  } catch (e) {
-    error.value = errMsg(e);
-  } finally {
-    loading.value = false;
-  }
-}
-
-function enter(name: string) {
-  void load(`${cwd.value.replace(/\/$/, "")}/${name}`);
-}
-
-function goUp() {
-  const parent = cwd.value.replace(/\/[^/]+$/, "") || "/";
-  void load(parent);
-}
-
-const atRoot = computed(() => roots.value.includes(cwd.value));
 
 async function submit() {
   moving.value = true;
@@ -82,15 +53,7 @@ async function submit() {
   }
 }
 
-onMounted(async () => {
-  try {
-    roots.value = await api.fsRoots();
-  } catch (e) {
-    error.value = errMsg(e);
-    return;
-  }
-  await load(roots.value[0] ?? "/");
-});
+// 目录的加载与导航都交给 DirPicker，这里只关心它最终选中了哪个目录（cwd）。
 </script>
 
 <template>
@@ -120,53 +83,14 @@ onMounted(async () => {
         </div>
       </div>
 
-      <!-- 目标目录选择 -->
-      <div class="flex items-center gap-2 px-5 py-2 bg-slate-50 border-b border-slate-200">
-        <button
-          class="p-1 rounded hover:bg-slate-200 text-slate-500 disabled:opacity-30"
-          title="上一级"
-          :disabled="atRoot"
-          @click="goUp"
-        >
-          <CornerLeftUp :size="15" />
-        </button>
-        <button
-          v-for="r in roots"
-          :key="r"
-          class="p-1 rounded hover:bg-slate-200 text-slate-500"
-          :title="`回到 ${r}`"
-          @click="load(r)"
-        >
-          <Home :size="15" />
-        </button>
-        <code class="text-xs text-slate-600 truncate">{{ cwd }}</code>
-      </div>
-
-      <div class="flex-1 overflow-auto min-h-[10rem]">
-        <div
-          v-if="loading"
-          class="py-10 flex items-center justify-center text-slate-400 gap-2 text-sm"
-        >
-          <Loader2 :size="16" class="animate-spin" /> 加载中…
-        </div>
-        <div v-else-if="!dirs.length" class="py-10 text-center text-sm text-slate-400">
-          该目录下没有子目录 —— 可直接移动到当前目录
-        </div>
-        <button
-          v-for="d in dirs"
-          :key="d.name"
-          class="w-full flex items-center gap-2 px-5 py-2 text-sm text-left hover:bg-slate-50 disabled:opacity-40 disabled:hover:bg-white"
-          :disabled="srcSet.has(`${cwd.replace(/\/$/, '')}/${d.name}`)"
-          :title="
-            srcSet.has(`${cwd.replace(/\/$/, '')}/${d.name}`)
-              ? '这是待移动项本身'
-              : `进入 ${d.name}`
-          "
-          @click="enter(d.name)"
-        >
-          <Folder :size="15" class="text-amber-500 shrink-0" />
-          <span class="truncate text-slate-700">{{ d.name }}</span>
-        </button>
+      <!-- 目标目录选择（与「添加共享目录」选落点复用同一个组件） -->
+      <div class="px-5 py-3">
+        <DirPicker
+          v-model="cwd"
+          :disabled-paths="srcSet"
+          allow-mkdir
+          height-class="max-h-56"
+        />
       </div>
 
       <div class="px-5 py-2 text-xs" :class="error ? 'text-rose-600' : 'text-slate-500'">
@@ -184,7 +108,7 @@ onMounted(async () => {
         </button>
         <button
           class="px-4 py-2 text-sm rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60 flex items-center gap-2"
-          :disabled="moving || loading || !cwd"
+          :disabled="moving || !cwd"
           @click="submit"
         >
           <Loader2 v-if="moving" :size="15" class="animate-spin" />

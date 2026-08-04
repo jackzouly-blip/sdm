@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, watch } from "vue";
 import { api, errMsg } from "@/api";
 import type { NetdiskShare, NetdiskShareInput, SharePreviewItem } from "@/api/types";
 import { fmtBytes } from "@/lib/format";
+import DirPicker from "@/components/DirPicker.vue";
 import { X, Loader2, CloudDownload, Folder, FileIcon, CornerLeftUp, Check } from "lucide-vue-next";
 
 // share 为空表示新建；否则编辑。
@@ -85,8 +86,14 @@ const intervalOptions = [
   { label: "每天", value: 86400 },
 ];
 
+// 落点：留空由后端按 <inbox 根>/<属主>/<源名> 派生；也可自己挑一个目录。
+const pickingDir = ref(false);
+const pickedDir = ref(props.share?.local_dir ?? "");
+watch(pickedDir, (v) => {
+  if (v) form.value.local_dir = v;
+});
+
 const derivedLocalDir = computed(() => {
-  if (form.value.local_dir.trim()) return form.value.local_dir.trim();
   if (!props.inboxBase || !form.value.name.trim()) return "";
   return `${props.inboxBase}/<你的用户名>/${form.value.name.trim()}`;
 });
@@ -265,21 +272,41 @@ async function submit() {
           />
         </label>
 
-        <label class="block">
-          <span class="text-sm text-slate-600">服务器落点</span>
-          <input
-            v-model="form.local_dir"
-            type="text"
-            placeholder="留空自动分配"
-            class="mt-1 w-full px-3 py-2 rounded-md border border-slate-300 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none text-sm font-mono"
+        <div>
+          <div class="flex items-center gap-2">
+            <span class="text-sm text-slate-600">服务器落点</span>
+            <button
+              type="button"
+              class="text-xs px-2 py-0.5 rounded border border-slate-300 text-slate-600 hover:bg-slate-50"
+              @click="pickingDir = !pickingDir"
+            >
+              {{ pickingDir ? "收起" : "选择目录…" }}
+            </button>
+            <button
+              v-if="form.local_dir"
+              type="button"
+              class="text-xs px-2 py-0.5 rounded border border-slate-300 text-slate-500 hover:bg-slate-50"
+              title="改回按名称自动分配"
+              @click="form.local_dir = ''"
+            >
+              恢复自动分配
+            </button>
+          </div>
+          <p class="mt-1 text-xs font-mono truncate"
+             :class="form.local_dir ? 'text-slate-700' : 'text-slate-400'">
+            {{ form.local_dir || derivedLocalDir || "（保存后自动分配）" }}
+          </p>
+          <DirPicker
+            v-if="pickingDir"
+            v-model="pickedDir"
+            allow-mkdir
+            height-class="max-h-40"
+            class="mt-2"
           />
-          <p v-if="derivedLocalDir" class="mt-1 text-xs text-slate-400 font-mono truncate">
-            {{ derivedLocalDir }}
-          </p>
           <p class="mt-1 text-xs text-slate-400">
-            同步下来的文件先落在这里，你可以在「文件浏览」里把它们移到自己的工作目录。
+            同步下来的文件按网盘里的目录层级落在这里，你可以在「文件浏览」里把它们移到工作目录。
           </p>
-        </label>
+        </div>
 
         <label class="flex items-center gap-2 text-sm text-slate-600 border-t border-slate-100 pt-3">
           <input v-model="form.enabled" type="checkbox" /> 启用

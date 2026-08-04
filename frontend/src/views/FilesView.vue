@@ -1,18 +1,26 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { ref, onMounted, watch } from "vue";
+import { useRoute } from "vue-router";
 import { api, errMsg } from "@/api";
 import FileBrowser from "@/components/FileBrowser.vue";
 
-// 初始进入第一个白名单根。
+// 默认进第一个白名单根；带 ?path= 时直达该目录——供别处"跳到这个目录"用
+// （如网盘同步的落点）。路径合法性仍由后端校验，这里只负责定位。
+const route = useRoute();
 const startPath = ref<string>("");
 const roots = ref<string[]>([]);
 const error = ref("");
 const ready = ref(false);
 
+function wanted(): string {
+  const p = route.query.path;
+  return typeof p === "string" && p.startsWith("/") ? p : "";
+}
+
 onMounted(async () => {
   try {
     roots.value = await api.fsRoots();
-    startPath.value = roots.value[0] ?? "";
+    startPath.value = wanted() || roots.value[0] || "";
     if (!startPath.value) error.value = "未配置可浏览的根目录";
   } catch (e) {
     error.value = errMsg(e);
@@ -20,6 +28,15 @@ onMounted(async () => {
     ready.value = true;
   }
 });
+
+// 已在本页时再次跳转（?path= 变化）也要生效，否则第二次点"打开落点"没反应
+watch(
+  () => route.query.path,
+  () => {
+    const p = wanted();
+    if (p) startPath.value = p;
+  }
+);
 
 function switchRoot(r: string) {
   startPath.value = r;
