@@ -96,18 +96,26 @@ def download_file(
     verify_md5: bool = True,
     progress_cb: Optional[Callable[[int, int], None]] = None,
     timeout: int = 300,
+    rel_dir: str = "",
 ) -> str:
-    """下载单个文件到 dest_dir，返回最终落盘路径。
+    """下载单个文件到 dest_dir（rel_dir 非空时还原到该子目录），返回落盘路径。
+
+    rel_dir 用于还原网盘里的目录层级。**不能省**：压平后不同子目录下的同名文件
+    会互相覆盖（下面用的是 os.replace，静默覆盖），而 CAE 的 deck 常靠相对路径
+    互相 *INCLUDE，层级一丢引用就断了。
 
     resume_from > 0 时发 Range 续传；若服务端不支持 Range（返回 200 而非 206），
     自动退回从 0 重传，不会静默拼出损坏文件。
     progress_cb(done_bytes, total_bytes) 用于任务进度。
     """
     safe_name = _safe_filename(rf.filename)
-    part_dir = os.path.join(dest_dir, PART_DIR)
+    rel = safe_relpath(rel_dir)
+    target_dir = os.path.join(dest_dir, rel) if rel else dest_dir
+    part_dir = os.path.join(target_dir, PART_DIR)
     part_path = os.path.join(part_dir, safe_name + ".part")
-    final_path = os.path.join(dest_dir, safe_name)
+    final_path = os.path.join(target_dir, safe_name)
 
+    # 以属主身份创建（含各级父目录）——层级由用户自己建，权限仍归 OS 强制
     call_as_user(username, _ensure_dir, part_dir)
 
     headers = dict(PAN_UA)
@@ -181,9 +189,10 @@ def md5_as_user(username: str, path: str, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
-def part_size(username: str, dest_dir: str, filename: str) -> int:
+def part_size(username: str, dest_dir: str, filename: str, rel_dir: str = "") -> int:
     """已下载的 .part 字节数；不存在返回 0。用于决定 Range 起点。"""
-    part_path = os.path.join(dest_dir, PART_DIR, _safe_filename(filename) + ".part")
+    base = os.path.join(dest_dir, safe_relpath(rel_dir)) if rel_dir else dest_dir
+    part_path = os.path.join(base, PART_DIR, _safe_filename(filename) + ".part")
     try:
         return call_as_user(username, _file_size, part_path)
     except Exception:  # noqa: BLE001
@@ -198,6 +207,22 @@ def _safe_filename(name: str) -> str:
     name = re.sub(r'[\x00-\x1f<>:"|?*]+', "_", name)
     name = name.lstrip(".") or "unnamed"  # 防 ".." 与隐藏文件
     return name[:200]
+
+
+def safe_relpath(rel: str) -> str:
+    """逐段清理相对目录，用于在落点下还原网盘的目录层级。
+
+    整串一次性清理是不够的——那样会把分隔符也抹掉，层级就没了。这里按段拆开
+    分别净化，既保留结构，又保证每一段都不含分隔符、不以点开头（挡住 `..`）。
+    返回 "" 表示落在落点根下。
+    """
+    parts = []
+    for seg in (rel or "").replace("\\", "/").split("/"):
+        seg = seg.strip()
+        if not seg or seg in (".", ".."):
+            continue
+        parts.append(_safe_filename(seg))
+    return "/".join(parts)
 
 
 # --- 以下为 call_as_user 的目标函数，必须是可 pickle 的顶层函数 ---

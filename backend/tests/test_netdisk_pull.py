@@ -421,6 +421,49 @@ def test_local_dir_for_sanitizes_name(dl, monkeypatch, fresh_settings):
     assert got.startswith("/data/hpc-portal/netdisk-inbox/alice/")
 
 
+def test_safe_relpath_keeps_structure_but_blocks_traversal(dl):
+    """逐段净化：既要保住层级，又不能让 `..` 逃出落点。"""
+    assert dl.safe_relpath("Model/sub") == "Model/sub"
+    assert dl.safe_relpath("/Model/sub/") == "Model/sub"
+    assert dl.safe_relpath("") == ""
+    # 穿越段被丢弃，其余层级保留
+    assert dl.safe_relpath("../../etc") == "etc"
+    assert dl.safe_relpath("a/../../b") == "a/b"
+    assert dl.safe_relpath("a/./b") == "a/b"
+    # 段内的分隔符与控制字符被净化，但不会把整串压平
+    assert "/" in dl.safe_relpath("Model/sub")
+    assert dl.safe_relpath(".hidden/x") == "hidden/x"
+
+
+def test_rel_dir_strips_sub_dir_base(monkeypatch, fresh_settings):
+    """相对目录以同步源的 sub_dir 为基准截断。"""
+    from app.netdisk.puller import rel_dir_of
+
+    sub = "/HPC/user07/ZXY/LEV05/try"
+    assert rel_dir_of(f"{sub}/Model/main.key", sub) == "Model"
+    assert rel_dir_of(f"{sub}/main.key", sub) == ""
+    assert rel_dir_of(f"{sub}/a/b/c.k", sub) == "a/b"
+    # sub_dir 为空 = 同步整个分享，相对目录即分享内的完整目录
+    assert rel_dir_of("/HPC/user07/x.k", "") == "HPC/user07"
+    # sub_dir 带尾斜杠也要能正确截断
+    assert rel_dir_of(f"{sub}/Model/main.key", sub + "/") == "Model"
+
+
+def test_same_name_in_different_dirs_do_not_collide(monkeypatch, fresh_settings):
+    """不同子目录下的同名文件必须落到不同路径。
+
+    这正是压平时会静默互相覆盖的场景（落盘走 os.replace，不报错）；
+    CAE 的 deck 又常靠相对路径 *INCLUDE，压平即失效。
+    """
+    from app.netdisk.puller import rel_dir_of
+
+    sub = "/share/try"
+    a = rel_dir_of(f"{sub}/case5/main.key", sub)
+    b = rel_dir_of(f"{sub}/case6/main.key", sub)
+    assert a == "case5" and b == "case6"
+    assert a != b
+
+
 def test_remote_batch_dir_isolates_batches(monkeypatch, fresh_settings):
     """批次目录隔离是"同名不同版本"的解药，路径必须逐批不同。"""
     monkeypatch.setenv("HPC_NETDISK_INBOX_REMOTE", "/apps/HPC/inbox")

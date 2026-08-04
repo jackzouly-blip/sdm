@@ -114,6 +114,22 @@ def ensure_local_dir(owner: str, local_dir: str) -> None:
     call_as_user(owner, _ensure_dir, local_dir)
 
 
+def rel_dir_of(share_path: str, sub_dir: str) -> str:
+    """文件在落点下应处的相对目录（不含文件名）。
+
+    以同步源的 sub_dir 为基准截断：同步 `/HPC/user07/ZXY/LEV05/try` 时，
+    `/HPC/.../try/Model/main.key` 的相对目录是 `Model`，落点即 `<落点>/Model/main.key`。
+
+    保留层级不是为了整洁——转存与落盘都按纯文件名走的话，不同子目录下的同名
+    文件会互相覆盖且不报错；CAE 的 deck 又常靠相对路径 *INCLUDE，压平即失效。
+    """
+    d = os.path.dirname(share_path or "")
+    base = (sub_dir or "").rstrip("/")
+    if base and (d == base or d.startswith(base + "/")):
+        d = d[len(base):]
+    return d.strip("/")
+
+
 def _normalize(entries: List[dict]) -> List[dict]:
     """把 share/list 的原始条目收敛成清单需要的字段。"""
     out = []
@@ -185,33 +201,46 @@ def run_sync(share_id: int, handle: Optional[TaskHandle] = None) -> Dict:
 
             # --- 3：分批转存到独立批次目录 ---------------------------
             batch_id = time.strftime("%Y%m%d-%H%M%S")
-            dest_remote = remote_batch_dir(owner, share_id, batch_id)
-            _phase("准备中转目录", 6)
-            ensure_remote_dir(dest_remote)  # 不先建目录，转存会报 errno=2
+            batch_root = remote_batch_dir(owner, share_id, batch_id)
             todo = [r for r in pending if r["state"] != "transferred"]
-            n_batches = max(1, (len(todo) + s.netdisk_pull_batch - 1) // s.netdisk_pull_batch)
-            for bi in range(n_batches):
-                chunk = todo[bi * s.netdisk_pull_batch:(bi + 1) * s.netdisk_pull_batch]
-                if not chunk:
-                    continue
-                _phase(f"转存 {bi + 1}/{n_batches} 批（{len(chunk)} 个）",
-                       6 + 9 * (bi + 1) / n_batches)
-                fs_ids = [r["fs_id"] for r in chunk]
-                try:
-                    cli.transfer(sess, [int(x) for x in fs_ids], dest_remote)
-                except ShareError as e:
-                    if e.is_quota_exceeded:
-                        # 配额触顶：本批留待下轮，已转存的继续走下载
-                        db.mark(share_id, fs_ids, state="failed",
-                                error=f"转存配额受限 errno={e.errno}")
-                        stats["failed"] += len(fs_ids)
-                        log.warning("分享源 %s 转存配额触顶 errno=%s，本批推迟",
-                                    share_id, e.errno)
+
+            # 按源目录分组转存：share/transfer 只按文件名拷贝、不保留层级，
+            # 若整批塞进同一目录，不同子目录下的同名文件会被 ondup=skip 吞掉。
+            by_dir: Dict[str, List] = {}
+            for r in todo:
+                by_dir.setdefault(rel_dir_of(r["share_path"], row["sub_dir"]), []).append(r)
+
+            done_groups = 0
+            for rel, rows in by_dir.items():
+                remote_dir = f"{batch_root}/{rel}" if rel else batch_root
+                _phase(f"准备中转目录 {rel or '/'}", 6)
+                ensure_remote_dir(remote_dir)  # 不先建目录，转存会报 errno=2
+                n_batches = max(
+                    1, (len(rows) + s.netdisk_pull_batch - 1) // s.netdisk_pull_batch
+                )
+                for bi in range(n_batches):
+                    chunk = rows[bi * s.netdisk_pull_batch:(bi + 1) * s.netdisk_pull_batch]
+                    if not chunk:
                         continue
-                    raise
-                db.mark(share_id, fs_ids, state="transferred", batch_id=batch_id,
-                        error="")
-                stats["transferred"] += len(fs_ids)
+                    _phase(f"转存 {rel or '/'}（{len(chunk)} 个）",
+                           6 + 9 * (done_groups + 1) / max(len(by_dir), 1))
+                    fs_ids = [r["fs_id"] for r in chunk]
+                    try:
+                        cli.transfer(sess, [int(x) for x in fs_ids], remote_dir)
+                    except ShareError as e:
+                        if e.is_quota_exceeded:
+                            # 配额触顶：本批留待下轮，已转存的继续走下载
+                            db.mark(share_id, fs_ids, state="failed",
+                                    error=f"转存配额受限 errno={e.errno}")
+                            stats["failed"] += len(fs_ids)
+                            log.warning("分享源 %s 转存配额触顶 errno=%s，本批推迟",
+                                        share_id, e.errno)
+                            continue
+                        raise
+                    db.mark(share_id, fs_ids, state="transferred", batch_id=batch_id,
+                            error="")
+                    stats["transferred"] += len(fs_ids)
+                done_groups += 1
     except ShareError as e:
         link_state = "ok"
         if e.is_auth_failure:
@@ -236,15 +265,18 @@ def run_sync(share_id: int, handle: Optional[TaskHandle] = None) -> Dict:
     engine = NetdiskEngine()
     try:
         token = engine.oauth.get_access_token()
-        # 按批次目录分组，逐批解析 dlink（dlink 有效期约 8 小时，用时才取）
-        by_batch: Dict[str, List] = {}
+        # 按「批次 + 相对目录」分组：中转区里也是分目录存的，得逐目录列。
+        # dlink 有效期约 8 小时，故用时才取，不提前批量缓存。
+        by_batch: Dict[tuple, List] = {}
         for r in ready:
-            by_batch.setdefault(r["batch_id"], []).append(r)
+            key = (r["batch_id"], rel_dir_of(r["share_path"], row["sub_dir"]))
+            by_batch.setdefault(key, []).append(r)
 
         total = len(ready)
         idx = 0
-        for bid, rows in by_batch.items():
-            dest_remote = remote_batch_dir(owner, share_id, bid)
+        for (bid, rel), rows in by_batch.items():
+            batch_root = remote_batch_dir(owner, share_id, bid)
+            dest_remote = f"{batch_root}/{rel}" if rel else batch_root
             try:
                 listed = engine.client.list_dir(dest_remote)
             except Exception as e:  # noqa: BLE001
@@ -285,12 +317,13 @@ def run_sync(share_id: int, handle: Optional[TaskHandle] = None) -> Dict:
                         handle.update(progress=_b + (done / max(tot, 1)) * _s)
 
                 try:
-                    resume = part_size(owner, local_dir, fname)
+                    resume = part_size(owner, local_dir, fname, rel)
                     path = download_file(
                         rf, token, local_dir, owner,
                         resume_from=resume,
                         verify_md5=s.netdisk_pull_verify_md5,
                         progress_cb=_cb,
+                        rel_dir=rel,  # 还原网盘层级，防同名互相覆盖
                     )
                 except Exception as e:  # noqa: BLE001
                     log.exception("下载失败 share=%s file=%s", share_id, fname)
