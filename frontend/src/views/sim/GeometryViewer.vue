@@ -432,8 +432,14 @@ onMounted(async () => {
     r.setSize(host.value.clientWidth, host.value.clientHeight);
   };
   window.addEventListener("resize", onResize);
+  // 容器自身的尺寸变化也要跟上：左侧零件导航是**加载完才出现**的，它一出现
+  // 就把画布容器挤窄，而窗口并没有 resize —— 画布保持挂载时的全宽，向右伸出
+  // 对话框（用户截图：标题栏与 3D 区域宽度不一致）。ResizeObserver 盯容器。
+  const ro = new ResizeObserver(onResize);
+  ro.observe(el);
 
   onBeforeUnmount(() => {
+    ro.disconnect();
     window.removeEventListener("resize", onResize);
     cancelAnimationFrame(frame);
     ctl.dispose();
@@ -541,7 +547,7 @@ onMounted(async () => {
           </div>
         </aside>
 
-        <div class="relative flex-1 min-h-0">
+        <div class="relative flex-1 min-h-0 min-w-0 overflow-hidden">
         <div ref="host" class="absolute inset-0"></div>
         <div
           v-if="loading"
