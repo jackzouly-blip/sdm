@@ -3536,8 +3536,7 @@ def materialize_job(
     if job["hpc_jobid"]:
         raise HTTPException(status.HTTP_409_CONFLICT, "作业已投递，不能重实例化")
     subj = db.get_subject(job["sim_subject_id"])
-    target = db.get_target(subj["sim_target_id"])
-    proj = db.get_project(target["sim_project_id"])
+    proj = db.get_project(subj["sim_project_id"])   # 工况直接挂项目, 没有 target 一层
     if not proj["workdir"]:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "项目未设置工作目录，无法建 run 目录")
 
