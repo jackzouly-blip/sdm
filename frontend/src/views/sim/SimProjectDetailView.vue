@@ -6,6 +6,7 @@
  * 点进去即跳到算力管理的任务详情页。
  */
 import { computed, onMounted, ref } from "vue";
+import SubmitJobModal from "@/components/SubmitJobModal.vue";
 import { useRouter, type RouteLocationRaw } from "vue-router";
 import { simApi, errMsg } from "@/api";
 import type {
@@ -334,6 +335,20 @@ async function doNewRun() {
   } finally {
     newRunBusy.value = false;
   }
+}
+
+const submitTarget = ref<SimJob | null>(null);
+
+async function onHpcSubmitted(jobid: string) {
+  const j = submitTarget.value;
+  submitTarget.value = null;
+  if (!j) return;
+  try {
+    await simApi.markSimJobSubmitted(j.id, jobid);
+  } catch (e) {
+    error.value = errMsg(e);
+  }
+  await load();
 }
 
 function runDir(j: SimJob): string {
@@ -731,9 +746,16 @@ onMounted(() => { load(); loadReleases(); loadTemplateRefs(); });
               </td>
               <td class="py-2 text-slate-500">{{ fmt(j.submitted_at) }}</td>
               <td class="py-2 text-xs">
-                <span v-if="runDir(j)" class="font-mono text-slate-600 break-all"
-                      title="提交时在「作业提交」把初始目录填这里、输入文件填 main.key">
-                  {{ runDir(j) }}</span>
+                <template v-if="runDir(j)">
+                  <span class="font-mono text-slate-600 break-all">{{ runDir(j) }}</span>
+                  <span class="inline-flex items-center gap-2 ml-2">
+                    <RouterLink :to="{ name: 'files', query: { path: runDir(j) } }"
+                                class="text-indigo-700 hover:underline shrink-0">打开目录</RouterLink>
+                    <button v-if="!j.hpc_jobid"
+                            class="rounded bg-slate-800 px-2 py-0.5 text-white shrink-0"
+                            @click="submitTarget = j">提交 HPC</button>
+                  </span>
+                </template>
                 <button v-else-if="!j.hpc_jobid"
                         class="rounded border px-2 py-0.5 hover:bg-slate-50"
                         @click="openMaterialize(j)">实例化…</button>
@@ -795,6 +817,10 @@ onMounted(() => { load(); loadReleases(); loadTemplateRefs(); });
           </div>
         </div>
       </div>
+
+      <SubmitJobModal v-if="submitTarget" :init-dir="runDir(submitTarget)"
+                      input-file="main.key"
+                      @close="submitTarget = null" @submitted="onHpcSubmitted" />
 
       <!-- 结果 -->
       <div v-else>

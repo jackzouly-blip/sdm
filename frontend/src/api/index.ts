@@ -1335,6 +1335,11 @@ export const simApi = {
   async deleteProjectTemplateRef(pid: string, rid: string): Promise<void> {
     await http.delete(`/sim/projects/${pid}/template-refs/${rid}`);
   },
+  async markSimJobSubmitted(jid: string, hpcJobid: string): Promise<SimJob> {
+    const { data } = await http.post<SimJob>(`/sim/jobs/${jid}/mark-submitted`,
+      { hpc_jobid: hpcJobid });
+    return data;
+  },
   async createSimJob(sid: string, body?: { submit_mode?: string }): Promise<SimJob> {
     const { data } = await http.post<SimJob>(`/sim/subjects/${sid}/jobs`, body ?? {});
     return data;

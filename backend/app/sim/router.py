@@ -3580,6 +3580,25 @@ def materialize_job(
     return _row(db.get_job(jid), JOB_JSON)
 
 
+class JobSubmitted(BaseModel):
+    hpc_jobid: str = Field(min_length=1)
+
+
+@router.post("/jobs/{jid}/mark-submitted")
+def mark_job_submitted(
+    request: Request, jid: str, body: JobSubmitted,
+    user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """从项目页直接提交 HPC 成功后，把作业号回填到仿真作业上（状态联动）。"""
+    db = _db(request)
+    job = _owned_job(db, jid, user, is_admin)
+    if job["hpc_jobid"]:
+        raise HTTPException(status.HTTP_409_CONFLICT, "作业已投递过")
+    db.mark_job_submitted(jid, body.hpc_jobid)
+    log.info("仿真作业 %s 回填 HPC 作业号 %s by=%s", jid, body.hpc_jobid, user)
+    return _row(db.get_job(jid), JOB_JSON)
+
+
 @router.get("/projects/{pid}/jobs")
 def list_project_jobs(
     request: Request,
