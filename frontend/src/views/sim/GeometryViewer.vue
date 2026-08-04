@@ -21,7 +21,7 @@ import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { simApi } from "@/api";
 import type { SimGeometry } from "@/api/types";
-import { Loader2, Spline, X } from "lucide-vue-next";
+import { Eye, EyeOff, Loader2, Spline, X } from "lucide-vue-next";
 
 // ── 与 vektor3d 3D 工作台一致的渲染常量（useViewer.ts）──
 /** 折角超过它才画边线：太小则圆角面上爬满碎线，太大则棱线丢失 */
@@ -73,6 +73,7 @@ interface NavPart {
 const navParts = shallowRef<NavPart[]>([]);
 const activePart = ref<string | null>(null);
 const KIND_LABEL: Record<string, string> = {
+  part: "零件",
   single: "单层区(囊袋支撑层)", nangdai: "囊袋", chamber: "腔体", diffuser: "导流袋",
   // 一个安装位 = 固定带 + 扎带，它们叠着共缝，网格也建成一片
   strap: "安装位", fix: "固定带", tie: "扎带", named: "点名件",
@@ -100,7 +101,36 @@ function collectNav(root: THREE.Object3D) {
       segments: Number(ex.segments ?? 0), obj: o, box,
     });
   });
+  // 网格/deck 的 GLB 没有 airbag-flat 标识，按 mesh 名收（PART 名就是件名）。
+  // 有名字才收：几何轻量化的三角面常是一坨无名 mesh，列出来没有意义。
+  if (!out.length) {
+    root.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (!m.isMesh || !m.name) return;
+      const tris = (m.geometry?.getIndex()?.count ?? m.geometry?.getAttribute("position")?.count ?? 0) / 3;
+      out.push({
+        name: m.name, kind: "part", segments: Math.round(tris),
+        obj: m, box: new THREE.Box3().setFromObject(m),
+      });
+    });
+  }
   navParts.value = out;
+}
+
+/** 隐藏的件名集合。隐藏与聚焦独立：聚焦压暗其它件、隐藏彻底不画 */
+const hiddenParts = ref<Set<string>>(new Set());
+
+function toggleHidden(p: NavPart) {
+  const next = new Set(hiddenParts.value);
+  if (next.has(p.name)) next.delete(p.name);
+  else next.add(p.name);
+  hiddenParts.value = next;
+  p.obj.visible = !next.has(p.name);
+}
+
+function showAll() {
+  for (const q of navParts.value) q.obj.visible = true;
+  hiddenParts.value = new Set();
 }
 
 /** 点导航：把相机对准该件，并把其它件压暗（不隐藏——要看它在整图里的位置） */
@@ -524,6 +554,12 @@ onMounted(async () => {
             @click="focusPart(null)"
           >
             全部（{{ navParts.length }} 件）
+            <span
+              v-if="hiddenParts.size"
+              role="button"
+              class="ml-2 text-indigo-600 hover:underline"
+              @click.stop="showAll()"
+            >显示已隐藏的 {{ hiddenParts.size }} 件</span>
           </button>
           <div v-for="g in navGroups" :key="g.kind" class="border-b border-slate-200 last:border-0">
             <div class="px-3 py-1 text-[11px] text-slate-400 flex items-center gap-1">
@@ -537,12 +573,25 @@ onMounted(async () => {
             <button
               v-for="p in g.parts"
               :key="p.name"
-              class="w-full px-3 py-1 text-left hover:bg-white flex items-center justify-between gap-2"
-              :class="activePart === p.name ? 'bg-white text-slate-900 font-medium' : 'text-slate-600'"
+              class="group w-full px-3 py-1 text-left hover:bg-white flex items-center justify-between gap-2"
+              :class="[activePart === p.name ? 'bg-white text-slate-900 font-medium' : 'text-slate-600',
+                       hiddenParts.has(p.name) ? 'opacity-45' : '']"
               @click="focusPart(activePart === p.name ? null : p)"
             >
               <span class="truncate">{{ p.name }}</span>
-              <span class="text-[10px] text-slate-400 shrink-0">{{ p.segments }}</span>
+              <span class="flex items-center gap-1 shrink-0">
+                <span class="text-[10px] text-slate-400">{{ p.segments }}</span>
+                <span
+                  role="button"
+                  class="p-0.5 rounded hover:bg-slate-200"
+                  :class="hiddenParts.has(p.name) ? '' : 'opacity-0 group-hover:opacity-100'"
+                  :title="hiddenParts.has(p.name) ? '显示该件' : '隐藏该件'"
+                  @click.stop="toggleHidden(p)"
+                >
+                  <EyeOff v-if="hiddenParts.has(p.name)" :size="12" />
+                  <Eye v-else :size="12" />
+                </span>
+              </span>
             </button>
           </div>
         </aside>
