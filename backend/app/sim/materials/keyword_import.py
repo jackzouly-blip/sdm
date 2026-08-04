@@ -146,6 +146,10 @@ _CURVE_REFS: Dict[str, Tuple[Tuple[Tuple[int, int], str], ...]] = {
                                        ((1, 2), "strain_rate_scale"),
                                        ((1, 3), "strain_rate_scale")),
     "MOONEY-RIVLIN_RUBBER": (((1, 3), "force_deflection"),),
+    # MAT_FABRIC: 末行 LCA/LCB/LCAB/LCUA/LCUB/LCUC(可为负=曲线驱动)，
+    # 卡 3 末列为拉应力截止曲线(工程师 MAT.K 的曲线 15, 引用 TTF 参数)
+    "FABRIC": tuple([((5, i), "stress_strain" if i < 2 else "fabric_curve")
+                     for i in range(6)] + [((2, 7), "fabric_curve")]),
     "MODIFIED_HONEYCOMB": tuple([((1, i), "stress_strain") for i in range(7)]
                                 + [((1, 7), "strain_rate_scale")]),
 }
@@ -194,6 +198,9 @@ class ParseResult:
     curves: Dict[int, ParsedCurve]
     tables: Dict[int, ParsedTable]
     warnings: List[str]
+    #: *PARAMETER 定义：参数名 -> 原始定义行。曲线/卡里用 &NAME 引用它们
+    #: (如曲线 15 的时间轴偏移 1.0&TTF)，丢了定义求解器直接报错。
+    params: Dict[str, str] = None
 
 
 def parse_material_file(text: str) -> ParseResult:
@@ -201,6 +208,7 @@ def parse_material_file(text: str) -> ParseResult:
     curves: Dict[int, ParsedCurve] = {}
     tables: List[ParsedTable] = []
     warnings: List[str] = []
+    params: Dict[str, str] = {}
 
     for b in read_blocks(text):
         if b.keyword.startswith("*MAT_"):
@@ -215,7 +223,8 @@ def parse_material_file(text: str) -> ParseResult:
                 if ri < len(rows):
                     ref = _to_i(rows[ri][ci])
                     if ref:
-                        m.refs.append((ref, semantic))
+                        # 负号 = 按曲线驱动(如 -19/-20 应变率缩放)，号取绝对值
+                        m.refs.append((abs(ref), semantic))
             mats.append(m)
 
         elif b.keyword.startswith("*DEFINE_CURVE"):
@@ -238,6 +247,16 @@ def parse_material_file(text: str) -> ParseResult:
                 _to_f(head[4]) or 0.0, _to_f(head[5]) or 0.0,
                 pts, b.raw,
             )
+
+        elif b.keyword.startswith("*PARAMETER"):
+            # 每行最多 4 组 (类型+名, 值)，10 列一栏。只需要"名 -> 定义行"，
+            # 渲染时按引用挑出需要的行原样放回。
+            for r in b.data:
+                for k in range(0, min(len(r), 80), 20):
+                    fld = r[k:k + 10]
+                    mm = re.match(r"\s*[RIC]\s+(\w+)", fld, re.I)
+                    if mm:
+                        params[mm.group(1).upper()] = r[k:k + 20].rstrip()
 
         elif b.keyword.startswith("*DEFINE_TABLE"):
             if not b.data:
@@ -273,7 +292,7 @@ def parse_material_file(text: str) -> ParseResult:
                 claimed.add(lc)
                 t.member_lcids.append(lc)
 
-    return ParseResult(mats, curves, {t.tbid: t for t in tables}, warnings)
+    return ParseResult(mats, curves, {t.tbid: t for t in tables}, warnings, params)
 
 
 # --- 物理材料归一 ---------------------------------------------------------
@@ -342,7 +361,15 @@ def _bundle_raw(m: ParsedMat, pr: ParseResult) -> str:
         elif ref in pr.curves:
             c = pr.curves[ref]
             add(c.order, c.raw)
-    return "\n".join(raw for _, raw in sorted(parts))
+    text = "\n".join(raw for _, raw in sorted(parts))
+    # 块里引用了 &参数 的，把 *PARAMETER 定义一并打包进来（如曲线 15 的时间轴
+    # 偏移 1.0&TTF —— 起爆时刻）。不带上它，卡块就不是自包含的：拼出的 MAT.K
+    # 引用未定义参数，求解器直接报错。渲染侧会把多卡重复的定义去重成一个块。
+    need = [n for n in sorted({mm.upper() for mm in re.findall(r"&(\w+)", text)})
+            if (pr.params or {}).get(n)]
+    if need:
+        text += "\n*PARAMETER\n" + "\n".join(pr.params[n] for n in need)
+    return text
 
 
 def _curve_dicts(m: ParsedMat, pr: ParseResult, y_stress_unit: str,

@@ -165,21 +165,54 @@ def render_material_template(db, template_id: str) -> str:
         f"$ 由 SDM 材料库导出，共 {len(items)} 张材料卡；各卡原文原样拼接",
         "$",
     ]
+    # *PARAMETER 汇总去重：各卡的自包含块可能各带一份同名参数定义（导入时打包
+    # 进去的，如 TTF），LS-DYNA 里参数重复定义是致命错——拼接时把它们摘出来，
+    # 文件头部只发一个块。同名不同值说明两张卡来自不同标定，记告警。
+    param_lines: Dict[str, str] = {}
+    body: List[str] = []
     for it in items:
         row = db.get_material_card(it["card_id"])
         if row is None:
             log.warning("模板 %s 的成员卡 %s 已不存在，跳过", template_id, it["card_id"])
             continue
         card = dict(row)          # sqlite3.Row 没有 .get()
-        out.append(_HEADER)
-        out.append(f"$ {card.get('title') or card.get('mat_type')}"
-                   f"   MID={card.get('source_mid')}   {card.get('unit_system')}")
-        out.append(_HEADER)
-        text = (card["keyword_text"] or "").strip("\n")
-        # 卡的原文可能自带 *KEYWORD/*END（导入时按整块存的），拼接时要去掉
-        lines = [ln for ln in text.split("\n")
-                 if ln.strip().upper() not in ("*KEYWORD", "*END")]
-        out.extend(lines)
+        body.append(_HEADER)
+        body.append(f"$ {card.get('title') or card.get('mat_type')}"
+                    f"   MID={card.get('source_mid')}   {card.get('unit_system')}")
+        body.append(_HEADER)
+        lines = (card["keyword_text"] or "").strip("\n").split("\n")
+        i = 0
+        while i < len(lines):
+            up = lines[i].strip().upper()
+            if up in ("*KEYWORD", "*END"):
+                i += 1
+                continue
+            if up.startswith("*PARAMETER"):
+                i += 1
+                while i < len(lines) and not lines[i].lstrip().startswith("*"):
+                    ln = lines[i].strip()
+                    if ln and not ln.startswith("$"):
+                        m2 = re.match(r"\s*[RIC]\s+(\w+)", lines[i], re.I)
+                        if m2:
+                            name = m2.group(1).upper()
+                            if name in param_lines and param_lines[name] != lines[i].rstrip():
+                                log.warning("参数 %s 在不同卡里取值不同: %r vs %r",
+                                            name, param_lines[name], lines[i].rstrip())
+                            param_lines.setdefault(name, lines[i].rstrip())
+                    i += 1
+                continue
+            body.append(lines[i])
+            i += 1
+    # 引用了却没定义的参数，显式标出来（渲染不该静默产出坏文件）
+    refs = {m2.upper() for m2 in re.findall(r"&(\w+)", "\n".join(body))}
+    missing = sorted(refs - set(param_lines))
+    if missing:
+        log.warning("模板 %s 引用了未定义参数: %s", template_id, missing)
+        out.append(f"$ WARNING: undefined parameters referenced: {', '.join(missing)}")
+    if param_lines:
+        out.append("*PARAMETER")
+        out.extend(param_lines[k] for k in sorted(param_lines))
+    out.extend(body)
     out.append("*END")
     return "\n".join(out) + "\n"
 
