@@ -419,6 +419,9 @@ export interface SimProject {
   default_solver: string | null;
   unit_system: string;
   workdir: string | null;
+  /** 结算组装引用的模板发布版本（不可变快照）id */
+  control_release_id?: string | null;
+  material_release_id?: string | null;
   created_at: number;
   updated_at: number;
   stats?: SimProjectStats;
@@ -431,6 +434,8 @@ export interface SimProjectInput {
   default_solver?: string | null;
   unit_system?: string;
   workdir?: string | null;
+  control_release_id?: string | null;
+  material_release_id?: string | null;
 }
 
 export interface SimTarget {
@@ -1096,4 +1101,18 @@ export interface SimMaterialImportReport {
   cards: number;
   curves: number;
   warnings: string[];
+}
+
+/** 模板发布版本：发布时点完整原文的不可变快照，项目引用它做结算组装 */
+export interface SimTemplateRelease {
+  id: string;
+  kind: "material" | "control";
+  template_id: string;
+  version_no: number;
+  name: string;
+  unit_system: string;
+  note: string;
+  created_by: string;
+  created_at: number;
+  content_bytes?: number;
 }

@@ -15,6 +15,7 @@ import type {
   SimResult,
   SimSubject,
   SimTarget,
+  SimTemplateRelease,
 } from "@/api/types";
 import { ArrowLeft, Boxes, ChevronRight, Eye, FolderCog, Loader2, Plus, Sparkles, Trash2 } from "lucide-vue-next";
 import GeometryPanel from "./GeometryPanel.vue";
@@ -177,6 +178,32 @@ async function saveWorkdir() {
   }
 }
 
+const ctrlReleases = ref<SimTemplateRelease[]>([]);
+const matReleases = ref<SimTemplateRelease[]>([]);
+
+async function loadReleases() {
+  try {
+    const [cts, mts] = await Promise.all([
+      simApi.listControlTemplates(), simApi.listMaterialTemplates(),
+    ]);
+    ctrlReleases.value = (await Promise.all(
+      cts.map((t) => simApi.listTemplateReleases("control", t.id)))).flat();
+    matReleases.value = (await Promise.all(
+      mts.map((t) => simApi.listTemplateReleases("material", t.id)))).flat();
+  } catch {
+    /* 模板库不可用不阻断项目页 */
+  }
+}
+
+async function setRelease(field: "control_release_id" | "material_release_id", rid: string) {
+  if (!project.value) return;
+  try {
+    project.value = await simApi.updateProject(project.value.id, { [field]: rid });
+  } catch (e) {
+    error.value = errMsg(e);
+  }
+}
+
 function fmt(ts: number | null) {
   return ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "—";
 }
@@ -212,7 +239,7 @@ function viewerFor(r: SimResult): RouteLocationRaw | null {
   return { name: "d3plot", query: { path: r.file_path } };
 }
 
-onMounted(load);
+onMounted(() => { load(); loadReleases(); });
 </script>
 
 <template>
@@ -256,6 +283,34 @@ onMounted(load);
           <span v-if="project.dbit_project_code" class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700">
             dbit {{ project.dbit_project_code }}
           </span>
+        </div>
+
+        <!-- 求解模板引用: 结算组装(生成网格→main.key)按它取控制卡/材料卡。
+             引用的是发布版本快照 —— 模板后续编辑不影响本项目, 换版本才变。 -->
+        <div class="flex flex-wrap items-center gap-2 mt-2 text-xs">
+          <span class="text-slate-500">求解模板</span>
+          <label class="inline-flex items-center gap-1">
+            控制卡
+            <select class="rounded border px-1.5 py-0.5"
+                    :value="project.control_release_id ?? ''"
+                    @change="setRelease('control_release_id', ($event.target as HTMLSelectElement).value)">
+              <option value="">内置默认</option>
+              <option v-for="r in ctrlReleases" :key="r.id" :value="r.id">
+                {{ r.name }} v{{ r.version_no }}
+              </option>
+            </select>
+          </label>
+          <label class="inline-flex items-center gap-1">
+            材料卡
+            <select class="rounded border px-1.5 py-0.5"
+                    :value="project.material_release_id ?? ''"
+                    @change="setRelease('material_release_id', ($event.target as HTMLSelectElement).value)">
+              <option value="">内置默认</option>
+              <option v-for="r in matReleases" :key="r.id" :value="r.id">
+                {{ r.name }} v{{ r.version_no }}
+              </option>
+            </select>
+          </label>
         </div>
 
         <!-- 工作目录:未设置时导入数模必失败,所以缺失要显眼、且能就地补 -->

@@ -1,6 +1,7 @@
 import { http, getToken } from "./client";
 export { errMsg } from "./client";
 import type {
+  SimTemplateRelease,
   D3plotFindResult,
   D3plotManifest,
   D3plotPrepareResult,
@@ -483,6 +484,21 @@ export const api = {
   async syncShare(id: number): Promise<{ task_id: string }> {
     const { data } = await http.post<{ task_id: string }>(
       `/netdisk/shares/${id}/sync`
+    );
+    return data;
+  },
+  /**
+   * 重新拉取单个文件并覆盖本地，返回 task_id。
+   *
+   * 比整源同步快——只列该文件所在的一层目录。客户在网盘上换了新版本时
+   * fs_id 会变，后端按文件名重新定位，所以这个调用对"更新"和"补一份"都适用。
+   */
+  async resyncShareFile(
+    shareId: number,
+    fsId: string
+  ): Promise<{ task_id: string }> {
+    const { data } = await http.post<{ task_id: string }>(
+      `/netdisk/shares/${shareId}/files/${encodeURIComponent(fsId)}/resync`
     );
     return data;
   },
@@ -1276,6 +1292,23 @@ export const simApi = {
   },
   controlParseTicket(tid: string): Promise<SimTemplateParseTicket> {
     return templateParseTicket("control-templates", tid, "control");
+  },
+
+  // --- 模板发布版本（不可变快照，项目引用它做结算组装）---
+  async publishTemplate(kind: "material" | "control", tid: string, note = ""):
+    Promise<SimTemplateRelease> {
+    const { data } = await http.post<SimTemplateRelease>(
+      `/sim/${kind}-templates/${tid}/publish`, null, { params: { note } });
+    return data;
+  },
+  async listTemplateReleases(kind: "material" | "control", tid: string):
+    Promise<SimTemplateRelease[]> {
+    const { data } = await http.get<SimTemplateRelease[]>(
+      `/sim/${kind}-templates/${tid}/releases`);
+    return data;
+  },
+  templateReleaseUrl(rid: string): string {
+    return `/api/sim/template-releases/${rid}?download=1`;
   },
 
   // --- AI 会话（契约：docs/vektor3d-ai-session-contract.md）---

@@ -19,6 +19,7 @@ import type {
   SimMaterialTemplate,
   SimMaterialTemplateDetail,
   SimTemplateCheck,
+  SimTemplateRelease,
 } from "@/api/types";
 import { useAuthStore } from "@/stores/auth";
 import { parseTemplate, parseHint, type ParsePhase } from "./templateParse";
@@ -50,6 +51,24 @@ const notice = ref("");
  * 而 *MAT_FABRIC 少写三张必需卡这类问题只有它能发现。
  */
 const parsing = ref(false);
+const releases = ref<SimTemplateRelease[]>([]);
+const publishing = ref(false);
+
+async function publish(tid: string) {
+  publishing.value = true;
+  try {
+    await simApi.publishTemplate("material", tid);
+    releases.value = await simApi.listTemplateReleases("material", tid);
+  } catch (e) {
+    error.value = errMsg(e);
+  } finally {
+    publishing.value = false;
+  }
+}
+
+function copyRid(rid: string) {
+  navigator.clipboard?.writeText(rid);
+}
 const parsePhase = ref<ParsePhase>("");
 const parseIssues = computed<{ level: string; message: string; keyword?: string }[]>(() => {
   if (!selected.value?.summary_json) return [];
@@ -118,6 +137,7 @@ async function open(tid: string) {
   try {
     selected.value = await simApi.getMaterialTemplate(tid);
     picked.value = selected.value.items.map((i) => i.card_id);
+    releases.value = await simApi.listTemplateReleases("material", tid);
     editing.value = false;
     check.value = null;
   } catch (e) {
@@ -312,6 +332,19 @@ onMounted(load);
             <RefreshCw v-else class="h-3.5 w-3.5" />
             {{ parsing ? (parsePhase || "复核中") : "深度复核" }}
           </button>
+          <button v-if="isAdmin"
+                  class="inline-flex items-center gap-1 rounded bg-slate-800 px-2 py-1 text-xs text-white
+                         disabled:opacity-50"
+                  :disabled="publishing" @click="publish(selected.id)">
+            发布 v{{ (releases[0]?.version_no ?? 0) + 1 }}
+          </button>
+          <span v-if="releases.length" class="text-xs">
+            <span v-for="r in releases" :key="r.id" class="mr-2 inline-flex items-center gap-1">
+              <a :href="simApi.templateReleaseUrl(r.id)" class="text-indigo-700 hover:underline">v{{ r.version_no }}</a>
+              <button class="text-slate-400 hover:text-slate-700" title="复制版本 id（项目引用用）"
+                      @click="copyRid(r.id)">⧉</button>
+            </span>
+          </span>
           <a :href="simApi.materialTemplateExportUrl(selected.id)"
              class="inline-flex items-center gap-1 rounded border px-2 py-1 text-xs hover:bg-slate-50">
             <Download class="h-3.5 w-3.5" /> 导出 MAT.K

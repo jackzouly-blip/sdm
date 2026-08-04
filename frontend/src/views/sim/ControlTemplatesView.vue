@@ -14,7 +14,7 @@
  */
 import { computed, onMounted, ref } from "vue";
 import { simApi, errMsg } from "@/api";
-import type { SimControlTemplate } from "@/api/types";
+import type { SimControlTemplate, SimTemplateRelease } from "@/api/types";
 import { useAuthStore } from "@/stores/auth";
 import { parseTemplate, parseHint, type ParsePhase } from "./templateParse";
 import {
@@ -70,6 +70,24 @@ const issues = computed<{ level: string; message: string; keyword?: string }[]>(
 const errCount = computed(() => issues.value.filter((i) => i.level === "ERR").length);
 
 const parsing = ref("");
+const releases = ref<SimTemplateRelease[]>([]);
+const publishing = ref(false);
+
+async function publish(tid: string) {
+  publishing.value = true;
+  try {
+    await simApi.publishTemplate("control", tid);
+    releases.value = await simApi.listTemplateReleases("control", tid);
+  } catch (e) {
+    error.value = errMsg(e);
+  } finally {
+    publishing.value = false;
+  }
+}
+
+function copyRid(rid: string) {
+  navigator.clipboard?.writeText(rid);
+}
 const parsePhase = ref<ParsePhase>("");
 const notice = ref("");
 
@@ -88,6 +106,7 @@ async function reparse(tid: string, afterCreate = false) {
       parsePhase.value = (d ? `解析中 · ${d}` : p) as ParsePhase;
     });
     selected.value = await simApi.getControlTemplate(tid);
+    releases.value = await simApi.listTemplateReleases("control", tid);
     notice.value = out.errors.length
       ? `解析完成，发现 ${out.errors.length} 个必须处理的问题`
       : out.warnings.length
@@ -117,6 +136,7 @@ async function load() {
 async function open(tid: string) {
   try {
     selected.value = await simApi.getControlTemplate(tid);
+    releases.value = await simApi.listTemplateReleases("control", tid);
   } catch (e) {
     error.value = errMsg(e);
   }
@@ -278,6 +298,13 @@ onMounted(load);
             <RefreshCw v-else class="h-3.5 w-3.5" />
             {{ parsing === selected.id ? (parsePhase || "解析中") : "解析" }}
           </button>
+          <button v-if="isAdmin"
+                  class="inline-flex items-center gap-1 rounded bg-slate-800 px-2 py-1 text-xs text-white
+                         disabled:opacity-50"
+                  :disabled="publishing" @click="publish(selected.id)">
+            <Loader2 v-if="publishing" class="h-3.5 w-3.5 animate-spin" />
+            发布 v{{ (releases[0]?.version_no ?? 0) + 1 }}
+          </button>
           <a :href="simApi.controlTemplateExportUrl(selected.id)"
              class="inline-flex items-center gap-1 rounded border px-2 py-1 text-xs hover:bg-slate-50">
             <Download class="h-3.5 w-3.5" /> 导出
@@ -295,6 +322,16 @@ onMounted(load);
             <span class="text-slate-500">{{ k }}</span>
             <span class="font-medium">{{ v }}</span>
           </div>
+        </div>
+        <div v-if="releases.length" class="border-b px-4 py-2 text-xs">
+          <span class="text-slate-500 mr-2">已发布版本（项目引用的是版本快照，不随编辑变化）</span>
+          <span v-for="r in releases" :key="r.id" class="mr-3 inline-flex items-center gap-1">
+            <a :href="simApi.templateReleaseUrl(r.id)" class="text-indigo-700 hover:underline">
+              v{{ r.version_no }}</a>
+            <span class="text-slate-400">{{ new Date(r.created_at * 1000).toLocaleDateString() }}</span>
+            <button class="text-slate-400 hover:text-slate-700" title="复制版本 id（项目引用用）"
+                    @click="copyRid(r.id)">⧉</button>
+          </span>
         </div>
         <p v-else class="border-b px-4 py-2 text-[11px] text-slate-400">
           尚无求解策略摘要 —— 点上方「解析」调用 vektor3d 生成（需桌面端已启动）
