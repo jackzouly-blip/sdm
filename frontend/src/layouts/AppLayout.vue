@@ -130,10 +130,22 @@ function switchApp(appId: string) {
       class="h-14 shrink-0 bg-white border-b border-slate-200 flex items-center px-3 sm:px-5 gap-3 sm:gap-6"
     >
       <img src="/cherish-logo.png" alt="CHERISH" class="h-9 w-auto shrink-0" />
+      <!--
+        品牌区不该和功能导航抢横向空间：原来 text-lg 单行约占 200px，正是顶栏最挤的
+        那部分。这里做两件事——字号降到 text-sm、版本号降级为次要小字；再按宽度分段：
+          <768px  导航收进汉堡菜单，没人跟它抢 → 显示
+          768–1023px 导航已展开而空间最紧 → 隐藏，把这 ~130px 全让给菜单
+          ≥1024px 两者都放得下 → 显示
+        品牌本身没丢：logo 始终在，title 属性给出全称。
+      -->
       <div
-        class="font-semibold text-slate-800 text-base sm:text-lg whitespace-nowrap hidden sm:block"
+        class="hidden sm:flex md:hidden lg:flex items-baseline gap-1 shrink-0"
+        title="驰越诗软件计算平台 V3.0"
       >
-        驰越诗软件计算平台V3.0
+        <span class="text-sm font-semibold text-slate-800 whitespace-nowrap">
+          驰越诗软件计算平台
+        </span>
+        <span class="text-[10px] font-medium text-slate-400">V3.0</span>
       </div>
 
       <!-- 一级 APP 切换器 -->
