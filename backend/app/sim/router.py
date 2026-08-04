@@ -1061,6 +1061,32 @@ async def upload_airbag_deck(
         except ValueError:
             log.warning("气囊 deck 元数据不是合法 JSON，已忽略 gid=%s", gid)
 
+    # —— 组装结算主控：控制卡/材料卡/起爆模板 + 本次网格 —— #
+    # 模板放 SDM（用户定的分工）；与几何绑定的三张卡（SET_PART 1 控制体 /
+    # SET_PART 2 全部件 / 展平参考几何）由 vektor3d 写在 deck 本体里。
+    # 模板 replace 覆盖写：内容随部署更新、重复生成幂等；主控与 deck 同名
+    # 前缀（airbag-vNN[-rM]-main.key），一次生成一套、互不覆盖。
+    # 失败只降级不阻断——deck 本体照常登记，主控可以手动补。
+    master_name = None
+    try:
+        tdir = os.path.join(os.path.dirname(__file__), "templates", "airbag")
+        for fn in ("03_Control_card.k", "MAT.K", "inflator.k"):
+            with open(os.path.join(tdir, fn), "rb") as fh:
+                write_file(proj["owner"], parent, fn, fh.read(),
+                           get_settings().fs_root_list, replace=True)
+        with open(os.path.join(tdir, "main.key.tpl"), encoding="latin-1") as fh:
+            tpl = fh.read()
+        master_name = f"{os.path.splitext(name)[0]}-main.key"
+        write_file(proj["owner"], parent, master_name,
+                   tpl.replace("{bag}", name).encode("latin-1"),
+                   get_settings().fs_root_list, replace=True)
+        info["master_deck"] = master_name
+        log.info("结算主控已组装 gid=%s master=%s（含控制/材料/起爆模板）",
+                 gid, master_name)
+    except (FsError, OSError) as e:
+        log.warning("结算主控组装失败（deck 本体不受影响）: %s", e)
+        master_name = None
+
     new_gid = db.add_geometry(
         src_geom["sim_target_id"],
         source_type="deck",
@@ -1090,6 +1116,7 @@ async def upload_airbag_deck(
 
     out_row = _row(db.get_geometry(new_gid), GEOM_JSON)
     out_row["convert_task_id"] = task_id
+    out_row["master_deck"] = master_name
     return out_row
 
 
