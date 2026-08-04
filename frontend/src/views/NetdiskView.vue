@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from "vue";
+import { ref, computed, onMounted, onUnmounted } from "vue";
 import { useRouter } from "vue-router";
 import { api, errMsg, pollTask } from "@/api";
 import type {
@@ -40,14 +40,48 @@ function openFileDir(localPath: string) {
   if (dir) openInFiles(dir);
 }
 
-/** 文件在落点下的相对目录；同名文件分布在不同子目录时靠它区分。 */
-function relDir(f: NetdiskShareFile): string {
-  const share = shares.value.find((s) => s.id === expanded.value);
-  if (!share || !f.local_path) return "";
-  const base = share.local_dir.replace(/\/$/, "");
-  const dir = f.local_path.replace(/\/[^/]+$/, "");
-  return dir.startsWith(base + "/") ? dir.slice(base.length + 1) : "";
+/**
+ * 文件在落点下的相对目录。
+ *
+ * 由 share_path 相对 sub_dir 推出（与后端 rel_dir_of 同一套规则），不依赖
+ * local_path——尚未下载的文件也要能正确归组。
+ */
+function relDirOf(f: NetdiskShareFile, share: NetdiskShare): string {
+  const dir = (f.share_path || "").replace(/\/[^/]+$/, "");
+  const base = (share.sub_dir || "").replace(/\/+$/, "");
+  const rel = base && (dir === base || dir.startsWith(base + "/"))
+    ? dir.slice(base.length)
+    : dir;
+  return rel.replace(/^\/+|\/+$/g, "");
 }
+
+/**
+ * 文件清单按目录分组。
+ *
+ * 平铺成一张表、每行再重复一遍完整相对路径，会让"层级已保留"看起来像"全都堆在
+ * 一起"——长路径出现 N 遍反而淹没了结构。分组后目录只出现一次，一眼能看出层次。
+ */
+const fileGroups = computed(() => {
+  const share = shares.value.find((s) => s.id === expanded.value);
+  if (!share) return [];
+  const map = new Map<string, NetdiskShareFile[]>();
+  for (const f of files.value) {
+    const d = relDirOf(f, share);
+    if (!map.has(d)) map.set(d, []);
+    map.get(d)!.push(f);
+  }
+  return [...map.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([dir, items]) => ({
+      dir,
+      items: [...items].sort((x, y) => x.filename.localeCompare(y.filename)),
+      bytes: items.reduce((n, f) => n + f.size, 0),
+      /** 该目录在集群上的绝对路径，供"打开这个目录" */
+      localDir: dir
+        ? `${share.local_dir.replace(/\/$/, "")}/${dir}`
+        : share.local_dir,
+    }));
+});
 
 const status = ref<NetdiskSyncStatus | null>(null);
 const shares = ref<NetdiskShare[]>([]);
@@ -411,30 +445,51 @@ onUnmounted(() => stoppers.forEach((s) => s()));
                     </tr>
                   </thead>
                   <tbody>
-                    <tr v-for="f in files" :key="f.fs_id" class="border-t border-slate-200/70">
-                      <td class="py-1.5 pr-3">
-                        <button
-                          v-if="f.local_path"
-                          class="text-slate-700 truncate hover:text-blue-700 hover:underline text-left"
-                          title="打开该文件所在目录"
-                          @click="openFileDir(f.local_path)"
-                        >
-                          {{ f.filename }}
-                        </button>
-                        <div v-else class="text-slate-700 truncate">{{ f.filename }}</div>
-                        <!-- 相对目录：同步保留网盘层级后，同名文件靠它区分 -->
-                        <div
-                          v-if="relDir(f)"
-                          class="text-slate-400 truncate font-mono"
-                          :title="f.share_path"
-                        >
-                          {{ relDir(f) }}
-                        </div>
-                        <div
-                          v-if="f.error"
-                          class="text-rose-500 truncate"
-                          :title="f.error"
-                        >
+                    <!-- 按目录分组：目录名只出现一次，文件缩进其下。
+                         此前每行重复完整相对路径，五行一模一样，反而像"全堆在一起"。 -->
+                    <template v-for="g in fileGroups" :key="g.dir">
+                      <tr class="border-t border-slate-200/70 bg-slate-100/50">
+                        <td colspan="4" class="py-1.5 pr-3">
+                          <button
+                            class="group inline-flex items-center gap-1.5 text-left"
+                            :title="`在「文件浏览」中打开 ${g.localDir}`"
+                            @click="openInFiles(g.localDir)"
+                          >
+                            <FolderOpen
+                              :size="13"
+                              class="shrink-0 text-amber-500 group-hover:text-blue-600"
+                            />
+                            <span
+                              class="font-mono text-slate-600 group-hover:text-blue-700 group-hover:underline"
+                            >
+                              {{ g.dir || "（落点根目录）" }}
+                            </span>
+                            <span class="text-slate-400">
+                              · {{ g.items.length }} 个文件 · {{ fmtBytes(g.bytes) }}
+                            </span>
+                          </button>
+                        </td>
+                      </tr>
+                      <tr
+                        v-for="f in g.items"
+                        :key="f.fs_id"
+                        class="border-t border-slate-200/70"
+                      >
+                        <td class="py-1.5 pr-3 pl-5">
+                          <button
+                            v-if="f.local_path"
+                            class="text-slate-700 truncate hover:text-blue-700 hover:underline text-left"
+                            title="打开该文件所在目录"
+                            @click="openFileDir(f.local_path)"
+                          >
+                            {{ f.filename }}
+                          </button>
+                          <div v-else class="text-slate-700 truncate">{{ f.filename }}</div>
+                          <div
+                            v-if="f.error"
+                            class="text-rose-500 truncate"
+                            :title="f.error"
+                          >
                           {{ f.error }}
                         </div>
                       </td>
@@ -448,7 +503,8 @@ onUnmounted(() => stoppers.forEach((s) => s()));
                         </span>
                       </td>
                       <td class="py-1.5 text-slate-400">{{ fmtTime(f.updated_at) }}</td>
-                    </tr>
+                      </tr>
+                    </template>
                   </tbody>
                 </table>
               </td>
