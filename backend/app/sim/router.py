@@ -1075,47 +1075,11 @@ async def upload_airbag_deck(
         tdir = os.path.join(os.path.dirname(__file__), "templates", "airbag")
         # 项目引用了发布版本的, 用发布快照; 没引用的用内置模板兜底。
         # 引用的是**不可变快照**: 模板后续在线编辑不影响已生成的结算包。
-        overrides = {}
-        # ① "引用模板"通用列表优先: 每类取最近添加的一条(library 取快照原文,
-        #    local 取上传原文)。② 旧的项目级两字段其次(兼容)。③ 内置模板兜底。
-        cat2fn = {"material": "MAT.K", "control": "03_Control_card.k"}
-        for ref in db.list_project_template_refs(proj["id"]):
-            fn = cat2fn.get(ref["category"])
-            if fn is None or fn in overrides:
-                continue
-            if ref["source"] == "library":
-                rel = db.get_template_release(ref["release_id"] or "")
-                if rel is not None:
-                    overrides[fn] = rel["content"].encode("latin-1", "replace")
-                    log.info("结算组装用引用模板(库) %s -> %s", ref["name"], fn)
-            else:
-                full = db.get_project_template_ref(ref["id"])
-                if full is not None and full["content"]:
-                    overrides[fn] = full["content"].encode("latin-1", "replace")
-                    log.info("结算组装用引用模板(本地) %s -> %s", ref["name"], fn)
-        for col, fn in (("control_release_id", "03_Control_card.k"),
-                        ("material_release_id", "MAT.K")):
-            if fn in overrides:
-                continue
-            rid_ = (proj[col] if col in proj.keys() else None) or ""
-            if rid_:
-                rel = db.get_template_release(rid_)
-                if rel is not None:
-                    overrides[fn] = rel["content"].encode("latin-1", "replace")
-                    log.info("结算组装用项目引用的模板版本 %s v%d -> %s",
-                             rel["name"], rel["version_no"], fn)
-                else:
-                    log.warning("项目引用的模板版本不存在(%s), 回退内置模板", rid_)
-        for fn in ("03_Control_card.k", "MAT.K", "inflator.k"):
-            if fn in overrides:
-                data_ = overrides[fn]
-            else:
-                with open(os.path.join(tdir, fn), "rb") as fh:
-                    data_ = fh.read()
+        files_ = _airbag_template_contents(db, proj)
+        tpl = files_.pop("main.key.tpl").decode("latin-1")
+        for fn, data_ in files_.items():
             write_file(proj["owner"], parent, fn, data_,
                        get_settings().fs_root_list, replace=True)
-        with open(os.path.join(tdir, "main.key.tpl"), encoding="latin-1") as fh:
-            tpl = fh.read()
         master_name = f"{os.path.splitext(name)[0]}-main.key"
         write_file(proj["owner"], parent, master_name,
                    tpl.replace("{bag}", name).encode("latin-1"),
@@ -3204,6 +3168,42 @@ def export_control_template(request: Request, tid: str,
     )
 
 
+def _airbag_template_contents(db, proj) -> Dict[str, bytes]:
+    """结算组装/实例化取模板内容。优先级: 项目"引用模板"列表(每类最近一条) >
+    旧项目两字段(兼容) > SDM 内置模板。返回 {文件名: 内容}。"""
+    tdir = os.path.join(os.path.dirname(__file__), "templates", "airbag")
+    out: Dict[str, bytes] = {}
+    cat2fn = {"material": "MAT.K", "control": "03_Control_card.k"}
+    for ref in db.list_project_template_refs(proj["id"]):
+        fn = cat2fn.get(ref["category"])
+        if fn is None or fn in out:
+            continue
+        if ref["source"] == "library":
+            rel = db.get_template_release(ref["release_id"] or "")
+            if rel is not None:
+                out[fn] = rel["content"].encode("latin-1", "replace")
+        else:
+            full = db.get_project_template_ref(ref["id"])
+            if full is not None and full["content"]:
+                out[fn] = full["content"].encode("latin-1", "replace")
+    for col, fn in (("control_release_id", "03_Control_card.k"),
+                    ("material_release_id", "MAT.K")):
+        if fn in out:
+            continue
+        rid_ = (proj[col] if col in proj.keys() else None) or ""
+        if rid_:
+            rel = db.get_template_release(rid_)
+            if rel is not None:
+                out[fn] = rel["content"].encode("latin-1", "replace")
+    for fn in ("03_Control_card.k", "MAT.K", "inflator.k"):
+        if fn not in out:
+            with open(os.path.join(tdir, fn), "rb") as fh:
+                out[fn] = fh.read()
+    with open(os.path.join(tdir, "main.key.tpl"), encoding="latin-1") as fh:
+        out["main.key.tpl"] = fh.read().encode("latin-1")
+    return out
+
+
 # --- 项目引用模板（通用列表：材料卡/控制卡起步，类别可扩展）-----------
 
 @router.get("/projects/{pid}/template-refs")
@@ -3510,6 +3510,74 @@ def create_job(
     _owned_subject(db, sid, user, is_admin)
     jid = db.create_job(sid, body.submit_mode, body.sim_mesh_version_id,
                         body.submit_payload)
+    return _row(db.get_job(jid), JOB_JSON)
+
+
+class JobMaterialize(BaseModel):
+    geometry_id: str = Field(min_length=1, description="deck 类型的几何版本 id")
+
+
+@router.post("/jobs/{jid}/materialize")
+def materialize_job(
+    request: Request, jid: str, body: JobMaterialize,
+    user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """为这次计算实例化独立目录（用户定的流程）：
+
+        <项目workdir>/runs/<jid前8位>/ 里落 网格deck + 控制卡 + 材料卡 +
+        起爆卡 + main.key —— 每次计算一个目录、互不覆盖，改引用只影响之后的
+        run。提交仍走算力管理的「作业提交」：初始目录填 run 目录、输入文件
+        main.key。已投递(hpc_jobid 非空)的作业拒绝重实例化。
+    """
+    from ..fs.browser import FsError, write_file
+
+    db = _db(request)
+    job = _owned_job(db, jid, user, is_admin)
+    if job["hpc_jobid"]:
+        raise HTTPException(status.HTTP_409_CONFLICT, "作业已投递，不能重实例化")
+    subj = db.get_subject(job["sim_subject_id"])
+    target = db.get_target(subj["sim_target_id"])
+    proj = db.get_project(target["sim_project_id"])
+    if not proj["workdir"]:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "项目未设置工作目录，无法建 run 目录")
+
+    geom = db.get_geometry(body.geometry_id)
+    if geom is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "几何版本不存在")
+    gt = db.get_target(geom["sim_target_id"])
+    if gt is None or gt["sim_project_id"] != proj["id"]:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "几何版本不属于本项目")
+    src = _json_or_none(geom["source_file_json"]) or {}
+    if geom["source_type"] != "deck" or not src.get("path"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "所选几何版本不是 deck（请先生成网格）")
+
+    run_dir = os.path.join(proj["workdir"], "runs", jid[:8])
+    bag_name = src.get("name") or "bag.k"
+    try:
+        with open(src["path"], "rb") as fh:
+            bag_data = fh.read()
+    except OSError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"读取 deck 失败: {e}")
+
+    files = _airbag_template_contents(db, proj)
+    master_tpl = files.pop("main.key.tpl").decode("latin-1")
+    try:
+        write_file(proj["owner"], run_dir, bag_name, bag_data,
+                   get_settings().fs_root_list, replace=True)
+        for fn, data in files.items():
+            write_file(proj["owner"], run_dir, fn, data,
+                       get_settings().fs_root_list, replace=True)
+        write_file(proj["owner"], run_dir, "main.key",
+                   master_tpl.replace("{bag}", bag_name).encode("latin-1"),
+                   get_settings().fs_root_list, replace=True)
+    except FsError as e:
+        raise HTTPException(e.status, f"实例化失败: {e.message}")
+
+    payload = _json_or_none(job["submit_payload_json"]) or {}
+    payload.update({"run_dir": run_dir, "master": "main.key",
+                    "geometry_id": body.geometry_id, "bag": bag_name})
+    db.update_job_payload(jid, payload)
+    log.info("作业 %s 实例化 run 目录 %s（deck=%s）by=%s", jid, run_dir, bag_name, user)
     return _row(db.get_job(jid), JOB_JSON)
 
 

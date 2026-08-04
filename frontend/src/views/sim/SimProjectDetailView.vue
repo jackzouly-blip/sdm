@@ -259,6 +259,42 @@ async function removeRef(rid: string) {
   }
 }
 
+// ── 实例化 run 目录: 每次计算独立目录(用户定的流程) ──
+const matJob = ref<SimJob | null>(null);
+const matDecks = ref<SimGeometry[]>([]);
+const matDeckId = ref("");
+const matBusy = ref(false);
+
+async function openMaterialize(j: SimJob) {
+  matJob.value = j;
+  matDeckId.value = "";
+  try {
+    const all = await Promise.all(targets.value.map((tg) => simApi.listGeometries(tg.id)));
+    matDecks.value = all.flat().filter((g) => g.source_type === "deck");
+    if (matDecks.value.length === 1) matDeckId.value = matDecks.value[0].id;
+  } catch (e) {
+    error.value = errMsg(e);
+  }
+}
+
+async function doMaterialize() {
+  if (!matJob.value || !matDeckId.value) return;
+  matBusy.value = true;
+  try {
+    await simApi.materializeJob(matJob.value.id, matDeckId.value);
+    matJob.value = null;
+    await load();
+  } catch (e) {
+    error.value = errMsg(e);
+  } finally {
+    matBusy.value = false;
+  }
+}
+
+function runDir(j: SimJob): string {
+  return String((j.submit_payload as Record<string, unknown> | null)?.run_dir ?? "");
+}
+
 function catLabel(k: string) {
   return CATEGORIES.find((c) => c.key === k)?.label ?? k;
 }
@@ -620,6 +656,7 @@ onMounted(() => { load(); loadReleases(); loadTemplateRefs(); });
               <th class="text-left font-medium py-2">方式</th>
               <th class="text-left font-medium py-2">状态</th>
               <th class="text-left font-medium py-2">投递时间</th>
+              <th class="text-left font-medium py-2">运行目录</th>
             </tr>
           </thead>
           <tbody>
@@ -643,9 +680,39 @@ onMounted(() => { load(); loadReleases(); loadTemplateRefs(); });
                 >
               </td>
               <td class="py-2 text-slate-500">{{ fmt(j.submitted_at) }}</td>
+              <td class="py-2 text-xs">
+                <span v-if="runDir(j)" class="font-mono text-slate-600 break-all"
+                      title="提交时在「作业提交」把初始目录填这里、输入文件填 main.key">
+                  {{ runDir(j) }}</span>
+                <button v-else-if="!j.hpc_jobid"
+                        class="rounded border px-2 py-0.5 hover:bg-slate-50"
+                        @click="openMaterialize(j)">实例化…</button>
+              </td>
             </tr>
           </tbody>
         </table>
+      </div>
+
+      <div v-if="matJob" class="fixed inset-0 z-50 bg-black/30 flex items-center justify-center"
+           @click.self="matJob = null">
+        <div class="bg-white rounded-lg shadow-xl p-4 w-96 text-sm">
+          <div class="font-medium mb-2">实例化运行目录</div>
+          <p class="text-xs text-slate-500 mb-2">
+            将在项目工作目录下建 runs/&lt;作业号&gt;/，放入所选网格 deck、
+            引用模板（控制卡/材料卡/起爆卡）与 main.key。每次计算一个独立目录。
+          </p>
+          <select v-model="matDeckId" class="w-full rounded border px-2 py-1 mb-3">
+            <option value="">选择网格 deck…</option>
+            <option v-for="g in matDecks" :key="g.id" :value="g.id">
+              {{ g.source_file?.name }} (v{{ g.version_no }})
+            </option>
+          </select>
+          <div class="flex justify-end gap-2">
+            <button class="rounded border px-3 py-1" @click="matJob = null">取消</button>
+            <button class="rounded bg-slate-800 px-3 py-1 text-white disabled:opacity-50"
+                    :disabled="!matDeckId || matBusy" @click="doMaterialize">实例化</button>
+          </div>
+        </div>
       </div>
 
       <!-- 结果 -->

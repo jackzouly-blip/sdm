@@ -1335,6 +1335,12 @@ export const simApi = {
   async deleteProjectTemplateRef(pid: string, rid: string): Promise<void> {
     await http.delete(`/sim/projects/${pid}/template-refs/${rid}`);
   },
+  /** 为一次计算实例化独立 run 目录（deck+模板+main.key），提交仍走作业提交页 */
+  async materializeJob(jid: string, geometryId: string): Promise<SimJob> {
+    const { data } = await http.post<SimJob>(`/sim/jobs/${jid}/materialize`,
+      { geometry_id: geometryId });
+    return data;
+  },
 
   // --- AI 会话（契约：docs/vektor3d-ai-session-contract.md）---
   /** 项目级只读票据：交给 vektor3d 拉主数据填充 workspace。写永远走提案-确认 */

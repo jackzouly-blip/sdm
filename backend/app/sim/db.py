@@ -1152,6 +1152,10 @@ class SimDB(PipelineStoreMixin):
 
     # --- 作业 -----------------------------------------------------------
 
+    def update_job_payload(self, jid: str, payload: Dict) -> None:
+        self._write("UPDATE sim_job SET submit_payload_json=? WHERE id=?",
+                    (json.dumps(payload, ensure_ascii=False), jid))
+
     def create_job(
         self,
         sim_subject_id: str,
