@@ -1116,3 +1116,16 @@ export interface SimTemplateRelease {
   created_at: number;
   content_bytes?: number;
 }
+
+/** 项目引用的模板文件：library=库里的发布快照, local=本地上传原文 */
+export interface SimProjectTemplateRef {
+  id: string;
+  sim_project_id: string;
+  category: string;
+  name: string;
+  source: "library" | "local";
+  release_id: string | null;
+  created_by: string;
+  created_at: number;
+  content_bytes?: number;
+}

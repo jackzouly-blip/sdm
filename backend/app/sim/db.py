@@ -440,6 +440,22 @@ CREATE TABLE IF NOT EXISTS sim_template_release (
     UNIQUE(kind, template_id, version_no)
 );
 CREATE INDEX IF NOT EXISTS idx_sim_tpl_release ON sim_template_release(kind, template_id, version_no);
+
+-- 项目引用的模板文件：通用列表，材料卡/控制卡起步，后续可扩展类别。
+-- 两种来源：library=引用模板库的发布快照(不可变)；local=本地上传的文件原文。
+-- 结算组装按类别取**最近添加**的一条。
+CREATE TABLE IF NOT EXISTS sim_project_template_ref (
+    id             TEXT PRIMARY KEY,
+    sim_project_id TEXT NOT NULL REFERENCES sim_project(id) ON DELETE CASCADE,
+    category       TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    source         TEXT NOT NULL,
+    release_id     TEXT,
+    content        TEXT,
+    created_by     TEXT NOT NULL DEFAULT '',
+    created_at     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sim_proj_tplref ON sim_project_template_ref(sim_project_id, category, created_at);
 """
 
 
@@ -1511,6 +1527,32 @@ class SimDB(PipelineStoreMixin):
 
     def get_template_release(self, rid: str):
         return self._one("SELECT * FROM sim_template_release WHERE id=?", (rid,))
+
+    def list_project_template_refs(self, pid: str):
+        return self._all(
+            "SELECT id, sim_project_id, category, name, source, release_id,"
+            " created_by, created_at, LENGTH(content) content_bytes"
+            " FROM sim_project_template_ref WHERE sim_project_id=?"
+            " ORDER BY category, created_at DESC", (pid,))
+
+    def add_project_template_ref(self, pid: str, category: str, name: str,
+                                 source: str, release_id: Optional[str],
+                                 content: Optional[str], user: str) -> str:
+        rid = _uid()
+        self._write(
+            """INSERT INTO sim_project_template_ref
+               (id, sim_project_id, category, name, source, release_id,
+                content, created_by, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (rid, pid, category, name, source, release_id, content,
+             user, time.time()))
+        return rid
+
+    def get_project_template_ref(self, rid: str):
+        return self._one("SELECT * FROM sim_project_template_ref WHERE id=?", (rid,))
+
+    def delete_project_template_ref(self, rid: str) -> bool:
+        return self._write("DELETE FROM sim_project_template_ref WHERE id=?", (rid,)) > 0
 
     def create_control_template(self, name: str, unit_system: str, keyword_text: str,
                                 analysis_type: str = "", description: str = "",

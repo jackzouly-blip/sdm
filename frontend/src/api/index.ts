@@ -2,6 +2,7 @@ import { http, getToken } from "./client";
 export { errMsg } from "./client";
 import type {
   SimTemplateRelease,
+  SimProjectTemplateRef,
   D3plotFindResult,
   D3plotManifest,
   D3plotPrepareResult,
@@ -1309,6 +1310,30 @@ export const simApi = {
   },
   templateReleaseUrl(rid: string): string {
     return `/api/sim/template-releases/${rid}?download=1`;
+  },
+
+  // --- 项目引用模板（通用列表）---
+  async listProjectTemplateRefs(pid: string): Promise<SimProjectTemplateRef[]> {
+    const { data } = await http.get<SimProjectTemplateRef[]>(`/sim/projects/${pid}/template-refs`);
+    return data;
+  },
+  async addProjectTemplateRef(pid: string, category: string, releaseId: string):
+    Promise<SimProjectTemplateRef> {
+    const { data } = await http.post<SimProjectTemplateRef>(
+      `/sim/projects/${pid}/template-refs`, { category, release_id: releaseId });
+    return data;
+  },
+  async uploadProjectTemplateRef(pid: string, category: string, file: File):
+    Promise<SimProjectTemplateRef> {
+    const fd = new FormData();
+    fd.append("category", category);
+    fd.append("file", file);
+    const { data } = await http.post<SimProjectTemplateRef>(
+      `/sim/projects/${pid}/template-refs/upload`, fd);
+    return data;
+  },
+  async deleteProjectTemplateRef(pid: string, rid: string): Promise<void> {
+    await http.delete(`/sim/projects/${pid}/template-refs/${rid}`);
   },
 
   // --- AI 会话（契约：docs/vektor3d-ai-session-contract.md）---

@@ -15,6 +15,7 @@ import type {
   SimResult,
   SimSubject,
   SimTarget,
+  SimProjectTemplateRef,
   SimTemplateRelease,
 } from "@/api/types";
 import { ArrowLeft, Boxes, ChevronRight, Eye, FolderCog, Loader2, Plus, Sparkles, Trash2 } from "lucide-vue-next";
@@ -38,13 +39,14 @@ const requirementCount = ref(0);
 const loading = ref(true);
 const error = ref("");
 
-type Tab = "requirements" | "targets" | "subjects" | "jobs" | "results";
+type Tab = "requirements" | "targets" | "subjects" | "templates" | "jobs" | "results";
 const tab = ref<Tab>("targets");
 const TABS: { key: Tab; label: string }[] = [
   // 需求排在最前:整条链是 需求 → 质量卡 → 几何 → 网格 → 工况 → 作业 → 结果
   { key: "requirements", label: "客户需求" },
   { key: "targets", label: "分析对象" },
   { key: "subjects", label: "工况" },
+  { key: "templates", label: "引用模板" },
   { key: "jobs", label: "作业" },
   { key: "results", label: "结果" },
 ];
@@ -52,6 +54,7 @@ const counts = computed<Record<Tab, number>>(() => ({
   requirements: requirementCount.value,
   targets: targets.value.length,
   subjects: subjects.value.length,
+  templates: templateRefs.value.length,
   jobs: jobs.value.length,
   results: results.value.length,
 }));
@@ -195,13 +198,69 @@ async function loadReleases() {
   }
 }
 
-async function setRelease(field: "control_release_id" | "material_release_id", rid: string) {
-  if (!project.value) return;
+// ── 引用模板(通用列表): 结算实例化按类别取最近一条; 类别可扩展 ──
+const templateRefs = ref<SimProjectTemplateRef[]>([]);
+const CATEGORIES = [
+  { key: "material", label: "材料卡" },
+  { key: "control", label: "控制卡" },
+];
+const addCategory = ref("material");
+const addReleaseId = ref("");
+const addBusy = ref(false);
+
+const pickerReleases = computed(() =>
+  addCategory.value === "control" ? ctrlReleases.value : matReleases.value);
+
+async function loadTemplateRefs() {
   try {
-    project.value = await simApi.updateProject(project.value.id, { [field]: rid });
+    templateRefs.value = await simApi.listProjectTemplateRefs(props.pid);
+  } catch {
+    /* 列表加载失败不阻断项目页 */
+  }
+}
+
+async function addFromLibrary() {
+  if (!addReleaseId.value) return;
+  addBusy.value = true;
+  try {
+    await simApi.addProjectTemplateRef(props.pid, addCategory.value, addReleaseId.value);
+    addReleaseId.value = "";
+    await loadTemplateRefs();
+  } catch (e) {
+    error.value = errMsg(e);
+  } finally {
+    addBusy.value = false;
+  }
+}
+
+async function addFromLocal(ev: Event) {
+  const input = ev.target as HTMLInputElement;
+  const f = input.files?.[0];
+  input.value = "";
+  if (!f) return;
+  addBusy.value = true;
+  try {
+    await simApi.uploadProjectTemplateRef(props.pid, addCategory.value, f);
+    await loadTemplateRefs();
+  } catch (e) {
+    error.value = errMsg(e);
+  } finally {
+    addBusy.value = false;
+  }
+}
+
+async function removeRef(rid: string) {
+  if (!confirm("移除该引用？（不影响模板库与已生成的结算包）")) return;
+  try {
+    await simApi.deleteProjectTemplateRef(props.pid, rid);
+    await loadTemplateRefs();
   } catch (e) {
     error.value = errMsg(e);
   }
+}
+
+function catLabel(k: string) {
+  return CATEGORIES.find((c) => c.key === k)?.label ?? k;
 }
 
 function fmt(ts: number | null) {
@@ -239,7 +298,7 @@ function viewerFor(r: SimResult): RouteLocationRaw | null {
   return { name: "d3plot", query: { path: r.file_path } };
 }
 
-onMounted(() => { load(); loadReleases(); });
+onMounted(() => { load(); loadReleases(); loadTemplateRefs(); });
 </script>
 
 <template>
@@ -283,34 +342,6 @@ onMounted(() => { load(); loadReleases(); });
           <span v-if="project.dbit_project_code" class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700">
             dbit {{ project.dbit_project_code }}
           </span>
-        </div>
-
-        <!-- 求解模板引用: 结算组装(生成网格→main.key)按它取控制卡/材料卡。
-             引用的是发布版本快照 —— 模板后续编辑不影响本项目, 换版本才变。 -->
-        <div class="flex flex-wrap items-center gap-2 mt-2 text-xs">
-          <span class="text-slate-500">求解模板</span>
-          <label class="inline-flex items-center gap-1">
-            控制卡
-            <select class="rounded border px-1.5 py-0.5"
-                    :value="project.control_release_id ?? ''"
-                    @change="setRelease('control_release_id', ($event.target as HTMLSelectElement).value)">
-              <option value="">内置默认</option>
-              <option v-for="r in ctrlReleases" :key="r.id" :value="r.id">
-                {{ r.name }} v{{ r.version_no }}
-              </option>
-            </select>
-          </label>
-          <label class="inline-flex items-center gap-1">
-            材料卡
-            <select class="rounded border px-1.5 py-0.5"
-                    :value="project.material_release_id ?? ''"
-                    @change="setRelease('material_release_id', ($event.target as HTMLSelectElement).value)">
-              <option value="">内置默认</option>
-              <option v-for="r in matReleases" :key="r.id" :value="r.id">
-                {{ r.name }} v{{ r.version_no }}
-              </option>
-            </select>
-          </label>
         </div>
 
         <!-- 工作目录:未设置时导入数模必失败,所以缺失要显眼、且能就地补 -->
@@ -514,6 +545,69 @@ onMounted(() => { load(); loadReleases(); });
       </div>
 
       <!-- 作业 -->
+      <div v-else-if="tab === 'templates'">
+        <!-- 引用模板: 每次计算实例化时按类别取**最近添加**的一条。
+             library=模板库发布快照(不可变), local=本地上传原文。类别后续可扩展 -->
+        <div class="flex flex-wrap items-center gap-2 mb-3 text-xs">
+          <select v-model="addCategory" class="rounded border px-2 py-1">
+            <option v-for="c in CATEGORIES" :key="c.key" :value="c.key">{{ c.label }}</option>
+          </select>
+          <select v-model="addReleaseId" class="rounded border px-2 py-1 min-w-56">
+            <option value="">从库选择已发布版本…</option>
+            <option v-for="r in pickerReleases" :key="r.id" :value="r.id">
+              {{ r.name }} v{{ r.version_no }}
+            </option>
+          </select>
+          <button class="rounded bg-slate-800 px-3 py-1 text-white disabled:opacity-50"
+                  :disabled="!addReleaseId || addBusy" @click="addFromLibrary">从库添加</button>
+          <label class="rounded border px-3 py-1 cursor-pointer hover:bg-slate-50"
+                 :class="addBusy ? 'opacity-50 pointer-events-none' : ''">
+            本地上传…
+            <input type="file" accept=".k,.key,.dyn,.inc" class="hidden" @change="addFromLocal" />
+          </label>
+        </div>
+        <p v-if="!templateRefs.length" class="text-sm text-slate-400 py-6 text-center">
+          尚未引用任何模板 —— 结算组装将使用内置默认（工程师 5P-BAG 那套）
+        </p>
+        <table v-else class="w-full text-sm">
+          <thead>
+            <tr class="text-left text-xs text-slate-500 border-b">
+              <th class="py-1.5 pr-3">类别</th>
+              <th class="py-1.5 pr-3">名称</th>
+              <th class="py-1.5 pr-3">来源</th>
+              <th class="py-1.5 pr-3">添加人 / 时间</th>
+              <th class="py-1.5"></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in templateRefs" :key="r.id" class="border-b last:border-0">
+              <td class="py-1.5 pr-3">{{ catLabel(r.category) }}</td>
+              <td class="py-1.5 pr-3">
+                <a v-if="r.release_id" :href="simApi.templateReleaseUrl(r.release_id)"
+                   class="text-indigo-700 hover:underline">{{ r.name }}</a>
+                <span v-else>{{ r.name }}</span>
+              </td>
+              <td class="py-1.5 pr-3 text-xs">
+                <span :class="r.source === 'library'
+                  ? 'px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700'
+                  : 'px-1.5 py-0.5 rounded bg-slate-100 text-slate-600'">
+                  {{ r.source === "library" ? "模板库" : "本地上传" }}
+                </span>
+              </td>
+              <td class="py-1.5 pr-3 text-xs text-slate-500">
+                {{ r.created_by }} · {{ fmt(r.created_at) }}
+              </td>
+              <td class="py-1.5 text-right">
+                <button class="text-xs text-red-600 hover:underline" @click="removeRef(r.id)">移除</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="mt-3 text-[11px] text-slate-400">
+          同类别有多条时，实例化取最近添加的一条。引用模板库版本是不可变快照——库里继续编辑不影响本项目。
+        </p>
+      </div>
+
       <div v-else-if="tab === 'jobs'">
         <p v-if="!jobs.length" class="text-sm text-slate-400 py-8 text-center">
           还没有作业。作业由编排产生，执行仍在算力管理的 HPC 链路。

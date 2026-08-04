@@ -1076,8 +1076,27 @@ async def upload_airbag_deck(
         # 项目引用了发布版本的, 用发布快照; 没引用的用内置模板兜底。
         # 引用的是**不可变快照**: 模板后续在线编辑不影响已生成的结算包。
         overrides = {}
+        # ① "引用模板"通用列表优先: 每类取最近添加的一条(library 取快照原文,
+        #    local 取上传原文)。② 旧的项目级两字段其次(兼容)。③ 内置模板兜底。
+        cat2fn = {"material": "MAT.K", "control": "03_Control_card.k"}
+        for ref in db.list_project_template_refs(proj["id"]):
+            fn = cat2fn.get(ref["category"])
+            if fn is None or fn in overrides:
+                continue
+            if ref["source"] == "library":
+                rel = db.get_template_release(ref["release_id"] or "")
+                if rel is not None:
+                    overrides[fn] = rel["content"].encode("latin-1", "replace")
+                    log.info("结算组装用引用模板(库) %s -> %s", ref["name"], fn)
+            else:
+                full = db.get_project_template_ref(ref["id"])
+                if full is not None and full["content"]:
+                    overrides[fn] = full["content"].encode("latin-1", "replace")
+                    log.info("结算组装用引用模板(本地) %s -> %s", ref["name"], fn)
         for col, fn in (("control_release_id", "03_Control_card.k"),
                         ("material_release_id", "MAT.K")):
+            if fn in overrides:
+                continue
             rid_ = (proj[col] if col in proj.keys() else None) or ""
             if rid_:
                 rel = db.get_template_release(rid_)
@@ -3183,6 +3202,78 @@ def export_control_template(request: Request, tid: str,
         content=text, media_type="text/plain; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="control_{tid[:8]}.k"'},
     )
+
+
+# --- 项目引用模板（通用列表：材料卡/控制卡起步，类别可扩展）-----------
+
+@router.get("/projects/{pid}/template-refs")
+def list_project_template_refs(
+    request: Request, pid: str,
+    user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request),
+) -> List[Dict]:
+    db = _db(request)
+    _owned_project(db, pid, user, is_admin)
+    return [_row(r) for r in db.list_project_template_refs(pid)]
+
+
+class TemplateRefAdd(BaseModel):
+    category: str = Field(min_length=1, max_length=40)
+    release_id: str = Field(min_length=1)
+
+
+@router.post("/projects/{pid}/template-refs", status_code=status.HTTP_201_CREATED)
+def add_project_template_ref(
+    request: Request, pid: str, body: TemplateRefAdd,
+    user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """从库添加：引用一个模板发布快照（不可变）。"""
+    db = _db(request)
+    _owned_project(db, pid, user, is_admin)
+    rel = db.get_template_release(body.release_id)
+    if rel is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "模板发布版本不存在")
+    rid = db.add_project_template_ref(
+        pid, body.category, f"{rel['name']} v{rel['version_no']}",
+        "library", body.release_id, None, user)
+    out = _row(db.get_project_template_ref(rid)); out.pop("content", None)
+    return out
+
+
+@router.post("/projects/{pid}/template-refs/upload", status_code=status.HTTP_201_CREATED)
+async def upload_project_template_ref(
+    request: Request, pid: str,
+    category: str = Form(...),
+    file: UploadFile = File(...),
+    user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request),
+) -> Dict:
+    """本地上传：文件原文直接存下（k 文件都很小），与库引用同列。"""
+    db = _db(request)
+    _owned_project(db, pid, user, is_admin)
+    name = os.path.basename((file.filename or "").replace("\\", "/")) or "file.k"
+    if not name.lower().endswith((".k", ".key", ".dyn", ".inc")):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            f"仅支持 .k/.key/.dyn/.inc（收到 {name}）")
+    data = await file.read()
+    if len(data) > 4 * 1024 * 1024:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "文件超过 4MB，请入模板库走引用")
+    rid = db.add_project_template_ref(
+        pid, category, name, "local", None,
+        data.decode("latin-1"), user)
+    out = _row(db.get_project_template_ref(rid)); out.pop("content", None)
+    return out
+
+
+@router.delete("/projects/{pid}/template-refs/{rid}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_project_template_ref(
+    request: Request, pid: str, rid: str,
+    user: str = Depends(current_user), is_admin: bool = Depends(is_admin_request),
+) -> None:
+    db = _db(request)
+    _owned_project(db, pid, user, is_admin)
+    ref = db.get_project_template_ref(rid)
+    if ref is None or ref["sim_project_id"] != pid:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "引用不存在")
+    db.delete_project_template_ref(rid)
 
 
 # --- 模板发布版本（发布=不可变快照，项目引用快照而非模板本身）-----------
