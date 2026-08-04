@@ -1335,6 +1335,10 @@ export const simApi = {
   async deleteProjectTemplateRef(pid: string, rid: string): Promise<void> {
     await http.delete(`/sim/projects/${pid}/template-refs/${rid}`);
   },
+  async createSimJob(sid: string, body?: { submit_mode?: string }): Promise<SimJob> {
+    const { data } = await http.post<SimJob>(`/sim/subjects/${sid}/jobs`, body ?? {});
+    return data;
+  },
   /** 为一次计算实例化独立 run 目录（deck+模板+main.key），提交仍走作业提交页 */
   async materializeJob(jid: string, geometryId: string): Promise<SimJob> {
     const { data } = await http.post<SimJob>(`/sim/jobs/${jid}/materialize`,

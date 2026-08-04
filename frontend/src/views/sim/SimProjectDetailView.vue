@@ -291,6 +291,51 @@ async function doMaterialize() {
   }
 }
 
+// ── 新建计算: 一步建工况(可选)+作业+实例化 run 目录 ──
+const newRunOpen = ref(false);
+const newRunSubjectId = ref("");
+const newRunSubjectName = ref("");
+const newRunDeckId = ref("");
+const newRunBusy = ref(false);
+
+async function openNewRun() {
+  newRunOpen.value = true;
+  newRunSubjectId.value = subjects.value[0]?.id ?? "";
+  newRunSubjectName.value = "";
+  newRunDeckId.value = "";
+  try {
+    const all = await Promise.all(targets.value.map((tg) => simApi.listGeometries(tg.id)));
+    matDecks.value = all.flat().filter((g) => g.source_type === "deck");
+    if (matDecks.value.length === 1) newRunDeckId.value = matDecks.value[0].id;
+  } catch (e) {
+    error.value = errMsg(e);
+  }
+}
+
+async function doNewRun() {
+  if (!newRunDeckId.value) return;
+  newRunBusy.value = true;
+  try {
+    let sid = newRunSubjectId.value;
+    if (!sid) {
+      const name = newRunSubjectName.value.trim() || "气囊展开";
+      const subj = await simApi.createSubject(props.pid, {
+        name, subject_type: "airbag_deploy", solver_type: "lsdyna",
+      });
+      sid = subj.id;
+    }
+    const job = await simApi.createSimJob(sid);
+    await simApi.materializeJob(job.id, newRunDeckId.value);
+    newRunOpen.value = false;
+    await load();
+    tab.value = "jobs";
+  } catch (e) {
+    error.value = errMsg(e);
+  } finally {
+    newRunBusy.value = false;
+  }
+}
+
 function runDir(j: SimJob): string {
   return String((j.submit_payload as Record<string, unknown> | null)?.run_dir ?? "");
 }
@@ -645,8 +690,13 @@ onMounted(() => { load(); loadReleases(); loadTemplateRefs(); });
       </div>
 
       <div v-else-if="tab === 'jobs'">
+        <div class="mb-3">
+          <button class="rounded bg-slate-800 px-3 py-1.5 text-white text-sm"
+                  @click="openNewRun()">新建计算（实例化 run 目录）</button>
+        </div>
         <p v-if="!jobs.length" class="text-sm text-slate-400 py-8 text-center">
-          还没有作业。作业由编排产生，执行仍在算力管理的 HPC 链路。
+          还没有计算。点上方「新建计算」：选网格 deck 一步生成 run 目录，
+          随后在「作业提交」页以该目录 + main.key 入队。
         </p>
         <table v-else class="w-full text-sm">
           <thead class="text-slate-500 border-b border-slate-200">
@@ -711,6 +761,37 @@ onMounted(() => { load(); loadReleases(); loadTemplateRefs(); });
             <button class="rounded border px-3 py-1" @click="matJob = null">取消</button>
             <button class="rounded bg-slate-800 px-3 py-1 text-white disabled:opacity-50"
                     :disabled="!matDeckId || matBusy" @click="doMaterialize">实例化</button>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="newRunOpen" class="fixed inset-0 z-50 bg-black/30 flex items-center justify-center"
+           @click.self="newRunOpen = false">
+        <div class="bg-white rounded-lg shadow-xl p-4 w-[26rem] text-sm">
+          <div class="font-medium mb-2">新建计算</div>
+          <label class="block text-xs text-slate-500 mb-1">工况</label>
+          <select v-if="subjects.length" v-model="newRunSubjectId"
+                  class="w-full rounded border px-2 py-1 mb-2">
+            <option v-for="sj in subjects" :key="sj.id" :value="sj.id">{{ sj.name }}</option>
+            <option value="">新建工况…</option>
+          </select>
+          <input v-if="!subjects.length || !newRunSubjectId" v-model="newRunSubjectName"
+                 placeholder="工况名（默认：气囊展开）"
+                 class="w-full rounded border px-2 py-1 mb-2" />
+          <label class="block text-xs text-slate-500 mb-1">网格 deck</label>
+          <select v-model="newRunDeckId" class="w-full rounded border px-2 py-1 mb-3">
+            <option value="">选择网格 deck…</option>
+            <option v-for="g in matDecks" :key="g.id" :value="g.id">
+              {{ g.source_file?.name }} (v{{ g.version_no }})
+            </option>
+          </select>
+          <p v-if="!matDecks.length" class="text-xs text-amber-600 mb-2">
+            本项目还没有网格 deck——先在「分析对象」里对平面图点「生成网格」。
+          </p>
+          <div class="flex justify-end gap-2">
+            <button class="rounded border px-3 py-1" @click="newRunOpen = false">取消</button>
+            <button class="rounded bg-slate-800 px-3 py-1 text-white disabled:opacity-50"
+                    :disabled="!newRunDeckId || newRunBusy" @click="doNewRun">创建并实例化</button>
           </div>
         </div>
       </div>
